@@ -28,7 +28,7 @@ cargo install axiopera --locked
 axiopera --version
 ```
 
-独立工作目录功能需要 Git。Windows 和 Linux 已有实测，macOS 待验证，详见[已测版本](docs/backends.md#兼容性)。
+独立工作目录功能需要 Git。Windows 和 Linux 已有实测，macOS 待验证，详见[已测版本](docs/verification.md#已测版本)。
 
 ## 开始使用
 

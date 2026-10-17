@@ -28,7 +28,7 @@ cargo install axiopera --locked
 axiopera --version
 ```
 
-Git is required for separate working copies. Windows and Linux have been tested; macOS still needs validation. See the [tested versions](docs/backends.md#兼容性).
+Git is required for separate working copies. Windows and Linux have been tested; macOS still needs validation. See the [tested versions](docs/verification.md#已测版本).
 
 ## Get started
 
