@@ -1,0 +1,52 @@
+# Axiopera
+
+[简体中文](README.zh-CN.md)
+
+Lightweight, minimally invasive collaboration for coding agents.
+
+Bring Claude Code, Codex, and Grok Build together with a single executable. Keep your existing tools and sign-ins, and start delegating tasks with a few commands.
+
+Ask Codex to review Claude's changes, split a task across models, or leave a longer job running after your session ends.
+
+- Send new instructions while a task is running.
+- Let agents ask questions and exchange notes.
+- Give each task its own model and permissions, with an optional separate working copy.
+- Continue a task in its original agent CLI when you want to take over.
+
+Each agent starts with the task description you provide. Include the context it needs.
+
+## Install
+
+Install and sign in to the agent CLIs you want to use. Axiopera uses those existing accounts.
+
+Download the archive for your system from [GitHub Releases](https://github.com/Victor-Quqi/Axiopera/releases), extract it, and put `axiopera` or `axiopera.exe` in a directory on your PATH.
+
+Or install from [crates.io](https://crates.io/crates/axiopera) with Rust:
+
+```sh
+cargo install axiopera --locked
+axiopera --version
+```
+
+Git is required for separate working copies. Windows and Linux have been tested; macOS still needs validation. See the [tested versions](docs/backends.md#兼容性).
+
+## Get started
+
+Add this to your coding agent's project instructions:
+
+> When delegating tasks through Axiopera, run `axiopera guide` first.
+
+Or try a task from your terminal:
+
+```sh
+axiopera spawn codex --tier read --name review "Review this repository and report the issues most worth fixing."
+axiopera wait review
+```
+
+The task starts in the background. `wait` returns its answer, and `send` lets you follow up in the same conversation.
+
+See the [agent guide](src/guide.md) for more examples, or run `axiopera --help`. The [usage and configuration guide](docs/usage.md) is currently in Chinese.
+
+## License
+
+[Apache-2.0](LICENSE).
