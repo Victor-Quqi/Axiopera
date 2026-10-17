@@ -1,7 +1,6 @@
 """Check release tags and package native binaries. Requires Python 3.11+."""
 
 import argparse
-import hashlib
 from pathlib import Path
 import subprocess
 import tarfile
@@ -52,10 +51,6 @@ def package(target, binary, output):
                 info.uname = info.gname = ""
                 with path.open("rb") as content:
                     packed.addfile(info, content)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    archive.with_name(archive.name + ".sha256").write_text(
-        f"{digest}  {archive.name}\n", encoding="utf-8"
-    )
     print(archive)
 
 

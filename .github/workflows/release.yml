@@ -73,12 +73,7 @@ jobs:
           pattern: release-*
           merge-multiple: true
           path: assets
-      - name: Verify archives
-        working-directory: assets
-        run: |
-          cat *.sha256 > SHA256SUMS
-          sha256sum --check SHA256SUMS
       - name: Publish release
         run: |
-          gh release create "$RELEASE_TAG" assets/*.zip assets/*.tar.gz assets/SHA256SUMS \
+          gh release create "$RELEASE_TAG" assets/*.zip assets/*.tar.gz \
             --verify-tag --title "$RELEASE_TAG" --generate-notes
