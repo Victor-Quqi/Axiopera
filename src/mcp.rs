@@ -68,10 +68,8 @@ fn tools() -> Value {
     json!([
         {
             "name": "ask",
-            "description": "Ask your parent agent something only it can answer. Returns at once: \
-                keep working on everything that does not depend on the answer, and do not poll \
-                for it. The answer arrives as a new message. If nothing is left to do without it, \
-                end your turn and say what you are waiting for.",
+            "description": "Ask your parent agent something only it can answer. Returns at once; \
+                the answer arrives later as a new message.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"question": text("The question, with the context your parent needs to answer it.")},

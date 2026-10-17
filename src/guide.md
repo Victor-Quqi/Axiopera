@@ -7,15 +7,17 @@ sub-agents: axiopera sub-agents see only the task you write.
 Dispatch
   axiopera spawn codex "Fix the failing test in tests/parser.rs; run cargo test before finishing."
   axiopera spawn claude --tier read --name review -f task.md
-  Tiers: read (look, don't change; MCP: read-only tools only, none on Grok), work (default: the agent's own auto mode), full (the agent's full-access mode).
-  Options: --tier, --model, --effort, --name (use it instead of the ID), --cwd, --timeout 30m,
+  Tiers: read (look, don't change; MCP: read-only tools only, none on Grok),
+         work (default: the agent's own auto mode), full (the agent's full-access mode).
+  Options: --model, --effort, --name (use it instead of the ID), --cwd, --timeout 30m,
   --worktree (an isolated git worktree).
 
 Get results
   axiopera wait            blocks until one of your sub-tasks finishes a turn or hits a problem,
                            then prints it. Each result is delivered once.
   - Claude Code: run `axiopera wait` as a background command; you are woken when it exits.
-  - Codex: if spawn says to use wait, poll with `axiopera wait --timeout 60s`.
+  - Codex: if spawn says to use wait, poll with `axiopera wait --timeout 60s`. On Windows your
+    shell reports every nonzero exit code as 1; tell them apart by the output.
   - Grok: run it in the background, or use `axiopera watch` with your monitor tool.
   Exit codes: 0 success, 1 command error, 3 timed out, 4 nothing left to wait for,
   5 something failed, 6 something was cancelled.
@@ -34,7 +36,7 @@ Answer questions
 
 For long messages, use `send <task> -f msg.md` or `reply <question> -f answer.md`; use `-` to read stdin.
 
-Sub-agents can talk to each other: give them each other's task IDs, and they can run
+Sub-agents can talk to each other: give them each other's task IDs and tell them to run
 `axiopera tell <task> "..."` (Codex sub-agents have it as the `tell` tool). You get a copy of
 every note.
 

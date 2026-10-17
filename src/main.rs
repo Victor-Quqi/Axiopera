@@ -44,8 +44,10 @@ enum Command {
         file: Option<PathBuf>,
         #[arg(long, value_enum, default_value = "work")]
         tier: Tier,
+        /// Model name, passed to the agent as is.
         #[arg(long)]
         model: Option<String>,
+        /// Reasoning effort, passed to the agent as is.
         #[arg(long)]
         effort: Option<String>,
         /// Working directory (default: the current one).
@@ -71,6 +73,7 @@ enum Command {
     },
     /// Wait for the next results or problems from your sub-tasks.
     Wait {
+        /// Only these tasks (default: all of yours).
         tasks: Vec<String>,
         /// Give up after this long (exit code 3), e.g. 60s.
         #[arg(long, value_parser = parse_duration)]
@@ -88,6 +91,7 @@ enum Command {
     /// Recent events of a task.
     Log {
         task: String,
+        /// How many of the latest events to show.
         #[arg(long, default_value_t = 30)]
         tail: usize,
     },
@@ -130,6 +134,7 @@ enum Command {
     /// Remove finished tasks untouched for a while, and their worktrees if nothing in them is
     /// uncommitted.
     Gc {
+        /// Untouched for at least this many days.
         #[arg(long, default_value_t = 7)]
         days: u64,
     },
@@ -147,7 +152,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DaemonCommand {
+    /// The daemon's version, PID and number of running tasks.
     Status,
+    /// Stop the daemon.
     Stop {
         /// Stop even if tasks are running (they become interrupted).
         #[arg(long)]

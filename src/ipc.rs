@@ -37,8 +37,11 @@ pub enum Agent {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum Tier {
+    /// Look, don't change.
     Read,
+    /// The agent's own auto mode.
     Work,
+    /// The agent's full-access mode.
     Full,
 }
 
