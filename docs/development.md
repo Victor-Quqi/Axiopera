@@ -24,8 +24,10 @@
 cargo fmt --check
 cargo test --locked
 cargo build --release --locked
-cargo package --locked
+cargo package --locked --target-dir target/package-verify
 ```
+
+打包校验使用单独的 target 目录。在默认目录中，它与 dev 构建共用 fingerprint，之后的 `cargo build` 只检查解包出的副本，修改源码也不会重新编译。
 
 普通测试使用本地临时数据，不调用模型。当前测试覆盖消息解析、消费确认、任务状态、结果游标、配置和平台辅助函数。CI 在 Windows、Linux 和 macOS 上运行上述检查，并按 `Cargo.toml` 的 `rust-version` 检查最低 Rust 版本。
 
