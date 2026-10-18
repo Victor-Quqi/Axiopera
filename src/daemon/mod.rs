@@ -381,6 +381,11 @@ impl Daemon {
         };
         let mut out = Out { w: &mut w };
         let compatible = env.protocol == ipc::PROTOCOL && env.version == env!("CARGO_PKG_VERSION");
+        // Hooks run in every host session; one from another version must not restart us.
+        if !compatible && matches!(env.request, Request::Pending) {
+            out.done(ipc::exit::OK).await?;
+            return Ok(());
+        }
         if !compatible && !matches!(env.request, Request::Stop { .. }) {
             if self.lock().running == 0 {
                 out.error(ErrorCode::Version, "daemon version differs; restarting it")
@@ -474,6 +479,12 @@ impl Daemon {
                 let exit = self.wait(&caller, &tasks, timeout_ms, out).await;
                 self.retract_doorbell(&caller);
                 exit
+            }
+            Request::Pending => {
+                if let Some(seq) = self.needing_host(&caller) {
+                    out.text(push::REMINDER, json!({"seq": seq})).await?;
+                }
+                Ok(ipc::exit::OK)
             }
             Request::Watch => self.watch(&caller, out).await,
             Request::Status { task, all } => self.status(&caller, task.as_deref(), all, out).await,

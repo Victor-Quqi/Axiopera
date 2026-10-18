@@ -1,6 +1,11 @@
 //! `axiopera mcp`: ask, tell and inbox as MCP tools for a sub-agent. Codex starts MCP servers
 //! outside its sandbox, while its sandboxed shell cannot reach the daemon on Linux or in the
 //! elevated Windows sandbox.
+//!
+//! `axiopera mcp --codex-hooks` serves the hooks of the Codex plugin instead, in every Codex
+//! session where the plugin is installed.
+
+use std::collections::HashMap;
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -14,7 +19,8 @@ use crate::ipc::Request;
 /// not use yet.
 const VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-pub async fn serve(client: Client) -> Result<i32> {
+pub async fn serve(client: Client, codex_hooks: bool) -> Result<i32> {
+    let mut reminded = HashMap::new();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
     while let Some(line) = lines.next_line().await? {
@@ -36,7 +42,9 @@ pub async fn serve(client: Client) -> Result<i32> {
                 "serverInfo": {"name": "axiopera", "version": env!("CARGO_PKG_VERSION")},
             }),
             "ping" => json!({}),
+            "tools/list" if codex_hooks => json!({"tools": hook_tools()}),
             "tools/list" => json!({"tools": tools()}),
+            "tools/call" if codex_hooks => hook(&client, params, &mut reminded).await,
             "tools/call" => call(&client, params).await,
             other => {
                 let error = json!({"code": -32601, "message": format!("unknown method {other}")});
@@ -133,6 +141,64 @@ async fn call(client: &Client, params: &Value) -> Value {
         Ok(code) => tool_result(lines.join("\n"), failed || code != 0),
         Err(e) => tool_result(format!("{e:#}"), true),
     }
+}
+
+/// Codex keeps tools whose visibility leaves out the model from the model.
+fn hook_tools() -> Value {
+    let hidden = json!({"ui": {"visibility": ["app"]}});
+    let session = json!({"type": "string"});
+    json!([
+        {
+            "name": "post_tool_use",
+            "description": "For the Axiopera plugin's PostToolUse hook.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"session_id": session},
+                "required": ["session_id"],
+            },
+            "_meta": hidden,
+        },
+        {
+            "name": "stop",
+            "description": "For the Axiopera plugin's Stop hook.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"session_id": session, "stop_hook_active": {"type": "boolean"}},
+                "required": ["session_id"],
+            },
+            "_meta": hidden,
+        },
+    ])
+}
+
+/// Remind the session to run `wait` when its sub-tasks have news: mid-turn once per new
+/// event, and at the end of a turn by continuing it once. Silent while the daemon is down.
+async fn hook(client: &Client, params: &Value, reminded: &mut HashMap<String, u64>) -> Value {
+    let args = &params["arguments"];
+    let session = args["session_id"].as_str().unwrap_or_default();
+    let mut found = None;
+    let caller = format!("codex:{session}");
+    let _ = client
+        .request_as(caller, false, Request::Pending, |line| {
+            if let Line::Out { text, data } = line {
+                found = data["seq"].as_u64().map(|seq| (seq, text));
+            }
+        })
+        .await;
+    let Some((seq, text)) = found else {
+        return tool_result(String::new(), false);
+    };
+    let last = reminded.insert(session.to_string(), seq);
+    let output = match params["name"].as_str() {
+        Some("post_tool_use") if last.is_none_or(|l| l < seq) => json!({
+            "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text},
+        }),
+        Some("stop") if args["stop_hook_active"] != true => {
+            json!({"decision": "block", "reason": text})
+        }
+        _ => return tool_result(String::new(), false),
+    };
+    tool_result(output.to_string(), false)
 }
 
 fn tool_result(text: String, is_error: bool) -> Value {

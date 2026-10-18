@@ -44,7 +44,20 @@ impl Client {
     }
 
     /// Send one request, handing each line of the answer to `sink`. Returns the exit code.
-    pub async fn request(&self, request: Request, mut sink: impl FnMut(Line)) -> Result<i32> {
+    pub async fn request(&self, request: Request, sink: impl FnMut(Line)) -> Result<i32> {
+        let caller = identity::detect(|k| std::env::var(k).ok(), platform::ancestor_names);
+        let launch = !matches!(request, Request::Stop { .. });
+        self.request_as(caller, launch, request, sink).await
+    }
+
+    /// Without `launch`, a daemon that is not running answers nothing.
+    pub async fn request_as(
+        &self,
+        caller: String,
+        launch: bool,
+        request: Request,
+        mut sink: impl FnMut(Line),
+    ) -> Result<i32> {
         if !request.allowed_in_sandbox() && platform::self_sandboxed() {
             sink(Line::Error(SANDBOX_HINT.into()));
             return Ok(ipc::exit::ERROR);
@@ -53,16 +66,14 @@ impl Client {
         let envelope = Envelope {
             protocol: ipc::PROTOCOL,
             version: env!("CARGO_PKG_VERSION").into(),
-            caller: identity::detect(|k| std::env::var(k).ok(), platform::ancestor_names),
+            caller,
             cwd: std::env::current_dir()?,
             env,
             request,
         };
         // A version mismatch makes an idle daemon exit; then a fresh one is started.
         for _ in 0..3 {
-            let stream = self
-                .connect(matches!(envelope.request, Request::Stop { .. }))
-                .await?;
+            let stream = self.connect(launch).await?;
             let Some(stream) = stream else {
                 return Ok(ipc::exit::OK);
             };
@@ -74,15 +85,15 @@ impl Client {
         bail!("daemon version mismatch persists; run `axiopera daemon stop --force`")
     }
 
-    /// Ok(None) only for `daemon stop` when nothing is running.
-    async fn connect(&self, stopping: bool) -> Result<Option<platform::ClientStream>> {
+    /// Ok(None) only without `may_launch`, when nothing is running.
+    async fn connect(&self, may_launch: bool) -> Result<Option<platform::ClientStream>> {
         match platform::connect(&self.home).await {
             Ok(s) => return Ok(Some(s)),
             // Sandboxes that block sockets fail here rather than with "not found".
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!("{SANDBOX_HINT}"),
             Err(_) => {}
         }
-        if stopping {
+        if !may_launch {
             return Ok(None);
         }
         if platform::self_sandboxed() {

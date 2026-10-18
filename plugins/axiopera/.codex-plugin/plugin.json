@@ -1,0 +1,11 @@
+{
+  "name": "axiopera",
+  "description": "Tells Codex when its axiopera sub-tasks have news, and teaches it to delegate tasks to Claude Code, Codex and Grok Build.",
+  "mcpServers": "./codex/mcp.json",
+  "hooks": "./codex/hooks.json",
+  "interface": {
+    "displayName": "Axiopera",
+    "shortDescription": "Delegate tasks to other coding agents",
+    "developerName": "Victor-Quqi"
+  }
+}

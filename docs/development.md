@@ -9,7 +9,9 @@
 | `src/daemon/mod.rs`、`task.rs` | 请求处理、任务调度和轮次驱动 |
 | `src/daemon/push.rs`、`render.rs` | 宿主推送和输出格式 |
 | `src/agent/` | 原生 CLI 协议适配 |
-| `src/mcp.rs` | 子 agent 的 ask、tell、inbox 工具 |
+| `src/mcp.rs` | 子 agent 的 ask、tell、inbox 工具，Codex 插件的 hook |
+| `src/plugin.rs` | Codex 插件卸载后的清理 |
+| `plugins/axiopera/`、`.agents/plugins/` | skill、Codex 插件和 marketplace |
 | `src/platform/` | 进程树、IPC 和 sandbox 检测 |
 | `src/store.rs`、`worktree.rs` | 任务存储和 Git worktree |
 | `src/config.rs`、`paths.rs`、`identity.rs` | 配置、路径和调用方身份 |
@@ -39,6 +41,7 @@ cargo package --locked
 - `docs/backends.md`：权限映射和协议差异。修改适配器前先查，修改后端行为时同步。
 - `docs/verification.md`：已测版本、后端结论的依据和探针用法。新增或修改后端结论时在此登记依据，正文不标注来源。
 - `docs/design.md`：内部状态、持久化和并发机制。修改状态或交付逻辑时同步。
+- `plugins/axiopera/`：skill 只让 agent 去读 `axiopera guide`，说明写在 guide 里。改动 Codex hook 会让用户重新信任；插件在 Codex 中留下的内容有变化时，同步 `src/plugin.rs` 和[使用文档](usage.md#skill-与-codex-插件)。
 
 事实的条件和例外与它写在一起；未验证的结论在正文注明。删除过时表述。探索记录留在忽略目录 `.local/`。
 

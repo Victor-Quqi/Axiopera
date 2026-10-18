@@ -85,7 +85,7 @@ Grok 的 `_x.ai/session/interjection` 只确认入队。轮末输出注明消费
 | Claude Code，含 VS Code 扩展 | 自动开启一轮 | 下一次工具调用前送达 | 后台运行 `wait` |
 | Grok | 自动开启一轮 | 等本轮结束 | 后台运行 `wait`，或 `watch` 配合 monitor |
 | Codex TUI | 自动开启一轮 | 送入当前轮 | 推送 |
-| Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 等本轮结束 | 门铃 |
+| Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 等本轮结束；桌面端装了[插件](usage.md#skill-与-codex-插件)时，下一次工具调用后提醒 | 门铃，插件 hook |
 | 其他 Codex 会话 | 不唤醒 | 不送达 | 轮询 `wait` |
 
 Claude 和 Grok 由宿主进程在后台命令退出时唤醒，与界面无关。Axiopera 不向 Claude inbox socket 推送，因为 Linux 上脱离宿主进程树的 daemon 会触发入站批准，而且该接口没有送达回执。
@@ -100,6 +100,8 @@ Codex 交互式会话挂在用户级 app-server daemon 上时，Axiopera 经 `co
 - 宿主运行 `wait` 后，Axiopera 用 `thread/queue/delete` 撤回尚未处理的提醒。
 
 `codex exec` 跑完一轮就退出，排入的提醒要到下次打开该会话时才触发，因此不用门铃。
+
+Codex 插件的 hook 用 `mcp_tool` 处理器调用插件自带的 MCP 服务器，hook 的调用不受工具审批影响。PostToolUse 返回的 `additionalContext` 在这次工具调用之后作为 developer 消息写入当前轮。Stop 返回 `decision: "block"` 时这一轮继续，`reason` 成为续写提示；续写后再次触发时 `stop_hook_active` 为真。只跑长命令或长时间不调工具时，要等轮末的 Stop 才能送达。工具的 `_meta.ui.visibility` 不含 `model` 时，模型看不到该工具，hook 仍可调用。
 
 Windows 上 Codex 经 PowerShell `-Command` 执行命令，外部程序的非零退出码一律报告为 1。
 

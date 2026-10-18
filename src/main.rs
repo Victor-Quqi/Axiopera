@@ -7,6 +7,7 @@ mod ipc;
 mod mcp;
 mod paths;
 mod platform;
+mod plugin;
 mod store;
 mod worktree;
 
@@ -142,12 +143,27 @@ enum Command {
     Guide,
     /// Serve ask, tell and inbox as MCP tools; axiopera sets this up for Codex sub-agents.
     #[command(hide = true)]
-    Mcp,
+    Mcp {
+        /// Serve the Codex plugin's hooks instead.
+        #[arg(long)]
+        codex_hooks: bool,
+    },
     /// Manage the background daemon.
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
     },
+    /// The Codex plugin.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// After you uninstall the plugin from Codex, remove what Codex keeps of it.
+    Cleanup,
 }
 
 #[derive(Subcommand)]
@@ -223,7 +239,12 @@ async fn run(cli: Cli) -> Result<i32> {
             print!("{}", include_str!("guide.md"));
             return Ok(0);
         }
-        Command::Mcp => return mcp::serve(client::Client { home, json: false }).await,
+        Command::Plugin {
+            command: PluginCommand::Cleanup,
+        } => return plugin::cleanup(&home).await,
+        Command::Mcp { codex_hooks } => {
+            return mcp::serve(client::Client { home, json: false }, codex_hooks).await;
+        }
         Command::Daemon {
             command: DaemonCommand::Run { home, idle_secs },
         } => {

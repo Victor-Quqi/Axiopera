@@ -32,7 +32,18 @@ axiopera --version
 
 ## 开始使用
 
-在编程 agent 的项目说明中加入：
+给编程 agent 装上 Axiopera 的 skill，让它知道如何派发任务：把 [`plugins/axiopera/skills/axiopera`](plugins/axiopera/skills/axiopera) 目录复制到 `~/.claude/skills/`（Claude Code）或 `~/.agents/skills/`（Codex）。Grok 两处都会读取。
+
+Codex 也可以改装插件。除了 skill，插件还能让正在工作的会话得知子任务的消息：
+
+```sh
+codex plugin marketplace add Victor-Quqi/Axiopera
+codex plugin add axiopera@axiopera
+```
+
+hook 和卸载方法见[使用与配置](docs/usage.md#skill-与-codex-插件)。
+
+也可以不装 skill，在 agent 的项目说明中加入：
 
 > 通过 Axiopera 派发子任务前，先运行 `axiopera guide`。
 

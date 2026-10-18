@@ -1,0 +1,30 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "axiopera-hooks",
+            "tool": "post_tool_use",
+            "input": { "session_id": "${session_id}" },
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "axiopera-hooks",
+            "tool": "stop",
+            "input": { "session_id": "${session_id}", "stop_hook_active": "${stop_hook_active}" },
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

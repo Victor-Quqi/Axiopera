@@ -50,6 +50,37 @@ model = "haiku"
 
 daemon 启动时读取配置。修改后运行 `axiopera daemon stop`，下一次调用会重新启动。未知配置项会报错。
 
+## Skill 与 Codex 插件
+
+skill 让 agent 在派发任务前先运行 `axiopera guide`，效果与在项目说明中写明这一点相同。skill 就是仓库中的 [`plugins/axiopera/skills/axiopera/`](../plugins/axiopera/skills/axiopera) 目录，复制到 agent 的 skills 目录即可，删除该目录即卸载：
+
+| agent | 位置 |
+|---|---|
+| Claude Code | `~/.claude/skills/axiopera/` |
+| Codex | `~/.agents/skills/axiopera/` |
+| Grok | 默认也读取上面两个位置；只用 Grok 时放到 `~/.grok/skills/axiopera/` |
+
+每个会话的上下文都会列出 skill 的名称和描述，约占一行。
+
+Codex 插件包含同一个 skill，另带 hook，让宿主在一轮进行中也能得知子任务的消息。装了插件就不必再复制 skill。插件不包含 `axiopera` 程序。
+
+- 安装：`codex plugin marketplace add Victor-Quqi/Axiopera`，再 `codex plugin add axiopera@axiopera`。
+- 卸载：`codex plugin remove axiopera@axiopera`，再 `codex plugin marketplace remove axiopera`。
+
+hook 要在桌面端的插件页或 TUI 的 `/hooks` 中信任后才运行，插件更新后需重新信任。VS Code 扩展官方不支持插件。hook 的作用：
+
+- 工具调用之后，如果有新的结果、提问或审批请求，提醒宿主运行 `wait`。
+- 一轮即将结束时，如果仍有未取的内容，让这一轮继续一次，取完再结束。
+
+装了插件后，Codex 每个会话都会启动一个 `axiopera mcp --codex-hooks` 进程。hook 只查询已在运行的 daemon，不会启动它；没有相关任务时立即返回。实测进程启动不到 0.1 秒，每次 hook 调用不到 1 毫秒。删除 `axiopera` 程序前先卸载插件，否则 Codex 无法启动这个进程。
+
+Codex 卸载插件后会留下以下内容，运行 `axiopera plugin cleanup` 清除：
+
+- `config.toml` 中 hook 的信任记录 `[hooks.state."axiopera@<来源>:codex/hooks.json:…"]`。如果保留，重装定义相同的插件时会直接沿用旧的信任。
+- 空目录 `plugins/cache/axiopera`。
+
+数据目录取 `CODEX_HOME`，未设置时为 `~/.codex`。插件仍装着时，清理命令不做任何处理。配置通过 Codex 自己的配置接口修改。
+
 ## daemon 与清理
 
 CLI 按需启动 daemon。没有运行中的 agent 和客户端连接时，daemon 空闲 10 分钟后退出。主会话退出不会取消已派发的任务。

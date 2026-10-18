@@ -1,0 +1,12 @@
+{
+  "name": "axiopera",
+  "interface": { "displayName": "Axiopera" },
+  "plugins": [
+    {
+      "name": "axiopera",
+      "source": { "source": "local", "path": "./plugins/axiopera" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Developer Tools"
+    }
+  ]
+}

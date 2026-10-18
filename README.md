@@ -32,7 +32,18 @@ Git is required for separate working copies. Windows and Linux have been tested;
 
 ## Get started
 
-Add this to your coding agent's project instructions:
+Give your coding agent the Axiopera skill, so it knows how to delegate: copy the [`plugins/axiopera/skills/axiopera`](plugins/axiopera/skills/axiopera) folder into `~/.claude/skills/` for Claude Code, or into `~/.agents/skills/` for Codex. Grok reads both.
+
+In Codex you can install the plugin instead. Besides the skill, it lets a busy session know when its sub-tasks have news:
+
+```sh
+codex plugin marketplace add Victor-Quqi/Axiopera
+codex plugin add axiopera@axiopera
+```
+
+The [usage guide](docs/usage.md#skill-与-codex-插件) covers the hooks and uninstalling.
+
+Or add this to your agent's project instructions instead:
 
 > When delegating tasks through Axiopera, run `axiopera guide` first.
 

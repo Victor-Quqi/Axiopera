@@ -255,6 +255,17 @@ impl Remote {
         Ok(r["deleted"] == true)
     }
 
+    /// Delete keys from the user's `config.toml`, editing it the way Codex itself does.
+    pub async fn clear_config(&mut self, key_paths: &[String]) -> Result<()> {
+        let edits: Vec<Value> = key_paths
+            .iter()
+            .map(|k| json!({"keyPath": k, "value": null, "mergeStrategy": "replace"}))
+            .collect();
+        self.call("config/batchWrite", json!({"edits": edits}))
+            .await?;
+        Ok(())
+    }
+
     async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.next += 1;
         let id = self.next;

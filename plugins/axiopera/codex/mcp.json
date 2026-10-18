@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "axiopera-hooks": {
+      "command": "axiopera",
+      "args": ["mcp", "--codex-hooks"],
+      "env_vars": ["AXIOPERA_HOME"],
+      "tool_timeout_sec": 10
+    }
+  }
+}

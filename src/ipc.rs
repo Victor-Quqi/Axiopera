@@ -117,6 +117,8 @@ pub enum Request {
     Detach {
         task: String,
     },
+    /// Whether the caller has unseen events that need it; for host hooks.
+    Pending,
 }
 
 impl Request {
