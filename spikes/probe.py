@@ -52,7 +52,7 @@ ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b.)?|
 # Host session identity leaks into every descendant; a sub-agent must not inherit ours.
 IDENTITY_VARS = {
     "CLAUDECODE", "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CLAUDE_CODE_ENTRYPOINT",
-    "CODEX_THREAD_ID", "CODEX_SESSION_ID", "GROK_SESSION_ID", "GROK_AGENT",
+    "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "GROK_SESSION_ID", "GROK_AGENT",
     "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
 }
 

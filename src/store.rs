@@ -219,6 +219,9 @@ pub struct Ledger {
     pub codex_hosts: std::collections::HashMap<String, CodexHost>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub pending_pushes: std::collections::HashMap<String, PendingPush>,
+    /// Reminders queued for hosts that have not run `wait` since, by queued message ID.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub doorbells: std::collections::HashMap<String, String>,
 }
 
 /// A batch written without an acknowledged reply, recoverable after a daemon restart.
@@ -229,13 +232,17 @@ pub struct PendingPush {
     pub turns: Vec<(String, u32)>,
 }
 
-/// A Codex session on the user's shared app-server daemon, reached through `exe`.
+/// A Codex session reached through `exe`.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct CodexHost {
     pub exe: PathBuf,
-    /// The caller's `CODEX_HOME`, which locates its daemon.
+    /// The caller's `CODEX_HOME`, which locates its daemon and data.
     pub codex_home: Option<PathBuf>,
     pub thread: String,
+    /// Outside the shared daemon: reminded through Codex's queue to run `wait`, rather than
+    /// sent the events.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub doorbell: bool,
 }
 
 impl Ledger {

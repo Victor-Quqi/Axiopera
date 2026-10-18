@@ -27,6 +27,7 @@ use crate::paths;
 use crate::platform;
 use crate::store::{self, Event, Ledger, Status, Store, Task};
 use crate::worktree;
+use push::Reach;
 
 pub use task::Cmd;
 
@@ -470,7 +471,9 @@ impl Daemon {
                 self.send(&caller, &task, message, env.env, out).await
             }
             Request::Wait { tasks, timeout_ms } => {
-                self.wait(&caller, &tasks, timeout_ms, out).await
+                let exit = self.wait(&caller, &tasks, timeout_ms, out).await;
+                self.retract_doorbell(&caller);
+                exit
             }
             Request::Watch => self.watch(&caller, out).await,
             Request::Status { task, all } => self.status(&caller, task.as_deref(), all, out).await,
@@ -613,7 +616,7 @@ impl Daemon {
         }
         agent::resolve_exe(s.agent, self.opts.agents.get(s.agent).path.as_deref(), &env)
             .map_err(|e| anyhow!(RefuseErr(ErrorCode::Invalid, format!("{e:#}"))))?;
-        let pushed = self.register_host(caller, &env).await;
+        let reach = self.register_host(caller, &env).await;
 
         let now = store::now_ms();
         let id = store::new_id('t', |id| self.store.exists(id));
@@ -687,10 +690,14 @@ impl Daemon {
                 notes.push(format!("approval requests go to {approver}"));
             }
         }
-        let next = if pushed {
-            "Results and questions arrive as messages: do not wait or poll; end your turn if nothing else is left."
-        } else {
-            "Get results and questions with `axiopera wait`."
+        let next = match reach {
+            Reach::Push => {
+                "Results and questions arrive as messages: do not wait or poll; end your turn if nothing else is left."
+            }
+            Reach::Doorbell => {
+                "After your turn ends, a message tells you when results or questions are ready for `axiopera wait`: do not poll; end your turn if nothing else is left."
+            }
+            Reach::Wait => "Get results and questions with `axiopera wait`.",
         };
         let state = if self.lock().tasks[&id].actor.is_some() {
             "running"
@@ -703,7 +710,7 @@ impl Daemon {
         }
         out.text(
             text,
-            json!({"task": id, "agent": s.agent, "tier": s.tier, "notes": notes, "pushed": pushed, "status": state}),
+            json!({"task": id, "agent": s.agent, "tier": s.tier, "notes": notes, "reach": reach, "status": state}),
         )
         .await?;
         Ok(ipc::exit::OK)
@@ -1168,6 +1175,9 @@ impl Daemon {
                 .retain(|host, _| tasks.values().any(|e| e.task.parent == *host));
             ledger
                 .pending_pushes
+                .retain(|host, _| ledger.codex_hosts.contains_key(host));
+            ledger
+                .doorbells
                 .retain(|host, _| ledger.codex_hosts.contains_key(host));
             ledger.save(&self.opts.home)?;
         }

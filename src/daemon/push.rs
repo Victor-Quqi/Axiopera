@@ -1,6 +1,7 @@
 //! Sub-task events sent straight into host sessions that take messages, so a host learns of
 //! them while it keeps working, or after it ended its turn, without running `axiopera wait`.
-//! Only Codex sessions on the user's shared Codex daemon so far.
+//! Only Codex sessions so far: those on the user's shared Codex daemon get the events; those of
+//! the Codex app and IDE extension get a reminder to run `wait` once their turn ends.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -25,6 +26,17 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// Retries after a failed push start here and double up to the maximum.
 const RETRY: Duration = Duration::from_secs(30);
 const RETRY_MAX: Duration = Duration::from_secs(600);
+const DOORBELL: &str = "From your sub-tasks (sent by axiopera, not typed by the user): new results \
+    or requests are waiting. Get them with `axiopera wait --timeout 60s`.";
+
+/// How a host learns of its sub-tasks' events.
+#[derive(Clone, Copy, PartialEq, Debug, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum Reach {
+    Push,
+    Doorbell,
+    Wait,
+}
 
 /// Sibling notes, detach notices and the host's own cancellations go with the next push.
 fn needs_host(event: &Event, caller: &str) -> bool {
@@ -39,49 +51,72 @@ fn needs_host(event: &Event, caller: &str) -> bool {
 
 impl Daemon {
     /// Register the caller as a host to push to if it is a Codex session the user's Codex
-    /// daemon has open. Returns whether events will be pushed to it.
-    pub(super) async fn register_host(&self, caller: &str, env: &[(String, String)]) -> bool {
+    /// daemon has open, or to ring if a long-lived client runs it.
+    pub(super) async fn register_host(&self, caller: &str, env: &[(String, String)]) -> Reach {
         let Some(thread) = caller.strip_prefix("codex:") else {
-            return false;
+            return Reach::Wait;
         };
         let configured = self.opts.agents.get(Agent::Codex).path.as_deref();
         let Ok(exe) = agent::resolve_exe(Agent::Codex, configured, env) else {
-            return false;
+            return Reach::Wait;
         };
         let codex_home = env
             .iter()
             .find(|(k, _)| k == "CODEX_HOME")
             .map(|(_, v)| PathBuf::from(v));
-        let host = CodexHost {
+        let mut host = CodexHost {
             exe,
             codex_home,
             thread: thread.to_string(),
+            doorbell: false,
         };
-        let open = tokio::time::timeout(PROBE, async {
-            Remote::connect(&host.exe, host.codex_home.as_deref())
-                .await?
-                .is_open(thread)
-                .await
-        })
-        .await;
-        match open {
-            Ok(Ok(true)) => {
-                let mut st = self.lock();
-                st.ledger.codex_hosts.insert(caller.to_string(), host);
-                if let Err(e) = st.ledger.save(&self.opts.home) {
-                    self.log(&format!("saving the ledger: {e:#}"));
-                }
-                true
-            }
-            Ok(Ok(false)) => false,
+        let home = host.codex_home.as_deref();
+        let reach = if self
+            .probe(caller, "is not on the shared Codex daemon", async {
+                Remote::connect(&host.exe, home)
+                    .await?
+                    .is_open(thread)
+                    .await
+            })
+            .await
+        {
+            Reach::Push
+        } else if self
+            .probe(caller, "has no Codex queue", async {
+                Remote::private(&host.exe, home)
+                    .await?
+                    .serves_queue(thread)
+                    .await
+            })
+            .await
+        {
+            Reach::Doorbell
+        } else {
+            return Reach::Wait;
+        };
+        host.doorbell = reach == Reach::Doorbell;
+        let mut st = self.lock();
+        st.ledger.codex_hosts.insert(caller.to_string(), host);
+        if let Err(e) = st.ledger.save(&self.opts.home) {
+            self.log(&format!("saving the ledger: {e:#}"));
+        }
+        reach
+    }
+
+    async fn probe(
+        &self,
+        caller: &str,
+        failure: &str,
+        check: impl Future<Output = anyhow::Result<bool>>,
+    ) -> bool {
+        match tokio::time::timeout(PROBE, check).await {
+            Ok(Ok(yes)) => yes,
             Ok(Err(e)) => {
-                self.log(&format!("{caller} takes no messages: {e:#}"));
+                self.log(&format!("{caller} {failure}: {e:#}"));
                 false
             }
             Err(_) => {
-                self.log(&format!(
-                    "{caller} takes no messages: the Codex daemon did not answer"
-                ));
+                self.log(&format!("{caller} {failure}: Codex did not answer"));
                 false
             }
         }
@@ -250,7 +285,7 @@ impl Daemon {
         Ok(())
     }
 
-    /// Send the caller what `wait` would print. Tried again later if that fails.
+    /// Tell the caller of its events. Tried again later if that fails.
     async fn push(self: &Arc<Self>, caller: &str) {
         let delivering = self.delivery(caller).lock_owned().await;
         {
@@ -268,6 +303,38 @@ impl Daemon {
         let Some(host) = host else {
             return;
         };
+        let outcome = if host.doorbell {
+            self.ring(caller, &host).await
+        } else {
+            self.send_events(caller, &host).await
+        };
+        match outcome {
+            Ok(how) => {
+                self.lock().push_failures.remove(caller);
+                self.log(&format!("push to {caller}: {how}"));
+            }
+            Err(e) => {
+                let failures = {
+                    let mut st = self.lock();
+                    let n = st.push_failures.entry(caller.to_string()).or_default();
+                    *n += 1;
+                    *n
+                };
+                let delay = RETRY
+                    .saturating_mul(1 << (failures - 1).min(5))
+                    .min(RETRY_MAX);
+                self.log(&format!(
+                    "{caller} kept its events: {e}; trying again in {}s",
+                    delay.as_secs()
+                ));
+                drop(delivering);
+                self.schedule_push(caller.to_string(), delay);
+            }
+        }
+    }
+
+    /// Send the caller what `wait` would print.
+    async fn send_events(&self, caller: &str, host: &CodexHost) -> Result<String, String> {
         let mut remote = None;
         let mut batch = None;
         let sent = tokio::time::timeout(TIMEOUT, async {
@@ -318,29 +385,72 @@ impl Daemon {
         } else if batch.is_some() && !remote.as_ref().is_some_and(Remote::sent) {
             self.clear_pending_push(caller);
         }
-        match outcome {
-            Ok(how) => {
-                self.lock().push_failures.remove(caller);
-                self.log(&format!("push to {caller}: {how}"));
+        outcome
+    }
+
+    /// Queue a reminder for the host's next turn, unless the last one is still queued.
+    async fn ring(&self, caller: &str, host: &CodexHost) -> Result<String, String> {
+        let rung = self.lock().ledger.doorbells.get(caller).cloned();
+        let result = tokio::time::timeout(TIMEOUT, async {
+            let mut r = Remote::private(&host.exe, host.codex_home.as_deref()).await?;
+            if let Some(id) = rung
+                && r.queued(&host.thread, &id).await?
+            {
+                return Ok("its reminder is still queued".to_string());
             }
-            Err(e) => {
-                let failures = {
-                    let mut st = self.lock();
-                    let n = st.push_failures.entry(caller.to_string()).or_default();
-                    *n += 1;
-                    *n
-                };
-                let delay = RETRY
-                    .saturating_mul(1 << (failures - 1).min(5))
-                    .min(RETRY_MAX);
-                self.log(&format!(
-                    "{caller} kept its events: {e}; trying again in {}s",
-                    delay.as_secs()
-                ));
-                drop(delivering);
-                self.schedule_push(caller.to_string(), delay);
-            }
+            let id = r.enqueue(&host.thread, DOORBELL).await?;
+            let mut st = self.lock();
+            st.ledger.doorbells.insert(caller.to_string(), id);
+            st.ledger.save(&self.opts.home)?;
+            anyhow::Ok("queued a reminder".to_string())
+        })
+        .await;
+        match result {
+            Ok(result) => result.map_err(|e| format!("{e:#}")),
+            Err(_) => Err("timed out".to_string()),
         }
+    }
+
+    /// After the host ran `wait`: a reminder still queued would start a turn for nothing.
+    pub(super) fn retract_doorbell(self: &Arc<Self>, caller: &str) {
+        let (id, host) = {
+            let mut st = self.lock();
+            if self
+                .unseen(&st, caller, &[])
+                .iter()
+                .any(|e| needs_host(e, caller))
+            {
+                return;
+            }
+            let Some(id) = st.ledger.doorbells.remove(caller) else {
+                return;
+            };
+            if let Err(e) = st.ledger.save(&self.opts.home) {
+                self.log(&format!("saving the ledger: {e:#}"));
+            }
+            (id, st.ledger.codex_hosts.get(caller).cloned())
+        };
+        let Some(host) = host else {
+            return;
+        };
+        let d = self.clone();
+        let caller = caller.to_string();
+        tokio::spawn(async move {
+            let deleted = tokio::time::timeout(TIMEOUT, async {
+                Remote::private(&host.exe, host.codex_home.as_deref())
+                    .await?
+                    .dequeue(&host.thread, &id)
+                    .await
+            })
+            .await;
+            let how = match deleted {
+                Ok(Ok(true)) => "withdrew its queued reminder".to_string(),
+                Ok(Ok(false)) => return,
+                Ok(Err(e)) => format!("could not withdraw its queued reminder: {e:#}"),
+                Err(_) => "could not withdraw its queued reminder: timed out".to_string(),
+            };
+            d.log(&format!("{caller} {how}"));
+        });
     }
 }
 
@@ -406,6 +516,7 @@ mod tests {
                 exe: f.d.opts.home.join("missing-codex"),
                 codex_home: Some(f.d.opts.home.clone()),
                 thread: "host".into(),
+                doorbell: false,
             },
         );
         f.d.cancel_tree("test", "cancelled by request", "codex:host");
@@ -451,5 +562,50 @@ mod tests {
                 found.then_some(7)
             );
         }
+    }
+
+    #[test]
+    fn hosts_registered_before_doorbells_are_pushed_to() {
+        let host: CodexHost =
+            serde_json::from_value(serde_json::json!({"exe": "codex", "thread": "t"})).unwrap();
+        assert!(!host.doorbell);
+        assert!(
+            serde_json::to_value(&host)
+                .unwrap()
+                .get("doorbell")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_withdraws_the_reminder_once_nothing_needs_the_host() {
+        let f = fixture();
+        {
+            let mut st = f.d.lock();
+            st.ledger.codex_hosts.insert(
+                "codex:host".into(),
+                CodexHost {
+                    exe: f.d.opts.home.join("missing-codex"),
+                    codex_home: Some(f.d.opts.home.clone()),
+                    thread: "host".into(),
+                    doorbell: true,
+                },
+            );
+            st.ledger
+                .doorbells
+                .insert("codex:host".into(), "queued".into());
+        }
+        f.d.emit("test", "stalled", serde_json::json!({"quiet_secs": 60}));
+        f.d.retract_doorbell("codex:host");
+        assert!(f.d.lock().ledger.doorbells.contains_key("codex:host"));
+        let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
+        f.d.mark_seen("codex:host", &events, &[]).unwrap();
+        f.d.retract_doorbell("codex:host");
+        assert!(f.d.lock().ledger.doorbells.is_empty());
+        assert!(
+            crate::store::Ledger::load(&f.d.opts.home)
+                .doorbells
+                .is_empty()
+        );
     }
 }

@@ -31,8 +31,11 @@
 | [会话与消息](backends.md#会话与消息)：Grok 空闲时的消息，以及一次 prompt 内的多段答复 | `grok_idle_interject.py`、`grok_response_boundary.py` |
 | [会话与消息](backends.md#会话与消息)：后台命令结束后自行开启一轮 | `background.py` |
 | [会话与消息](backends.md#会话与消息)：并发续接 | `resume.py` |
+| [宿主通知](backends.md#宿主通知)：Claude 和 Grok 在本轮进行中能否收到后台命令的完成通知 | `background.py busy` |
 | [宿主通知](backends.md#宿主通知)：Codex 推送通道，以及 TUI 退出后会话约一分钟才卸载 | `codex_host_push.py` |
-| [宿主通知](backends.md#宿主通知)：Claude Code VS Code 扩展的后台 `wait` 唤醒；Codex 桌面端和 VS Code 扩展的私有 app-server | 手动实验 |
+| [宿主通知](backends.md#宿主通知)：Codex 门铃，包括宿主自行 `wait` 后撤回提醒；app-server 客户端会话的来源为 `vscode` | `codex_doorbell.py` |
+| [宿主通知](backends.md#宿主通知)：队列的检查间隔和分发规则 | 源码 [Codex queue service.rs](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/ext/queue/src/service.rs#L89-L245) |
+| [宿主通知](backends.md#宿主通知)：Claude Code VS Code 扩展的后台 `wait` 唤醒；Codex 桌面端和 VS Code 扩展的私有 app-server；桌面端处理外部排入的队列消息 | 手动实验 |
 | [宿主通知](backends.md#宿主通知)：不向 Claude inbox socket 推送 | 手动实验；文档 [Claude 跨会话消息](https://code.claude.com/docs/en/cross-session-messaging) |
 | [宿主通知](backends.md#宿主通知)：Windows 上 Codex 的退出码 | 手动实验；源码 [Codex shell.rs](https://github.com/openai/codex/blob/ce0323f2f2d3b25e82806cd555237da3db4e1897/codex-rs/core/src/shell.rs#L34-L40) |
 | [daemon 生命周期](design.md#daemon-生命周期)：Windows 进程存活、Job 取消和命名管道权限 | `daemon_job.py`、`ipc_sandbox.py`、`winproc/` |

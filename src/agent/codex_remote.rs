@@ -1,6 +1,7 @@
 //! A host Codex session, reached through the user's shared Codex app-server daemon, which the
-//! interactive Codex uses by default. `codex app-server proxy` relays bytes to the daemon's
-//! control socket; the daemon speaks JSON-RPC over WebSocket.
+//! interactive Codex uses by default, or through a private app-server for sessions the daemon
+//! does not have. `codex app-server proxy` relays bytes to the daemon's control socket, which
+//! speaks JSON-RPC over WebSocket; a private `codex app-server` speaks it in lines on stdio.
 
 use std::path::Path;
 use std::process::Stdio;
@@ -15,6 +16,8 @@ pub struct Remote {
     stdin: ChildStdin,
     stdout: ChildStdout,
     buf: Vec<u8>,
+    /// Through the shared daemon rather than a private app-server.
+    shared: bool,
     next: u64,
     /// A message went out and was not refused.
     sent: bool,
@@ -23,28 +26,7 @@ pub struct Remote {
 impl Remote {
     /// `codex_home` locates the daemon; `None` means Codex's default.
     pub async fn connect(exe: &Path, codex_home: Option<&Path>) -> Result<Remote> {
-        let mut cmd = Command::new(exe);
-        cmd.args(["app-server", "proxy"]);
-        match codex_home {
-            Some(home) => cmd.env("CODEX_HOME", home),
-            None => cmd.env_remove("CODEX_HOME"),
-        };
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        // The daemon has no console; without this Windows opens a window for the proxy.
-        #[cfg(windows)]
-        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
-        let mut child = cmd.spawn().context("starting `codex app-server proxy`")?;
-        let mut r = Remote {
-            stdin: child.stdin.take().unwrap(),
-            stdout: child.stdout.take().unwrap(),
-            _child: child,
-            buf: Vec::new(),
-            next: 0,
-            sent: false,
-        };
+        let mut r = Remote::spawn(exe, codex_home, &["app-server", "proxy"], true)?;
         let key = base64(&uuid::Uuid::new_v4().into_bytes());
         r.stdin
             .write_all(
@@ -65,19 +47,56 @@ impl Remote {
         if !head.starts_with(b"HTTP/1.1 101") {
             bail!("the Codex daemon refused the connection");
         }
-        r.call(
-            "initialize",
-            json!({"clientInfo": {"name": "axiopera", "version": env!("CARGO_PKG_VERSION")}}),
-        )
-        .await?;
-        r.send_frame(
-            0x1,
-            json!({"method": "initialized", "params": {}})
-                .to_string()
-                .as_bytes(),
-        )
-        .await?;
+        r.initialize(None).await?;
         Ok(r)
+    }
+
+    /// An app-server of its own on the Codex home's data, which reads any stored session and
+    /// writes its queue, but runs none.
+    pub async fn private(exe: &Path, codex_home: Option<&Path>) -> Result<Remote> {
+        let mut r = Remote::spawn(exe, codex_home, &["app-server"], false)?;
+        // The queue is an experimental API.
+        r.initialize(Some(json!({"experimentalApi": true}))).await?;
+        Ok(r)
+    }
+
+    fn spawn(exe: &Path, codex_home: Option<&Path>, args: &[&str], shared: bool) -> Result<Remote> {
+        let mut cmd = Command::new(exe);
+        cmd.args(args);
+        match codex_home {
+            Some(home) => cmd.env("CODEX_HOME", home),
+            None => cmd.env_remove("CODEX_HOME"),
+        };
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        // The daemon has no console; without this Windows opens a window for the child.
+        #[cfg(windows)]
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("starting `codex {}`", args.join(" ")))?;
+        Ok(Remote {
+            stdin: child.stdin.take().unwrap(),
+            stdout: child.stdout.take().unwrap(),
+            _child: child,
+            buf: Vec::new(),
+            shared,
+            next: 0,
+            sent: false,
+        })
+    }
+
+    async fn initialize(&mut self, capabilities: Option<Value>) -> Result<()> {
+        let mut params =
+            json!({"clientInfo": {"name": "axiopera", "version": env!("CARGO_PKG_VERSION")}});
+        if let Some(c) = capabilities {
+            params["capabilities"] = c;
+        }
+        self.call("initialize", params).await?;
+        self.send(json!({"method": "initialized", "params": {}}))
+            .await
     }
 
     /// Whether the session is open in the daemon. A closed one must not be messaged: that
@@ -168,11 +187,79 @@ impl Remote {
         }
     }
 
+    /// Whether a long-lived client serves the session's queue. Sessions of app-server clients,
+    /// such as the Codex app and the IDE extension, report `vscode`. `codex exec` quits after
+    /// its turn, so a message queued for it would fire whenever the session is next opened. The
+    /// terminal Codex normally runs on the shared daemon and is not tried outside it.
+    pub async fn serves_queue(&mut self, thread: &str) -> Result<bool> {
+        let t = self
+            .call("thread/read", json!({"threadId": thread}))
+            .await?;
+        let t = &t["thread"];
+        if t["source"] != "vscode" || t["ephemeral"] == true {
+            return Ok(false);
+        }
+        // Fails where this Codex has no queue.
+        self.call("thread/queue/list", json!({"threadId": thread, "limit": 1}))
+            .await?;
+        Ok(true)
+    }
+
+    /// Queue a message for the session's next turn; returns its ID.
+    pub async fn enqueue(&mut self, thread: &str, text: &str) -> Result<String> {
+        let added = self
+            .call(
+                "thread/queue/add",
+                json!({
+                    "threadId": thread,
+                    "input": [{"type": "text", "text": text}],
+                    "clientUserMessageId": format!("axiopera-{}", uuid::Uuid::new_v4()),
+                }),
+            )
+            .await?;
+        added["queuedSubmission"]["id"]
+            .as_str()
+            .map(str::to_string)
+            .context("thread/queue/add omitted the ID")
+    }
+
+    /// Whether a queued message still waits to start a turn.
+    pub async fn queued(&mut self, thread: &str, id: &str) -> Result<bool> {
+        let mut cursor = Value::Null;
+        loop {
+            let page = self
+                .call(
+                    "thread/queue/list",
+                    json!({"threadId": thread, "cursor": cursor}),
+                )
+                .await?;
+            let items = page["data"].as_array().into_iter().flatten();
+            if items.filter_map(|s| s["id"].as_str()).any(|s| s == id) {
+                return Ok(true);
+            }
+            cursor = page["nextCursor"].clone();
+            if cursor.is_null() {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Returns whether it was still queued.
+    pub async fn dequeue(&mut self, thread: &str, id: &str) -> Result<bool> {
+        let r = self
+            .call(
+                "thread/queue/delete",
+                json!({"threadId": thread, "queuedSubmissionId": id}),
+            )
+            .await?;
+        Ok(r["deleted"] == true)
+    }
+
     async fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.next += 1;
         let id = self.next;
-        let request = json!({"id": id, "method": method, "params": params});
-        self.send_frame(0x1, request.to_string().as_bytes()).await?;
+        self.send(json!({"id": id, "method": method, "params": params}))
+            .await?;
         loop {
             let m = self.recv().await?;
             // Notifications and the daemon's own requests carry a method; replies do not.
@@ -187,6 +274,16 @@ impl Remote {
             }
             return Ok(m["result"].clone());
         }
+    }
+
+    async fn send(&mut self, message: Value) -> Result<()> {
+        let text = message.to_string();
+        if self.shared {
+            return self.send_frame(0x1, text.as_bytes()).await;
+        }
+        self.stdin.write_all(format!("{text}\n").as_bytes()).await?;
+        self.stdin.flush().await?;
+        Ok(())
     }
 
     async fn send_frame(&mut self, opcode: u8, data: &[u8]) -> Result<()> {
@@ -212,6 +309,15 @@ impl Remote {
     }
 
     async fn recv(&mut self) -> Result<Value> {
+        if !self.shared {
+            loop {
+                if let Some(i) = self.buf.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = self.buf.drain(..=i).collect();
+                    return serde_json::from_slice(&line).map_err(|e| anyhow!(e));
+                }
+                self.read_more().await?;
+            }
+        }
         let mut message = Vec::new();
         loop {
             self.fill(2).await?;
@@ -255,7 +361,10 @@ impl Remote {
         let mut chunk = [0u8; 8192];
         let n = self.stdout.read(&mut chunk).await?;
         if n == 0 {
-            bail!("the Codex daemon is not running");
+            if self.shared {
+                bail!("the Codex daemon is not running");
+            }
+            bail!("the Codex app-server exited");
         }
         self.buf.extend_from_slice(&chunk[..n]);
         Ok(())

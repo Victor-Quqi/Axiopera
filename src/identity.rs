@@ -11,14 +11,16 @@ pub const HOST_VARS: [(&str, &str); 3] = [
 ];
 
 /// Host identity variables a sub-agent must not inherit from its caller, including the
-/// credentials of a Claude Code session's inbox.
-pub const STRIP_VARS: [&str; 10] = [
+/// credentials of a Claude Code session's inbox, and the client name the Codex app and IDE
+/// extension give their sessions.
+pub const STRIP_VARS: [&str; 11] = [
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_PID",
     "CLAUDE_CODE_ENTRYPOINT",
     "CODEX_THREAD_ID",
     "CODEX_SESSION_ID",
+    "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
     "GROK_SESSION_ID",
     "GROK_AGENT",
     "CLAUDE_CODE_MESSAGING_SOCKET",

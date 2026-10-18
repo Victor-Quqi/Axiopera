@@ -80,10 +80,27 @@ Grok 的 `_x.ai/session/interjection` 只确认入队。轮末输出注明消费
 
 ## 宿主通知
 
-Claude 和 Grok 使用后台 `wait` 的退出通知或 monitor。唤醒由宿主进程完成，与界面无关，Claude Code 的 VS Code 扩展同样适用。Axiopera 不向 Claude inbox socket 推送，因为 Linux 上脱离宿主进程树的 daemon 会触发入站批准，而且该接口没有送达回执。
+| 宿主 | 本轮结束后 | 本轮进行中 | 方式 |
+|---|---|---|---|
+| Claude Code，含 VS Code 扩展 | 自动开启一轮 | 下一次工具调用前送达 | 后台运行 `wait` |
+| Grok | 自动开启一轮 | 等本轮结束 | 后台运行 `wait`，或 `watch` 配合 monitor |
+| Codex TUI | 自动开启一轮 | 送入当前轮 | 推送 |
+| Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 等本轮结束 | 门铃 |
+| 其他 Codex 会话 | 不唤醒 | 不送达 | 轮询 `wait` |
 
-Codex 交互式会话挂在用户级 app-server daemon 上时，Axiopera 经 `codex app-server proxy` 连接其 WebSocket JSON-RPC。用 `thread/loaded/list` 确认会话已加载，再按轮次状态调用 `turn/steer` 或 `turn/start`。`codex exec`、`--no-daemon`、带 `-c` 配置覆盖、Windows 管理员终端中的会话，以及各自以 stdio 启动私有 app-server 的 Codex 桌面端和 VS Code 扩展，都不走此通道，需要轮询 `wait`。
+Claude 和 Grok 由宿主进程在后台命令退出时唤醒，与界面无关。Axiopera 不向 Claude inbox socket 推送，因为 Linux 上脱离宿主进程树的 daemon 会触发入站批准，而且该接口没有送达回执。
+
+Codex 交互式会话挂在用户级 app-server daemon 上时，Axiopera 经 `codex app-server proxy` 连接其 WebSocket JSON-RPC。用 `thread/loaded/list` 确认会话已加载，再按轮次状态调用 `turn/steer` 或 `turn/start`。`codex exec`、`--no-daemon`、带 `-c` 配置覆盖、Windows 管理员终端中的会话不在该 daemon 上；桌面端和 VS Code 扩展的会话也不在，它们各自以 stdio 启动私有 app-server。
+
+不在共享 daemon 上的会话，由 Axiopera 另起的私有 `codex app-server` 用 `thread/read` 读取来源。来源为 `vscode` 表示 app-server 客户端的会话，桌面端和 VS Code 扩展都属于此类，Axiopera 对其使用门铃：
+
+- 用持久化队列的 `thread/queue/add` 排入一条提醒，让宿主运行 `wait`。队列属于实验性 API，需在 `initialize` 中声明 `experimentalApi`。
+- 加载了该会话的 app-server 约每 10 秒检查一次队列。会话空闲时用提醒开启一轮，运行中则等本轮结束。用户中断上一轮后，要等下一轮开始才继续处理。会话未打开时提醒一直保留。
+- 提醒在界面上显示为一条用户消息。
+- 宿主运行 `wait` 后，Axiopera 用 `thread/queue/delete` 撤回尚未处理的提醒。
+
+`codex exec` 跑完一轮就退出，排入的提醒要到下次打开该会话时才触发，因此不用门铃。
 
 Windows 上 Codex 经 PowerShell `-Command` 执行命令，外部程序的非零退出码一律报告为 1。
 
-TUI 退出后，Codex daemon 约一分钟才卸载会话，这段时间到达的事件仍可能开启一轮。推送去重和重试见[内部设计](design.md#codex-宿主推送)。
+TUI 退出后，Codex daemon 约一分钟才卸载会话，这段时间到达的事件仍可能开启一轮。推送去重、门铃和重试见[内部设计](design.md#codex-推送与门铃)。

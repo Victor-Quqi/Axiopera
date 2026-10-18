@@ -48,7 +48,7 @@
   worktrees/<repo>-<hash>/<id>/
 ```
 
-`task.json` 记录状态、仓库根目录、原生会话和 worktree 信息，写临时文件后原子替换。`events.jsonl` 只追加。`ledger.json` 保存游标、结果交付标记、Codex 推送目标和待确认批次。事件序号在整个 daemon 内单调递增，重启后继续。
+`task.json` 记录状态、仓库根目录、原生会话和 worktree 信息，写临时文件后原子替换。`events.jsonl` 只追加。`ledger.json` 保存游标、结果交付标记、Codex 推送目标、待确认批次和已排入的门铃。事件序号在整个 daemon 内单调递增，重启后继续。
 
 提问和答案随任务保存。审批应答通道、尚未送出的兄弟留言和消息消费跟踪 ID 只保存在内存中。
 
@@ -84,7 +84,7 @@ socket 连接返回 EPERM 时，客户端提示到 sandbox 外重跑。各后端
 
 daemon 用调用方经 IPC 传来的环境启动子 agent。环境只留在内存；daemon 重启后的续接使用新一次 `send` 的环境。受限客户端传来的环境不用于启动进程。
 
-启动前清除 `identity::STRIP_VARS` 列出的宿主身份和 inbox 凭据，注入任务 ID 与数据目录，并把 daemon 所在目录加入 PATH。各 backend 的配置覆盖见[后端文档](backends.md#可执行文件与配置继承)。
+启动前清除 `identity::STRIP_VARS` 列出的宿主身份、inbox 凭据和 Codex 客户端标识，注入任务 ID 与数据目录，并把 daemon 所在目录加入 PATH。各 backend 的配置覆盖见[后端文档](backends.md#可执行文件与配置继承)。
 
 ## 事件与交付
 
@@ -117,15 +117,17 @@ spawned、turn_started、steered、input_read、tool、file_changed、answered�
 
 `spawn` 回执告诉宿主适用哪种取结果方式。各宿主的能力见[后端文档](backends.md#宿主通知)。
 
-## Codex 宿主推送
+## Codex 推送与门铃
 
-`spawn` 尝试注册宿主推送，回执告诉主 agent 是否需要 `wait`。连接方式和可推送的会话见[后端文档](backends.md#宿主通知)。
+`spawn` 依次尝试注册推送和门铃，回执告诉主 agent 结果怎样送达。连接方式和适用的会话见[后端文档](backends.md#宿主通知)。
 
 推送与 `wait` 按调用方串行，从读取事件到推进游标都持有同一把锁。发出消息但未收到应答时，ledger 保存批次标记、事件序号和结果轮次。下次连接用 `thread/turns/list` 读回完整用户消息，找到标记才确认，找不到则重发。读回失败时按已送达处理并记日志。`wait` 交付前也核对该批次。
 
 推送合并 1 秒内的事件。失败后从 30 秒起指数退避，最长 10 分钟，新事件可以提前触发重试。兄弟留言抄送、交接通知和宿主自己发起的取消不会单独开一轮；超时或其他调用方的取消仍会推送。
 
-推送目标随 ledger 持久化，包含 Codex 路径、home 和 thread ID。只有 `spawn` 注册目标；`gc` 删除已无任务的目标。
+门铃不携带事件，交付仍由 `wait` 完成，因此不需要读回确认。上一条提醒仍在队列中时不再排入；提醒已被处理而宿主没有 `wait` 时，新事件会再排入一条。宿主 `wait` 后，若已没有需要它处理的事件，就撤回仍在队列中的提醒，避免空开一轮。排入失败时与推送一样退避重试。
+
+推送目标随 ledger 持久化，包含 Codex 路径、home、thread ID 和送达方式。只有 `spawn` 注册目标；`gc` 删除已无任务的目标。
 
 ## 审批路由
 
