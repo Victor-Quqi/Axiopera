@@ -31,7 +31,7 @@ Answer questions
   Questions arrive like results; sub-agents can keep working until you answer.
   axiopera reply <question> "Use port 8080."      reaches it mid-turn, or resumes it.
   Approval requests pause the sub-agent until you decide; unanswered requests are denied
-  after the configured approval timeout.
+  after the approval timeout (2 minutes by default) and the sub-agent goes on without it.
   axiopera approve <request>      axiopera deny <request> --reason "Use a dry run instead."
 
 For long messages, use `send <task> -f msg.md` or `reply <question> -f answer.md`; use `-` to read stdin.

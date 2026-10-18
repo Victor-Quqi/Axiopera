@@ -33,7 +33,7 @@
 ```toml
 concurrency = 4
 stall_minutes = 10
-approval_timeout_minutes = 10
+approval_timeout_minutes = 2
 ```
 
 `concurrency` 只计算顶层任务，嵌套任务共用父任务的名额。超过上限的任务排队。持续没有事件达到 `stall_minutes` 时，任务标为 stalled 并通知调用方；任务继续运行。`spawn --timeout` 才会在到期时取消任务。

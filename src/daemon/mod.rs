@@ -1781,12 +1781,14 @@ pub fn agent_env(
 /// Defaults, overridden by `config.toml` in `home`.
 pub fn options(home: PathBuf) -> Result<Options> {
     let c = config::load(&home)?;
-    let minutes = |m: Option<u64>| Duration::from_secs(m.unwrap_or(10) * 60);
+    let minutes = |m: Option<u64>, default: u64| Duration::from_secs(m.unwrap_or(default) * 60);
     Ok(Options {
         idle: Duration::from_secs(600),
         concurrency: c.concurrency.unwrap_or(4).max(1),
-        stall: minutes(c.stall_minutes),
-        approval_timeout: minutes(c.approval_timeout_minutes),
+        stall: minutes(c.stall_minutes, 10),
+        // Short, because a sub-agent waits for the decision and some hosts only see the request
+        // when their turn ends; a denied sub-agent reports what it needed instead.
+        approval_timeout: minutes(c.approval_timeout_minutes, 2),
         agents: c.agents,
         home,
     })
