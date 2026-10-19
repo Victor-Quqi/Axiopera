@@ -172,6 +172,24 @@ pub fn result_body(text: &str, path: &Path, max_tokens: usize) -> String {
     format!("{note}{}", &text[start..])
 }
 
+/// "t3 review (claude)": ID, name if any, and agent.
+pub fn task_label(t: &Task) -> String {
+    match &t.name {
+        Some(name) => format!("{} {name} ({})", t.id, agent_name(t.agent)),
+        None => format!("{} ({})", t.id, agent_name(t.agent)),
+    }
+}
+
+/// "45s", "4m12s", "1h05m".
+pub fn duration(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m{:02}s", s / 60, s % 60),
+        _ => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
 pub fn status_line(t: &Task, live: bool) -> String {
     let status = match t.status {
         Status::Queued => "queued",

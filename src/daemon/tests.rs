@@ -157,3 +157,77 @@ fn a_reply_takes_whole_events_and_leaves_the_rest() {
     assert!(render::tokens(text) <= render::RESPONSE_TOKENS);
     assert!(batch.left.is_empty());
 }
+
+#[test]
+fn progress_tells_the_turn_its_tool_calls_and_what_it_waits_for() {
+    let f = fixture();
+    let (actor, _commands) = mpsc::unbounded_channel();
+    let (reply, _decision) = oneshot::channel();
+    f.d.update("test", |t| t.status = Status::Running);
+    f.d.emit("test", "turn_started", json!({"turn": 1}));
+    f.d.emit(
+        "test",
+        "tool",
+        json!({"name": "Bash", "detail": "cargo test"}),
+    );
+    f.d.emit("test", "tool", json!({"name": "Read", "detail": ""}));
+    let mut st = f.d.lock();
+    st.tasks.get_mut("test").unwrap().actor = Some(actor);
+    st.approvals.insert(
+        "r1".into(),
+        Pending {
+            task: "test".into(),
+            approver: "codex:host".into(),
+            summary: "Bash: rm -rf build".into(),
+            reply,
+        },
+    );
+    let progress = f.d.progress(&st, &st.tasks["test"], "codex:host");
+    assert!(
+        progress.starts_with("turn 1, 0s, 2 tool call(s), last 0s ago: Read;"),
+        "{progress}"
+    );
+    assert!(
+        progress.ends_with("waiting for your approval of r1"),
+        "{progress}"
+    );
+    let other = f.d.progress(&st, &st.tasks["test"], "user");
+    assert!(
+        other.ends_with("waiting for approval of r1 from codex:host"),
+        "{other}"
+    );
+    drop(st);
+
+    // The process stays for background work, which may start a turn of its own.
+    f.d.emit("test", "turn_ended", json!({"turn": 1, "ok": true}));
+    f.d.update("test", |t| t.turns = 1);
+    let st = f.d.lock();
+    let between = f.d.progress(&st, &st.tasks["test"], "codex:host");
+    drop(st);
+    assert!(
+        between.starts_with("turn 1 ended 0s ago; its background work still runs"),
+        "{between}"
+    );
+    f.d.emit("test", "tool", json!({"name": "monitor", "detail": ""}));
+    let st = f.d.lock();
+    let next = f.d.progress(&st, &st.tasks["test"], "codex:host");
+    assert!(
+        next.starts_with("turn 2, 0s, 1 tool call(s), last 0s ago: monitor;"),
+        "{next}"
+    );
+    drop(st);
+
+    // Nothing runs once the process is on its way out.
+    f.d.emit("test", "turn_ended", json!({"turn": 2, "ok": true}));
+    let mut st = f.d.lock();
+    st.tasks.get_mut("test").unwrap().releasing = true;
+    let done = f.d.progress(&st, &st.tasks["test"], "codex:host");
+    assert!(!done.contains("turn"), "{done}");
+}
+
+#[test]
+fn durations_read_at_a_glance() {
+    assert_eq!(render::duration(45_000), "45s");
+    assert_eq!(render::duration(252_000), "4m12s");
+    assert_eq!(render::duration(3_900_000), "1h05m");
+}

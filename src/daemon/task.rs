@@ -267,6 +267,18 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                         }
                     }
                     AgentEvent::Blocked(detail) => d.emit(id, "blocked", json!({"detail": detail})),
+                    AgentEvent::TurnStarted => {
+                        // Unless it is the turn we have just started.
+                        let turn = d
+                            .lock()
+                            .tasks
+                            .get(id)
+                            .filter(|e| !e.in_turn)
+                            .map(|e| e.task.turns + 1);
+                        if let Some(turn) = turn {
+                            d.emit(id, "turn_started", json!({"turn": turn}));
+                        }
+                    }
                     AgentEvent::Approval(a) => d.request_approval(id, a),
                     AgentEvent::TurnEnded { ok, result, error, usage } => {
                         last_ok = ok;

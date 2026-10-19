@@ -98,6 +98,13 @@ struct Entry {
     /// Events for `inbox`, in order.
     deliverable: Vec<Event>,
     blocked: usize,
+    /// The running turn so far, for progress reports: when it started, how many tools it
+    /// called, and the last call with its time.
+    in_turn: bool,
+    turn_started_ms: u64,
+    tool_calls: u32,
+    last_tool: Option<(String, u64)>,
+    turn_ended_ms: u64,
 }
 
 /// One request's reply stream.
@@ -220,6 +227,11 @@ impl Daemon {
                 .collect();
             let entry = Entry {
                 blocked: 0,
+                in_turn: false,
+                turn_started_ms: 0,
+                tool_calls: 0,
+                last_tool: None,
+                turn_ended_ms: 0,
                 task,
                 actor: None,
                 releasing: false,
@@ -305,8 +317,34 @@ impl Daemon {
         }
         if let Some(entry) = st.tasks.get_mut(task) {
             entry.task.updated_ms = event.ts;
-            if kind == "blocked" {
-                entry.blocked += 1;
+            match kind {
+                "blocked" => entry.blocked += 1,
+                "turn_started" => {
+                    entry.in_turn = true;
+                    entry.turn_started_ms = event.ts;
+                    entry.tool_calls = 0;
+                    entry.last_tool = None;
+                }
+                "turn_ended" => {
+                    entry.in_turn = false;
+                    entry.turn_ended_ms = event.ts;
+                }
+                "tool" => {
+                    // A turn the agent started by itself that its adapter did not report.
+                    if !entry.in_turn {
+                        entry.in_turn = true;
+                        entry.turn_started_ms = event.ts;
+                        entry.tool_calls = 0;
+                    }
+                    let field = |k: &str| event.data.get(k).and_then(Value::as_str).unwrap_or("");
+                    let call = match (field("name"), field("detail")) {
+                        (name, "") => name.to_string(),
+                        (name, detail) => format!("{name}: {detail}"),
+                    };
+                    entry.tool_calls += 1;
+                    entry.last_tool = Some((call, event.ts));
+                }
+                _ => {}
             }
             if store::deliverable(kind) {
                 entry.deliverable.push(event.clone());
@@ -669,6 +707,11 @@ impl Daemon {
             let mut st = self.lock();
             let entry = Entry {
                 blocked: 0,
+                in_turn: false,
+                turn_started_ms: 0,
+                tool_calls: 0,
+                last_tool: None,
+                turn_ended_ms: 0,
                 task,
                 actor: None,
                 releasing: false,
@@ -1397,7 +1440,7 @@ impl Daemon {
             match deadline {
                 Some(d) => {
                     if tokio::time::timeout_at(d, next).await.is_err() {
-                        return self.nothing_new(out).await;
+                        return self.nothing_new(caller, &only, out).await;
                     }
                 }
                 None => next.await,
@@ -1426,7 +1469,7 @@ impl Daemon {
         if events.is_empty() {
             drop(delivering);
             return if live {
-                self.nothing_new(out).await
+                self.nothing_new(caller, &only, out).await
             } else {
                 self.nothing_running(caller, &only, out).await
             };
@@ -1467,10 +1510,93 @@ impl Daemon {
         })
     }
 
-    async fn nothing_new<W: AsyncWrite + Unpin>(&self, out: &mut Out<'_, W>) -> Result<i32> {
-        out.text("nothing new; sub-tasks are still running", Value::Null)
-            .await?;
+    /// Nothing new yet: where each running sub-task stands.
+    async fn nothing_new<W: AsyncWrite + Unpin>(
+        &self,
+        caller: &str,
+        only: &[String],
+        out: &mut Out<'_, W>,
+    ) -> Result<i32> {
+        let lines = {
+            let st = self.lock();
+            let mut live: Vec<&Entry> = self
+                .children(&st, caller, only)
+                .iter()
+                .map(|id| &st.tasks[id])
+                .filter(|e| e.actor.is_some() || !e.pending.is_empty())
+                .collect();
+            live.sort_by_key(|e| e.task.created_ms);
+            live.iter()
+                .map(|e| {
+                    let mut line = format!("  {}", render::task_label(&e.task));
+                    let progress = self.progress(&st, e, caller);
+                    if !progress.is_empty() {
+                        line.push_str(&format!(": {progress}"));
+                    }
+                    line
+                })
+                .collect::<Vec<_>>()
+        };
+        out.text(
+            format!(
+                "nothing new; still running:
+{}",
+                lines.join(
+                    "
+"
+                )
+            ),
+            Value::Null,
+        )
+        .await?;
         Ok(ipc::exit::NOTHING_NEW)
+    }
+
+    /// Where a task stands: its running turn, and what it waits for. Empty when idle.
+    fn progress(&self, st: &State, e: &Entry, caller: &str) -> String {
+        let now = store::now_ms();
+        let t = &e.task;
+        let mut parts = Vec::new();
+        if t.status == Status::Queued {
+            parts.push("queued".to_string());
+        } else if e.actor.is_some() && e.in_turn {
+            let mut turn = format!(
+                "turn {}, {}",
+                t.turns + 1,
+                render::duration(now.saturating_sub(e.turn_started_ms))
+            );
+            match &e.last_tool {
+                Some((call, at)) => turn.push_str(&format!(
+                    ", {} tool call(s), last {} ago: {call}",
+                    e.tool_calls,
+                    render::duration(now.saturating_sub(*at))
+                )),
+                None => turn.push_str(", no tool calls yet"),
+            }
+            parts.push(turn);
+        } else if e.releasing {
+            // Done; the process is on its way out.
+        } else if e.actor.is_some() && e.turn_ended_ms > 0 {
+            parts.push(format!(
+                "turn {} ended {} ago; its background work still runs",
+                t.turns,
+                render::duration(now.saturating_sub(e.turn_ended_ms))
+            ));
+        } else if e.actor.is_some() {
+            parts.push("starting".to_string());
+        }
+        for (rid, p) in st.approvals.iter().filter(|(_, p)| p.task == t.id) {
+            parts.push(if p.approver == caller {
+                format!("waiting for your approval of {rid}")
+            } else {
+                format!("waiting for approval of {rid} from {}", p.approver)
+            });
+        }
+        let open: Vec<&str> = t.open_questions().map(|q| q.id.as_str()).collect();
+        if !open.is_empty() {
+            parts.push(format!("waiting for an answer to {}", open.join(", ")));
+        }
+        parts.join("; ")
     }
 
     /// Nothing new and nothing running: what still waits for the caller.
@@ -1710,8 +1836,9 @@ impl Daemon {
                     .map(|e| {
                         let mut line =
                             render::status_line(&e.task, e.actor.is_some() && !e.releasing);
-                        for (rid, p) in st.approvals.iter().filter(|(_, p)| p.task == e.task.id) {
-                            line.push_str(&format!("  needs approval {rid} from {}", p.approver));
+                        let progress = self.progress(&st, e, caller);
+                        if !progress.is_empty() {
+                            line.push_str(&format!("  ({progress})"));
                         }
                         line
                     })

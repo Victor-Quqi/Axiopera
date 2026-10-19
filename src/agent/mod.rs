@@ -38,6 +38,8 @@ pub enum AgentEvent {
     Approval(Approval),
     /// The backend put this input into the turn's conversation.
     InputRead(u64),
+    /// The agent started a turn by itself, e.g. when background work ended.
+    TurnStarted,
     TurnEnded {
         ok: bool,
         result: String,

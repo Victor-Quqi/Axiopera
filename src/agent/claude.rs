@@ -382,7 +382,13 @@ async fn pump(
                     state.lock().unwrap().background = n;
                 }
                 // A finished background task makes Claude start a turn to report it.
-                "task_notification" => state.lock().unwrap().active = true,
+                "task_notification" => {
+                    let mut s = state.lock().unwrap();
+                    if !s.active {
+                        s.active = true;
+                        let _ = events.send(AgentEvent::TurnStarted);
+                    }
+                }
                 _ => {}
             },
             "control_request" => {

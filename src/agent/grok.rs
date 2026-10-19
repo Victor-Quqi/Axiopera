@@ -297,6 +297,15 @@ async fn pump(
 }
 
 fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
+    let was_active = state.lock().unwrap().active;
+    on_update(method, p, state, events);
+    // Active again without a prompt from us.
+    if !was_active && state.lock().unwrap().active {
+        let _ = events.send(AgentEvent::TurnStarted);
+    }
+}
+
+fn on_update(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
     // Grok's prompt queue: a running prompt we did not send is a turn it started by itself,
     // for a late interjection or a finished background command.
     if method == "_x.ai/queue/changed" {
@@ -434,6 +443,7 @@ mod tests {
             &events,
         );
         assert!(state.lock().unwrap().interjections.is_empty());
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::TurnStarted)));
         assert!(rx.try_recv().is_err());
         update(
             &state,
@@ -449,6 +459,7 @@ mod tests {
             json!({"sessionUpdate": "task_completed", "task_snapshot": {"task_id": "bg"}}),
         );
         assert!(state.lock().unwrap().active);
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::TurnStarted)));
         chunk(&state, &events, "background result");
         mark(&state, &events, "turn_completed");
         assert!(
@@ -458,7 +469,10 @@ mod tests {
 
     #[test]
     fn interjection_returns_only_last_response() {
-        let state = Mutex::new(State::default());
+        let state = Mutex::new(State {
+            active: true,
+            ..State::default()
+        });
         let (events, mut rx) = mpsc::unbounded_channel();
         chunk(&state, &events, "FIRST-");
         on_notification("_x.ai/session/interjection", &json!({}), &state, &events);
@@ -483,6 +497,7 @@ mod tests {
     #[test]
     fn prompt_reply_keeps_completed_response_for_collection() {
         let state = Mutex::new(State {
+            active: true,
             outstanding: 1,
             ..State::default()
         });
