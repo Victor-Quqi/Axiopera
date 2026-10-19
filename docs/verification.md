@@ -18,7 +18,8 @@
 
 | 结论 | 依据 |
 |---|---|
-| [已测版本](#已测版本)中的端到端流程：主 agent 仅凭 guide 完成派发、收结果、追问和取消 | `host_e2e.py` |
+| [已测版本](#已测版本)中的端到端流程：主 agent 仅凭 `guide --host` 完成派发、收结果、追问和取消 | `host_e2e.py` |
+| [宿主通知](backends.md#宿主通知)：`grok -p` 等 persistent monitor 结束才退出，`--no-wait-for-background` 让它在本轮结束时退出 | `host_e2e.py grok` |
 | [权限](backends.md#权限)：read 档 MCP 工具按注解过滤 | `read_mcp.py` |
 | [权限](backends.md#权限)：Grok 权限模式和工具裁剪 | `grok_perms.py`、`grok_profile.py` |
 | [权限](backends.md#权限)：回连差异表中 Codex Windows 两行 | `ipc_sandbox.py` |

@@ -88,7 +88,7 @@ Grok 的 `_x.ai/session/interjection` 只确认入队。轮末输出注明消费
 | Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 等本轮结束；桌面端装了[插件](usage.md#skill-与-codex-插件)时，下一次工具调用后提醒 | 门铃，插件 hook |
 | 其他 Codex 会话 | 不唤醒 | 不送达 | 轮询 `wait`，再 `inbox` |
 
-Claude 和 Grok 由宿主进程在后台命令退出时唤醒，与界面无关。Grok 的 monitor 把命令的每行输出作为一个事件：宿主忙时在当前这次工具调用之后送入本轮，空闲时开启一轮。monitor 每行保留 500 字节，最多连发 10 个事件，之后每 2 秒补 1 个，超出的丢弃；命令自行退出时，最后几行可能丢失。monitor 启动的命令没有 `GROK_SESSION_ID`，因此 `watch` 用 `--caller grok:<会话>` 指明调用方；`guide` 直接给出填好调用方的命令：Grok 会话填会话 ID，Grok 子 agent 填任务 ID。Axiopera 不向 Claude inbox socket 推送，因为 Linux 上脱离宿主进程树的 daemon 会触发入站批准，而且该接口没有送达回执。
+Claude 和 Grok 由宿主进程在后台命令退出时唤醒，与界面无关。Grok 的 monitor 把命令的每行输出作为一个事件：宿主忙时在当前这次工具调用之后送入本轮，空闲时开启一轮。monitor 每行保留 500 字节，最多连发 10 个事件，之后每 2 秒补 1 个，超出的丢弃；命令自行退出时，最后几行可能丢失。monitor 启动的命令没有 `GROK_SESSION_ID`，因此 `watch` 用 `--caller grok:<会话>` 指明调用方；`guide` 直接给出填好调用方的命令：Grok 会话填会话 ID，Grok 子 agent 填任务 ID。无人值守的 `grok -p` 默认等所有后台任务结束才退出，而 persistent monitor 不会自行结束，因此这样运行 Grok 时加 `--no-wait-for-background`，该选项不在 `--help` 中列出。Axiopera 不向 Claude inbox socket 推送，因为 Linux 上脱离宿主进程树的 daemon 会触发入站批准，而且该接口没有送达回执。
 
 Codex 交互式会话挂在用户级 app-server daemon 上时，Axiopera 经 `codex app-server proxy` 连接其 WebSocket JSON-RPC。用 `thread/loaded/list` 确认会话已加载，再按轮次状态调用 `turn/steer` 或 `turn/start`。`codex exec`、`--no-daemon`、带 `-c` 配置覆盖、Windows 管理员终端中的会话不在该 daemon 上；桌面端和 VS Code 扩展的会话也不在，它们各自以 stdio 启动私有 app-server。
 

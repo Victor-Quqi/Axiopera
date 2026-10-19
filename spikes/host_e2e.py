@@ -1,4 +1,4 @@
-"""End to end: a host agent drives axiopera by itself, starting from `axiopera guide`.
+"""End to end: a host agent drives axiopera by itself, starting from `axiopera guide --host`.
 
 Each host runs headless with the permissions a user would typically give it:
   claude  default mode, axiopera commands allowed
@@ -19,7 +19,7 @@ from pathlib import Path
 
 from probe import AXIOPERA, CLAUDE, CODEX, GROK, clean_env, forget_sessions, log, remove_tree, workdir
 
-PROMPT = """Use the `axiopera` CLI to delegate work to other coding agents. Run `axiopera guide` first to learn how.
+PROMPT = """Use the `axiopera` CLI to delegate work to other coding agents. Run `axiopera guide --host {host}` first to learn how.
 Then, with every sub-agent at tier read:
 1. Delegate three tiny tasks at once: Claude (model haiku) replies with exactly ALPHA, Codex (effort low) replies with exactly BRAVO, Grok replies with exactly CHARLIE.
 2. Collect all three replies.
@@ -29,12 +29,15 @@ Then, with every sub-agent at tier read:
 
 
 def host_argv(kind):
+    prompt = PROMPT.format(host=kind)
     return {
-        "claude": [CLAUDE, "-p", PROMPT, "--model", "sonnet", "--allowedTools", "Bash(axiopera *)",
+        "claude": [CLAUDE, "-p", prompt, "--model", "sonnet", "--allowedTools", "Bash(axiopera *)",
                    "--output-format", "stream-json", "--verbose"],
         "codex": [CODEX, "exec", "--skip-git-repo-check", "--approve-for-me", "--ephemeral", "--json",
-                  "-c", 'model_reasoning_effort="low"', PROMPT],
-        "grok": [GROK, "-p", PROMPT, "--permission-mode", "auto", "--output-format", "streaming-json"],
+                  "-c", 'model_reasoning_effort="low"', prompt],
+        # Otherwise `grok -p` waits for the persistent monitor running `axiopera watch`.
+        "grok": [GROK, "-p", prompt, "--permission-mode", "auto", "--output-format", "streaming-json",
+                 "--no-wait-for-background"],
     }[kind]
 
 
