@@ -334,6 +334,48 @@ async fn watch_merges_news_that_comes_together() {
     watcher.abort();
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_sub_agents_watch_ends_a_minute_after_its_work_is_done_and_taken() {
+    let f = fixture();
+    f.d.update("test", |t| t.parent = "task:boss".into());
+    let (actor, _rx) = mpsc::unbounded_channel();
+    f.d.lock().tasks.get_mut("test").unwrap().actor = Some(actor);
+    let (client, mut server) = tokio::io::duplex(1 << 16);
+    let d = f.d.clone();
+    let watcher =
+        tokio::spawn(async move { d.watch("task:boss", &mut Out::new(&mut server)).await });
+    let host = {
+        let d = f.d.clone();
+        tokio::spawn(async move { d.watch("codex:host", &mut Out::new(&mut Vec::new())).await })
+    };
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(!watcher.is_finished(), "a sub-task still runs");
+
+    f.d.emit(
+        "test",
+        "question",
+        json!({"id": "q1", "text": "Which port?"}),
+    );
+    f.d.lock().tasks.get_mut("test").unwrap().actor = None;
+    let mut reader = ipc::Reader::new(client);
+    let Some(Reply::Out { text, .. }) = reader.read::<Reply>().await.unwrap() else {
+        panic!("no line");
+    };
+    assert_eq!(text, "test (codex) asks q1: Which port?");
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert!(!watcher.is_finished(), "the question is not taken yet");
+
+    f.d.inbox("task:boss", &[], &mut Out::new(&mut Vec::new()))
+        .await
+        .unwrap();
+    tokio::time::sleep(WATCH_IDLE - Duration::from_secs(1)).await;
+    assert!(!watcher.is_finished());
+    tokio::time::sleep(WATCH_GAP * 2).await;
+    assert_eq!(watcher.await.unwrap().unwrap(), ipc::exit::NOTHING_RUNNING);
+    assert!(!host.is_finished(), "a session's watch runs until stopped");
+    host.abort();
+}
+
 #[test]
 fn the_request_log_keeps_argument_names_and_ages_out_with_gc() {
     let f = fixture();

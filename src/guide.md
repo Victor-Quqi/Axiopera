@@ -19,9 +19,9 @@ Get results
 @claude Run `axiopera wait` as a background command. When it exits, run `axiopera inbox`, and
 @claude start `axiopera wait` again while sub-tasks still run.
 @codex The output of spawn says how results reach you.
-@grok Once per session, start `axiopera watch --caller grok:<session>` with your monitor tool,
-@grok persistent. For each line it prints, run `axiopera inbox`. If told the monitor ended while
-@grok sub-tasks still run, start it again.
+@grok Before you spawn, start `axiopera watch --caller grok:<session>` with your monitor tool,
+@grok persistent, unless it is running; start it again if told it ended while sub-tasks run.
+@grok For each line it prints, run `axiopera inbox`.
   Exit codes: 0 success, 1 command error, 3 nothing new yet (or wait timed out),
   4 nothing new and nothing running.
 

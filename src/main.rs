@@ -86,7 +86,8 @@ enum Command {
         /// Only these tasks (default: all of yours).
         tasks: Vec<String>,
     },
-    /// A line for each piece of news from your sub-tasks, until stopped. Takes nothing.
+    /// A line for each piece of news from your sub-tasks, until stopped; for a sub-agent, until a
+    /// minute after its sub-tasks are done and their news taken. Takes nothing.
     Watch {
         /// Whose sub-tasks, e.g. `grok:<session>`: Grok's monitor tool starts commands without
         /// the session's GROK_SESSION_ID.

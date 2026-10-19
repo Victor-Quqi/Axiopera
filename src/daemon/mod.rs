@@ -36,6 +36,10 @@ const RELEASED: &str = "_released";
 /// Least time between two lines of `watch`, below the rate Grok's monitor keeps up with: ten
 /// events at once, then one every two seconds.
 const WATCH_GAP: Duration = Duration::from_secs(2);
+/// A sub-agent's watch ends once its sub-tasks have been done, and their news taken, this long.
+/// The monitor running it would otherwise keep the sub-agent busy, so its process is never
+/// released. Long enough for the spawn that usually follows starting the watch.
+const WATCH_IDLE: Duration = Duration::from_secs(60);
 
 pub struct Options {
     pub home: PathBuf,
@@ -1976,8 +1980,9 @@ impl Daemon {
         )
     }
 
-    /// A line for each piece of news, until stopped; news within `WATCH_GAP` of the last line
-    /// is merged into the next one. Takes nothing.
+    /// A line for each piece of news, until stopped, or for a sub-agent until it has been idle
+    /// for `WATCH_IDLE`; news within `WATCH_GAP` of the last line is merged into the next one.
+    /// Takes nothing.
     async fn watch<W: AsyncWrite + Unpin>(
         self: &Arc<Self>,
         caller: &str,
@@ -1993,7 +1998,29 @@ impl Daemon {
             (self.events.subscribe(), news)
         };
         let mut due = tokio::time::Instant::now();
+        let sub_agent = identity::task_of(caller).is_some();
+        let mut tick = tokio::time::interval(WATCH_GAP);
+        let mut idle_since = None;
         loop {
+            if sub_agent && news.is_empty() {
+                let idle = {
+                    let st = self.lock();
+                    !self.live(&st, caller, &[])
+                        && !self
+                            .unseen(&st, caller, &[])
+                            .iter()
+                            .any(|e| is_news(e, caller))
+                };
+                if !idle {
+                    idle_since = None;
+                } else if idle_since
+                    .get_or_insert_with(tokio::time::Instant::now)
+                    .elapsed()
+                    >= WATCH_IDLE
+                {
+                    return Ok(ipc::exit::NOTHING_RUNNING);
+                }
+            }
             if !news.is_empty() && tokio::time::Instant::now() >= due {
                 let line = {
                     let st = self.lock();
@@ -2024,6 +2051,7 @@ impl Daemon {
                     Err(broadcast::error::RecvError::Closed) => return Ok(ipc::exit::OK),
                 },
                 _ = wake, if !news.is_empty() => {}
+                _ = tick.tick(), if sub_agent => {}
             }
         }
     }

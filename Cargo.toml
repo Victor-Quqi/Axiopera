@@ -37,5 +37,9 @@ features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[dev-dependencies]
+# Paused time for tests of timers.
+tokio = { version = "1.53", features = ["test-util"] }
+
 [profile.release]
 strip = true
