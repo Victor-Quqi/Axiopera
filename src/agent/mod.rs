@@ -359,7 +359,8 @@ pub struct Proc {
     pub job: platform::Job,
     pub child: Child,
     pub stdin: Writer,
-    /// Last lines of stderr, for error reports. Never logged.
+    /// Last lines of stderr, each cut to a few hundred characters, for error reports. Never
+    /// logged.
     pub stderr: Arc<Mutex<VecDeque<String>>>,
 }
 
@@ -393,7 +394,8 @@ impl Proc {
                 if t.len() == 20 {
                     t.pop_front();
                 }
-                t.push_back(l);
+                // Node prints the source line of an uncaught error, a whole bundle when minified.
+                t.push_back(clip(&l, 300));
             }
         });
         Ok((
