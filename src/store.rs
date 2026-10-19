@@ -117,8 +117,8 @@ pub struct Event {
     pub data: Map<String, Value>,
 }
 
-/// Event kinds that end a `wait`.
-pub fn wakes(kind: &str) -> bool {
+/// Event kinds `inbox` hands to a task's parent, or to the approver of a request.
+pub fn deliverable(kind: &str) -> bool {
     matches!(
         kind,
         "turn_ended"

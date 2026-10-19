@@ -52,9 +52,10 @@ hook 和卸载方法见[使用与配置](docs/usage.md#skill-与-codex-插件)�
 ```sh
 axiopera spawn codex --tier read --name review "审查当前仓库，报告最需要修复的问题。"
 axiopera wait review
+axiopera inbox review
 ```
 
-任务在后台运行，`wait` 返回结果，`send` 可以在同一会话中继续追问。
+任务在后台运行。`wait` 等到它有新消息，`inbox` 取回结果，`send` 可以在同一会话中继续追问。
 
 更多示例见 [agent 使用说明](src/guide.md)，命令帮助用 `axiopera --help` 查看。工作目录、接管、清理等操作见[使用与配置](docs/usage.md)。
 

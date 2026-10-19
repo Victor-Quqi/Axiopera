@@ -512,7 +512,10 @@ mod tests {
             }
             f.d.cancel_tree("test", "cancelled by request", "codex:host");
             if releasing {
-                assert_eq!(f.d.lock().tasks["test"].wake[0].data["by"], "codex:host");
+                assert_eq!(
+                    f.d.lock().tasks["test"].deliverable[0].data["by"],
+                    "codex:host"
+                );
                 assert!(rx.try_recv().is_err());
             } else {
                 let Next::Stop(Exit::Cancelled(cause)) = release_or_continue(&f.d, "test", &mut rx)
@@ -586,7 +589,7 @@ mod tests {
         .unwrap();
         end_turn(&f.d, "test", true, "answer after input", None, None, (0, 0)).unwrap();
         let st = f.d.lock();
-        let events = &st.tasks["test"].wake;
+        let events = &st.tasks["test"].deliverable;
         assert_eq!(events[0].data["unread"], 2);
         assert_eq!(events[0].data["blocked"], 1);
         assert_eq!(events[1].data["blocked"], 0);

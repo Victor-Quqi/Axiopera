@@ -7,8 +7,9 @@ use serde_json::Value;
 use crate::ipc::{Agent, Tier};
 use crate::store::{Event, Status, Task};
 
-/// Token budget for one reply, under the smallest host truncation limit (Codex: 10k tokens).
-pub const RESPONSE_TOKENS: usize = 8_000;
+/// Token budget for one reply, under the smallest host truncation limit: Grok keeps 20,000
+/// characters of a command's output, 5,000 tokens of ASCII by this count.
+pub const RESPONSE_TOKENS: usize = 4_500;
 
 /// Rough token count that errs high: four ASCII characters per token, one per other character.
 pub fn tokens(s: &str) -> usize {

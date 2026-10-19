@@ -71,9 +71,14 @@ pub enum Request {
         task: String,
         message: String,
     },
+    /// Block until the caller's sub-tasks have news; takes nothing.
     Wait {
         tasks: Vec<String>,
         timeout_ms: Option<u64>,
+    },
+    /// Take what the caller's sub-tasks have for it; never blocks.
+    Inbox {
+        tasks: Vec<String>,
     },
     Watch,
     Status {
@@ -166,13 +171,16 @@ pub enum Reply {
     Error { code: ErrorCode, message: String },
 }
 
+/// Output that carries news always exits with OK: hosts cut long output harder after a nonzero
+/// exit (Claude Code keeps 5,000 characters from each end), and Codex on Windows reports every
+/// nonzero code as 1.
 pub mod exit {
     pub const OK: i32 = 0;
     pub const ERROR: i32 = 1;
-    pub const TIMEOUT: i32 = 3;
-    pub const NOTHING_TO_WAIT: i32 = 4;
-    pub const FAILED: i32 = 5;
-    pub const CANCELLED: i32 = 6;
+    /// Nothing new, or `wait` timed out; sub-tasks are still running.
+    pub const NOTHING_NEW: i32 = 3;
+    /// Nothing new and no sub-task running.
+    pub const NOTHING_RUNNING: i32 = 4;
 }
 
 pub async fn write<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> std::io::Result<()> {

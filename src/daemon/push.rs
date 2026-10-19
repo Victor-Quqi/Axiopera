@@ -1,7 +1,7 @@
 //! Sub-task events sent straight into host sessions that take messages, so a host learns of
-//! them while it keeps working, or after it ended its turn, without running `axiopera wait`.
+//! them while it keeps working, or after it ended its turn, without running `axiopera inbox`.
 //! Only Codex sessions so far: those on the user's shared Codex daemon get the events; those of
-//! the Codex app and IDE extension get a reminder to run `wait` once their turn ends.
+//! the Codex app and IDE extension get a reminder to run `inbox` once their turn ends.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +12,7 @@ use tokio::time::Instant;
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use super::{Daemon, RELEASED};
+use super::{Daemon, RELEASED, is_news};
 use crate::agent::{self, codex_remote::Remote};
 use crate::ipc::Agent;
 use crate::store::{CodexHost, Event, PendingPush};
@@ -27,7 +27,7 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY: Duration = Duration::from_secs(30);
 const RETRY_MAX: Duration = Duration::from_secs(600);
 pub(super) const REMINDER: &str = "From your sub-tasks (sent by axiopera, not typed by the user): new results \
-    or requests are waiting. Get them with `axiopera wait --timeout 60s`.";
+    or requests are waiting. Take them with `axiopera inbox`.";
 
 /// How a host learns of its sub-tasks' events.
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize)]
@@ -36,17 +36,6 @@ pub(super) enum Reach {
     Push,
     Doorbell,
     Wait,
-}
-
-/// Sibling notes, detach notices and the host's own cancellations go with the next push.
-fn needs_host(event: &Event, caller: &str) -> bool {
-    if event.kind == "cancelled" {
-        return event.data.get("by").and_then(Value::as_str) != Some(caller);
-    }
-    matches!(
-        event.kind.as_str(),
-        "turn_ended" | "question" | "approval_request" | "stalled" | "failed" | "interrupted"
-    )
 }
 
 impl Daemon {
@@ -150,7 +139,7 @@ impl Daemon {
                 }
             };
             if let Some(target) = target
-                && needs_host(&e, &target)
+                && is_news(&e, &target)
             {
                 self.schedule_push(target, GATHER);
             }
@@ -256,7 +245,7 @@ impl Daemon {
         Ok(())
     }
 
-    pub(super) async fn reconcile_before_wait(&self, caller: &str) -> anyhow::Result<()> {
+    pub(super) async fn reconcile_before_take(&self, caller: &str) -> anyhow::Result<()> {
         let pair = {
             let st = self.lock();
             st.ledger
@@ -293,7 +282,7 @@ impl Daemon {
             if !self
                 .unseen(&st, caller, &[])
                 .iter()
-                .any(|e| needs_host(e, caller))
+                .any(|e| is_news(e, caller))
                 && !st.ledger.pending_pushes.contains_key(caller)
             {
                 return;
@@ -304,14 +293,18 @@ impl Daemon {
             return;
         };
         let outcome = if host.doorbell {
-            self.ring(caller, &host).await
+            self.ring(caller, &host).await.map(|how| (how, false))
         } else {
             self.send_events(caller, &host).await
         };
         match outcome {
-            Ok(how) => {
+            Ok((how, more)) => {
                 self.lock().push_failures.remove(caller);
                 self.log(&format!("push to {caller}: {how}"));
+                if more {
+                    drop(delivering);
+                    self.schedule_push(caller.to_string(), GATHER);
+                }
             }
             Err(e) => {
                 let failures = {
@@ -333,21 +326,23 @@ impl Daemon {
         }
     }
 
-    /// Send the caller what `wait` would print.
-    async fn send_events(&self, caller: &str, host: &CodexHost) -> Result<String, String> {
+    /// Send the caller what `inbox` would print. Also says whether events are left for another
+    /// message.
+    async fn send_events(&self, caller: &str, host: &CodexHost) -> Result<(String, bool), String> {
         let mut remote = None;
         let mut batch = None;
         let sent = tokio::time::timeout(TIMEOUT, async {
             let r = remote.insert(Remote::connect(&host.exe, host.codex_home.as_deref()).await?);
             self.reconcile_push(caller, &host.thread, r).await?;
             let events = self.unseen(&self.lock(), caller, &[]);
-            if !events.iter().any(|e| needs_host(e, caller)) {
-                return Ok("no events requiring attention".to_string());
+            if !events.iter().any(|e| is_news(e, caller)) {
+                return Ok(("no events requiring attention".to_string(), false));
             }
             if !r.is_open(&host.thread).await? {
                 anyhow::bail!("the session is closed");
             }
-            let (texts, turns) = self.render_events(&events);
+            let taken = self.batch(&events);
+            let texts: Vec<&str> = taken.items.iter().map(|(_, t)| t.as_str()).collect();
             let marker = format!(
                 "[axiopera:{}]",
                 &uuid::Uuid::new_v4().simple().to_string()[..12]
@@ -356,10 +351,11 @@ impl Daemon {
                 "{marker} From your sub-tasks (sent by axiopera, not typed by the user):\n{}",
                 texts.join("\n")
             );
+            let events: Vec<Event> = taken.items.iter().map(|(e, _)| e.clone()).collect();
             let pending = PendingPush {
                 marker,
                 events: events.iter().map(|e| (e.task.clone(), e.seq)).collect(),
-                turns: turns.clone(),
+                turns: taken.turns.clone(),
             };
             // Save before writing: a daemon crash can also lose the acknowledgement.
             {
@@ -367,8 +363,9 @@ impl Daemon {
                 st.ledger.pending_pushes.insert(caller.to_string(), pending);
                 st.ledger.save(&self.opts.home)?;
             }
-            batch = Some((events, turns));
-            r.message(&host.thread, &message).await.map(str::to_string)
+            batch = Some((events, taken.turns));
+            let how = r.message(&host.thread, &message).await?;
+            anyhow::Ok((how.to_string(), !taken.left.is_empty()))
         })
         .await;
         let outcome = match sent {
@@ -416,19 +413,19 @@ impl Daemon {
         let st = self.lock();
         self.unseen(&st, caller, &[])
             .iter()
-            .filter(|e| needs_host(e, caller))
+            .filter(|e| is_news(e, caller))
             .map(|e| e.seq)
             .max()
     }
 
-    /// After the host ran `wait`: a reminder still queued would start a turn for nothing.
+    /// After the host ran `inbox`: a reminder still queued would start a turn for nothing.
     pub(super) fn retract_doorbell(self: &Arc<Self>, caller: &str) {
         let (id, host) = {
             let mut st = self.lock();
             if self
                 .unseen(&st, caller, &[])
                 .iter()
-                .any(|e| needs_host(e, caller))
+                .any(|e| is_news(e, caller))
             {
                 return;
             }
@@ -487,7 +484,7 @@ mod tests {
             "message",
             "detached",
         ] {
-            assert!(!needs_host(&event(kind), "codex:host"));
+            assert!(!is_news(&event(kind), "codex:host"));
         }
         for kind in [
             "turn_ended",
@@ -498,7 +495,7 @@ mod tests {
             "cancelled",
             "interrupted",
         ] {
-            assert!(needs_host(&event(kind), "codex:host"));
+            assert!(is_news(&event(kind), "codex:host"));
         }
     }
 
@@ -510,10 +507,10 @@ mod tests {
             let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].data["by"], by);
-            assert_eq!(needs_host(&events[0], "codex:host"), by != "codex:host");
+            assert_eq!(is_news(&events[0], "codex:host"), by != "codex:host");
             let saved = f.d.store.events("test");
             assert_eq!(saved[0].data["by"], by);
-            assert_eq!(needs_host(&saved[0], "codex:host"), by != "codex:host");
+            assert_eq!(is_news(&saved[0], "codex:host"), by != "codex:host");
         }
     }
 
@@ -540,7 +537,7 @@ mod tests {
         f.d.emit("test", "stalled", serde_json::json!({"quiet_secs": 60}));
         let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
         assert_eq!(events.len(), 2);
-        assert!(events.iter().any(|e| needs_host(e, "codex:host")));
+        assert!(events.iter().any(|e| is_news(e, "codex:host")));
         assert_eq!(events[0].kind, "cancelled");
     }
 

@@ -95,8 +95,8 @@ struct Entry {
     pending: Vec<String>,
     /// Notes from siblings, read at the start of its next turn; they do not start one.
     mail: Vec<String>,
-    /// Events that end a `wait`, in order.
-    wake: Vec<Event>,
+    /// Events for `inbox`, in order.
+    deliverable: Vec<Event>,
     blocked: usize,
 }
 
@@ -214,9 +214,9 @@ impl Daemon {
         for task in store.load_all() {
             let events = store.events(&task.id);
             seq = seq.max(events.last().map_or(0, |e| e.seq));
-            let wake = events
+            let deliverable = events
                 .into_iter()
-                .filter(|e| store::wakes(&e.kind))
+                .filter(|e| store::deliverable(&e.kind))
                 .collect();
             let entry = Entry {
                 blocked: 0,
@@ -226,7 +226,7 @@ impl Daemon {
                 env: None,
                 pending: Vec::new(),
                 mail: Vec::new(),
-                wake,
+                deliverable,
             };
             tasks.insert(entry.task.id.clone(), entry);
         }
@@ -308,8 +308,8 @@ impl Daemon {
             if kind == "blocked" {
                 entry.blocked += 1;
             }
-            if store::wakes(kind) {
-                entry.wake.push(event.clone());
+            if store::deliverable(kind) {
+                entry.deliverable.push(event.clone());
             }
         }
         let _ = self.events.send(event);
@@ -476,10 +476,9 @@ impl Daemon {
                 self.send(&caller, &task, message, env.env, out).await
             }
             Request::Wait { tasks, timeout_ms } => {
-                let exit = self.wait(&caller, &tasks, timeout_ms, out).await;
-                self.retract_doorbell(&caller);
-                exit
+                self.wait(&caller, &tasks, timeout_ms, out).await
             }
+            Request::Inbox { tasks } => self.inbox(&caller, &tasks, out).await,
             Request::Pending => {
                 if let Some(seq) = self.needing_host(&caller) {
                     out.text(push::REMINDER, json!({"seq": seq})).await?;
@@ -676,7 +675,7 @@ impl Daemon {
                 env: Some(env),
                 pending: vec![s.task.clone()],
                 mail: Vec::new(),
-                wake: Vec::new(),
+                deliverable: Vec::new(),
             };
             st.tasks.insert(id.clone(), entry);
         }
@@ -706,9 +705,11 @@ impl Daemon {
                 "Results and questions arrive as messages: do not wait or poll; end your turn if nothing else is left."
             }
             Reach::Doorbell => {
-                "After your turn ends, a message tells you when results or questions are ready for `axiopera wait`: do not poll; end your turn if nothing else is left."
+                "After your turn ends, a message tells you when results or questions are ready for `axiopera inbox`: do not poll; end your turn if nothing else is left."
             }
-            Reach::Wait => "Get results and questions with `axiopera wait`.",
+            Reach::Wait => {
+                "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some."
+            }
         };
         let state = if self.lock().tasks[&id].actor.is_some() {
             "running"
@@ -1343,6 +1344,8 @@ impl Daemon {
             .collect()
     }
 
+    /// Block until the caller's sub-tasks (or those in `only`) have news, then list it without
+    /// handing anything over.
     async fn wait<W: AsyncWrite + Unpin>(
         self: &Arc<Self>,
         caller: &str,
@@ -1350,91 +1353,51 @@ impl Daemon {
         timeout_ms: Option<u64>,
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
-        let only: Vec<String> = only
-            .iter()
-            .map(|r| self.find(caller, r))
-            .collect::<Result<_>>()?;
+        let only = self.find_all(caller, only)?;
         let deadline = timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
         loop {
-            let delivering = self.delivery(caller).lock_owned().await;
-            self.reconcile_before_wait(caller).await?;
             enum Check {
-                Ready(Vec<Event>),
-                Nothing(bool, Vec<String>),
+                News(String, Value),
+                Idle,
                 Wait(broadcast::Receiver<Event>),
             }
             let check = {
                 let st = self.lock();
-                let ids = self.children(&st, caller, &only);
-                let ready = self.unseen(&st, caller, &only);
-                let live = ids.iter().any(|id| {
-                    let e = &st.tasks[id];
-                    e.actor.is_some() || !e.pending.is_empty()
-                });
-                if !ready.is_empty() {
-                    Check::Ready(ready)
-                } else if !live {
-                    let questions = ids.iter().flat_map(|id| {
-                        st.tasks[id].task.open_questions().map(move |q| {
-                            format!(
-                                "  {id} asks {}: {}  (axiopera reply {} \"...\")",
-                                q.id,
-                                agent::clip(&q.text, 300),
-                                q.id
-                            )
-                        })
-                    });
-                    let approvals = st
-                        .approvals
-                        .iter()
-                        .filter(|(_, p)| p.approver == caller)
-                        .map(|(rid, p)| {
-                            format!(
-                                "  {} needs approval {rid}: {}  (axiopera approve {rid} | axiopera deny {rid})",
-                                p.task,
-                                agent::clip(&p.summary, 300)
-                            )
-                        });
-                    Check::Nothing(ids.is_empty(), questions.chain(approvals).collect())
+                let news: Vec<Event> = self
+                    .unseen(&st, caller, &only)
+                    .into_iter()
+                    .filter(|e| is_news(e, caller))
+                    .collect();
+                if !news.is_empty() {
+                    Check::News(self.news_text(&st, &news), serde_json::to_value(&news)?)
+                } else if !self.live(&st, caller, &only) {
+                    Check::Idle
                 } else {
                     // Subscribe while holding the lock so no event slips between check and wait.
                     Check::Wait(self.events.subscribe())
                 }
             };
             let mut rx = match check {
-                Check::Ready(events) => return self.deliver(caller, events, out).await,
-                Check::Nothing(none, open) => {
-                    let text = if !open.is_empty() {
-                        format!(
-                            "no running sub-tasks; these wait for you:\n{}",
-                            open.join("\n")
-                        )
-                    } else if none {
-                        "no sub-tasks to wait for".to_string()
-                    } else {
-                        "no running sub-tasks; nothing new to report".to_string()
-                    };
-                    out.text(text, Value::Null).await?;
-                    return Ok(ipc::exit::NOTHING_TO_WAIT);
+                Check::News(text, data) => {
+                    out.text(text, data).await?;
+                    return Ok(ipc::exit::OK);
                 }
+                Check::Idle => return self.nothing_running(caller, &only, out).await,
                 Check::Wait(rx) => rx,
             };
-            drop(delivering);
             let next = async {
                 loop {
                     match rx.recv().await {
-                        Ok(e) if store::wakes(&e.kind) || e.kind == RELEASED => return,
-                        Err(broadcast::error::RecvError::Closed) => return,
-                        _ => {}
+                        Ok(e) if store::deliverable(&e.kind) || e.kind == RELEASED => return,
+                        Ok(_) => {}
+                        Err(_) => return,
                     }
                 }
             };
             match deadline {
                 Some(d) => {
                     if tokio::time::timeout_at(d, next).await.is_err() {
-                        out.text("timed out; sub-tasks are still running", Value::Null)
-                            .await?;
-                        return Ok(ipc::exit::TIMEOUT);
+                        return self.nothing_new(out).await;
                     }
                 }
                 None => next.await,
@@ -1442,8 +1405,138 @@ impl Daemon {
         }
     }
 
-    /// Wake events the caller has not seen yet, oldest first: from its children (or only the
-    /// tasks in `only`), and approval requests routed to it from further down.
+    /// Hand the caller what its sub-tasks (or those in `only`) have for it: whole events, oldest
+    /// first, as many as one reply holds. The rest stays for the next call.
+    async fn inbox<W: AsyncWrite + Unpin>(
+        self: &Arc<Self>,
+        caller: &str,
+        only: &[String],
+        out: &mut Out<'_, W>,
+    ) -> Result<i32> {
+        let only = self.find_all(caller, only)?;
+        let delivering = self.delivery(caller).lock_owned().await;
+        self.reconcile_before_take(caller).await?;
+        let (events, live) = {
+            let st = self.lock();
+            (
+                self.unseen(&st, caller, &only),
+                self.live(&st, caller, &only),
+            )
+        };
+        if events.is_empty() {
+            drop(delivering);
+            return if live {
+                self.nothing_new(out).await
+            } else {
+                self.nothing_running(caller, &only, out).await
+            };
+        }
+        let batch = self.batch(&events);
+        for (e, text) in &batch.items {
+            out.text(text.clone(), serde_json::to_value(e)?).await?;
+        }
+        if !batch.left.is_empty() {
+            let approvals = batch
+                .left
+                .iter()
+                .filter(|e| e.kind == "approval_request")
+                .count();
+            let more = match approvals {
+                0 => format!("{} more", batch.left.len()),
+                n => format!("{} more, {n} of them approval requests", batch.left.len()),
+            };
+            out.text(format!("{more}: run `axiopera inbox` again."), Value::Null)
+                .await?;
+        }
+        let taken: Vec<Event> = batch.items.into_iter().map(|(e, _)| e).collect();
+        self.mark_seen(caller, &taken, &batch.turns)?;
+        drop(delivering);
+        self.retract_doorbell(caller);
+        Ok(ipc::exit::OK)
+    }
+
+    fn find_all(&self, caller: &str, references: &[String]) -> Result<Vec<String>> {
+        references.iter().map(|r| self.find(caller, r)).collect()
+    }
+
+    /// Whether any of the caller's children (or those in `only`) is running or about to.
+    fn live(&self, st: &State, caller: &str, only: &[String]) -> bool {
+        self.children(st, caller, only).iter().any(|id| {
+            let e = &st.tasks[id];
+            e.actor.is_some() || !e.pending.is_empty()
+        })
+    }
+
+    async fn nothing_new<W: AsyncWrite + Unpin>(&self, out: &mut Out<'_, W>) -> Result<i32> {
+        out.text("nothing new; sub-tasks are still running", Value::Null)
+            .await?;
+        Ok(ipc::exit::NOTHING_NEW)
+    }
+
+    /// Nothing new and nothing running: what still waits for the caller.
+    async fn nothing_running<W: AsyncWrite + Unpin>(
+        &self,
+        caller: &str,
+        only: &[String],
+        out: &mut Out<'_, W>,
+    ) -> Result<i32> {
+        let (none, open) = {
+            let st = self.lock();
+            let ids = self.children(&st, caller, only);
+            let questions = ids.iter().flat_map(|id| {
+                st.tasks[id].task.open_questions().map(move |q| {
+                    format!(
+                        "  {id} asks {}: {}  (axiopera reply {} \"...\")",
+                        q.id,
+                        agent::clip(&q.text, 300),
+                        q.id
+                    )
+                })
+            });
+            let approvals = st
+                .approvals
+                .iter()
+                .filter(|(_, p)| p.approver == caller)
+                .map(|(rid, p)| {
+                    format!(
+                        "  {} needs approval {rid}: {}  (axiopera approve {rid} | axiopera deny {rid})",
+                        p.task,
+                        agent::clip(&p.summary, 300)
+                    )
+                });
+            let open: Vec<String> = questions.chain(approvals).collect();
+            (ids.is_empty(), open)
+        };
+        let text = if !open.is_empty() {
+            format!(
+                "no running sub-tasks; these wait for you:\n{}",
+                open.join("\n")
+            )
+        } else if none {
+            "no sub-tasks".to_string()
+        } else {
+            "no running sub-tasks; nothing new".to_string()
+        };
+        out.text(text, Value::Null).await?;
+        Ok(ipc::exit::NOTHING_RUNNING)
+    }
+
+    /// The news `wait` lists, one line each.
+    fn news_text(&self, st: &State, news: &[Event]) -> String {
+        let mut lines: Vec<String> = news
+            .iter()
+            .map(|e| {
+                let agent = st.tasks[&e.task].task.agent;
+                let line = render::event_line(e, agent);
+                line.lines().next().unwrap_or_default().to_string()
+            })
+            .collect();
+        lines.push("Take them with `axiopera inbox`.".into());
+        lines.join("\n")
+    }
+
+    /// Events the caller has not taken yet, oldest first: from its children (or only the tasks
+    /// in `only`), and approval requests routed to it from further down.
     fn unseen(&self, st: &State, caller: &str, only: &[String]) -> Vec<Event> {
         let ids = self.children(st, caller, only);
         let mut ready = Vec::new();
@@ -1464,7 +1557,7 @@ impl Daemon {
             // Approval requests reach their approver only, who may be further up than the
             // parent; everything else reaches the parent.
             ready.extend(
-                e.wake
+                e.deliverable
                     .iter()
                     .filter(|ev| {
                         ev.seq > cursor
@@ -1481,39 +1574,26 @@ impl Daemon {
         ready
     }
 
-    /// Hand wake events to the caller, results included once, and advance its cursors.
-    async fn deliver<W: AsyncWrite + Unpin>(
-        &self,
-        caller: &str,
-        events: Vec<Event>,
-        out: &mut Out<'_, W>,
-    ) -> Result<i32> {
-        let (texts, turns) = self.render_events(&events);
-        let mut exit = ipc::exit::OK;
-        for (e, text) in events.iter().zip(texts) {
-            out.text(text, serde_json::to_value(e)?).await?;
-            exit = worse(exit, exit_for(e));
-        }
-        self.mark_seen(caller, &events, &turns)?;
-        Ok(exit)
-    }
-
-    /// Render wake events as one reply. One budget for all of it: several results at once must
-    /// not blow past the host's output truncation either. Also returns the turns whose results
-    /// it includes.
-    fn render_events(&self, events: &[Event]) -> (Vec<String>, Vec<(String, u32)>) {
+    /// What one reply hands over: whole events, oldest first, within the reply budget; the
+    /// first event goes in any case, its result cut down to fit.
+    fn batch(&self, events: &[Event]) -> Batch {
         let mut budget = render::RESPONSE_TOKENS;
-        let mut texts = Vec::new();
+        let mut items = Vec::new();
         let mut turns = Vec::new();
         for e in events {
-            let (text, body_turn) = self.render_wake(e, budget);
-            budget = budget.saturating_sub(render::tokens(&text));
-            if let Some(turn) = body_turn {
-                turns.push((e.task.clone(), turn));
+            let first = items.is_empty();
+            let (text, turn) = self.render_wake(e, first.then_some(budget));
+            let cost = render::tokens(&text);
+            if !first && cost > budget {
+                break;
             }
-            texts.push(text);
+            budget = budget.saturating_sub(cost);
+            turns.extend(turn.map(|t| (e.task.clone(), t)));
+            items.push((e.clone(), text));
         }
-        (texts, turns)
+        let left = events[items.len()..].to_vec();
+        items.sort_by_key(|(e, _)| urgency(e));
+        Batch { items, turns, left }
     }
 
     /// Held while handing the caller its events, from reading them to marking them seen.
@@ -1529,15 +1609,20 @@ impl Daemon {
         }
         let mut st = self.lock();
         for e in events {
-            st.ledger.cursors.insert(cursor_key(caller, &e.task), e.seq);
+            let cursor = st
+                .ledger
+                .cursors
+                .entry(cursor_key(caller, &e.task))
+                .or_default();
+            *cursor = (*cursor).max(e.seq);
         }
         st.ledger.save(&self.opts.home)?;
         Ok(())
     }
 
-    /// Render one wake event; a turn's result text is included the first time only, if it fits.
-    /// Also returns the turn whose result was included.
-    fn render_wake(&self, e: &Event, budget: usize) -> (String, Option<u32>) {
+    /// Render one event; a turn's result text is included the first time only. With `fit`, the
+    /// result is cut down to that many tokens.
+    fn render_wake(&self, e: &Event, fit: Option<usize>) -> (String, Option<u32>) {
         let (agent, delivered) = {
             let st = self.lock();
             let t = &st.tasks[&e.task].task;
@@ -1554,20 +1639,20 @@ impl Daemon {
                 None,
             );
         }
-        let room = budget.saturating_sub(render::tokens(&head));
-        if room < 500 {
-            return (
-                format!(
-                    "{head}\n(result omitted; get it with `axiopera result {} --turn {turn}`)",
-                    e.task
-                ),
-                None,
-            );
-        }
         let path = self.store.turn_path(&e.task, turn);
         let body = std::fs::read_to_string(&path).unwrap_or_default();
-        let text = format!("{head}\n{}", render::result_body(&body, &path, room));
-        (text, Some(turn))
+        let body = match fit {
+            Some(budget) => {
+                // One more for the line break.
+                render::result_body(
+                    &body,
+                    &path,
+                    budget.saturating_sub(render::tokens(&head) + 1),
+                )
+            }
+            None => body,
+        };
+        (format!("{head}\n{body}"), Some(turn))
     }
 
     async fn watch<W: AsyncWrite + Unpin>(
@@ -1744,24 +1829,37 @@ fn cursor_key(caller: &str, task: &str) -> String {
     format!("{caller}|{task}")
 }
 
-/// Exit code a delivered event implies for `wait`.
-fn exit_for(e: &Event) -> i32 {
+/// What one reply hands over.
+struct Batch {
+    /// In the order shown: what holds a sub-task up first.
+    items: Vec<(Event, String)>,
+    /// Turns whose result text is included.
+    turns: Vec<(String, u32)>,
+    /// Events left for the next reply.
+    left: Vec<Event>,
+}
+
+fn urgency(e: &Event) -> u8 {
     match e.kind.as_str() {
-        "failed" | "interrupted" => ipc::exit::FAILED,
-        "turn_ended" if e.data.get("ok") != Some(&Value::Bool(true)) => ipc::exit::FAILED,
-        "cancelled" => ipc::exit::CANCELLED,
-        _ => ipc::exit::OK,
+        "approval_request" => 0,
+        "question" => 1,
+        "failed" | "interrupted" | "stalled" | "cancelled" => 2,
+        "turn_ended" if e.data.get("ok") != Some(&Value::Bool(true)) => 2,
+        "turn_ended" => 3,
+        _ => 4,
     }
 }
 
-/// Failures outrank cancellations, which outrank success.
-fn worse(a: i32, b: i32) -> i32 {
-    let rank = |c| match c {
-        ipc::exit::FAILED => 2,
-        ipc::exit::CANCELLED => 1,
-        _ => 0,
-    };
-    if rank(b) > rank(a) { b } else { a }
+/// Events worth interrupting the caller for: all that `inbox` hands over except sibling notes,
+/// detach notices and the caller's own cancellations, which wait for its next `inbox`.
+fn is_news(event: &Event, caller: &str) -> bool {
+    if event.kind == "cancelled" {
+        return event.data.get("by").and_then(Value::as_str) != Some(caller);
+    }
+    matches!(
+        event.kind.as_str(),
+        "turn_ended" | "question" | "approval_request" | "stalled" | "failed" | "interrupted"
+    )
 }
 
 /// The environment a sub-agent starts with: its caller's, minus host session identity, plus ours.

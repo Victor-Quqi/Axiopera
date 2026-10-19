@@ -13,14 +13,15 @@ Dispatch
   --worktree (an isolated git worktree).
 
 Get results
-  axiopera wait            blocks until one of your sub-tasks finishes a turn or hits a problem,
-                           then prints it. Each result is delivered once.
-  - Claude Code: run `axiopera wait` as a background command; you are woken when it exits.
-  - Codex: if spawn says to use wait, poll with `axiopera wait --timeout 60s`. On Windows your
-    shell reports every nonzero exit code as 1; tell them apart by the output.
-  - Grok: run it in the background, or use `axiopera watch` with your monitor tool.
-  Exit codes: 0 success, 1 command error, 3 timed out, 4 nothing left to wait for,
-  5 something failed, 6 something was cancelled.
+  axiopera inbox           takes what your sub-tasks have for you: results, questions, approval
+                           requests and problems. Each is handed over once. Never blocks.
+  axiopera wait            blocks until there is something new, lists it, and takes nothing.
+  - Claude Code: run `axiopera wait` as a background command; when it exits, run `axiopera inbox`.
+  - Codex: if spawn says to use inbox, run `axiopera wait`, then `axiopera inbox`.
+  - Grok: run `axiopera wait` in the background, or use `axiopera watch` with your monitor tool;
+    then run `axiopera inbox`.
+  Exit codes: 0 success, 1 command error, 3 nothing new yet (or wait timed out),
+  4 nothing new and nothing running.
 
 Talk to a running sub-agent
   axiopera send <task> "Also update the docs."    steers the running turn, or starts a new turn

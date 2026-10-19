@@ -52,9 +52,10 @@ Or try a task from your terminal:
 ```sh
 axiopera spawn codex --tier read --name review "Review this repository and report the issues most worth fixing."
 axiopera wait review
+axiopera inbox review
 ```
 
-The task starts in the background. `wait` returns its answer, and `send` lets you follow up in the same conversation.
+The task starts in the background. `wait` blocks until it has news, `inbox` takes its answer, and `send` lets you follow up in the same conversation.
 
 See the [agent guide](src/guide.md) for more examples, or run `axiopera --help`. The [usage and configuration guide](docs/usage.md) is currently in Chinese.
 

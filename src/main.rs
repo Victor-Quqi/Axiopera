@@ -72,13 +72,19 @@ enum Command {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
     },
-    /// Wait for the next results or problems from your sub-tasks.
+    /// Block until your sub-tasks have news, then list it. Takes nothing; use inbox for that.
     Wait {
         /// Only these tasks (default: all of yours).
         tasks: Vec<String>,
-        /// Give up after this long (exit code 3), e.g. 60s.
+        /// Give up after this long (exit code 3), e.g. 10m.
         #[arg(long, value_parser = parse_duration)]
         timeout: Option<Duration>,
+    },
+    /// Take the results, questions and approval requests your sub-tasks have for you. Each is
+    /// handed over once. Never blocks.
+    Inbox {
+        /// Only these tasks (default: all of yours).
+        tasks: Vec<String>,
     },
     /// Print every event of your sub-tasks, one line each, until interrupted.
     Watch,
@@ -301,6 +307,7 @@ async fn run(cli: Cli) -> Result<i32> {
             tasks,
             timeout_ms: timeout.map(|d| d.as_millis() as u64),
         },
+        Command::Inbox { tasks } => Request::Inbox { tasks },
         Command::Watch => Request::Watch,
         Command::Status { task, all } => Request::Status { task, all },
         Command::Log { task, tail } => Request::Log { task, tail },
