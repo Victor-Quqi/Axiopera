@@ -31,6 +31,7 @@
 | [会话与消息](backends.md#会话与消息)：中途消息和消费确认 | `steer.py`、`message_receipts.py`；源码 [Codex tasks/mod.rs](https://github.com/openai/codex/blob/ce0323f2f2d3b25e82806cd555237da3db4e1897/codex-rs/core/src/tasks/mod.rs)、[Grok interjection.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/interjection.rs) |
 | [会话与消息](backends.md#会话与消息)：Grok 空闲时的消息，以及一次 prompt 内的多段答复 | `grok_idle_interject.py`、`grok_response_boundary.py` |
 | [会话与消息](backends.md#会话与消息)：后台命令结束后自行开启一轮 | `background.py` |
+| [结果与接管](usage.md#结果与接管)：审批请求先于更早的结果交出，交出前不能批准；过长的提问和留言只给首尾，全文写入文件；agent 自行开启的一轮从开始就计入进度 | `delivery.py` |
 | [会话与消息](backends.md#会话与消息)：并发续接 | `resume.py` |
 | [宿主通知](backends.md#宿主通知)：Claude 和 Grok 在本轮进行中能否收到后台命令的完成通知 | `background.py busy` |
 | [宿主通知](backends.md#宿主通知)：Codex 推送通道，以及 TUI 退出后会话约一分钟才卸载 | `codex_host_push.py` |
