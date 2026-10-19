@@ -45,6 +45,8 @@ cargo package --locked --target-dir target/package-verify
 - `docs/design.md`：内部状态、持久化和并发机制。修改状态或交付逻辑时同步。
 - `plugins/axiopera/`：skill 只让 agent 去读 `axiopera guide`，说明写在 guide 里。改动 Codex hook 会让用户重新信任；插件在 Codex 中留下的内容有变化时，同步 `src/plugin.rs` 和[使用文档](usage.md#skill-与-codex-插件)。
 
+增删命令或选项前，参考数据目录中 `daemon/requests.jsonl` 记录的实际用法，字段见[存储](design.md#存储)。
+
 事实的条件和例外与它写在一起；未验证的结论在正文注明。删除过时表述。探索记录留在忽略目录 `.local/`。
 
 代码注释用英文，解释代码本身看不出的原因。实现保持直接，优先修复可确认的缺陷。提交使用 Conventional Commits，探针改动使用 `test(spikes)`。

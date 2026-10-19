@@ -144,7 +144,7 @@ enum Command {
     /// Hand a task over to you: axiopera stops driving it and prints the native resume command.
     Detach { task: String },
     /// Remove finished tasks untouched for a while, and their worktrees if nothing in them is
-    /// uncommitted.
+    /// uncommitted; trim the request log to the same age.
     Gc {
         /// Untouched for at least this many days.
         #[arg(long, default_value_t = 7)]

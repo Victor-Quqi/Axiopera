@@ -84,7 +84,7 @@ async fn wait_lists_news_without_taking_it_and_inbox_takes_all() {
     // A sibling note is no news: with nothing running, wait returns at once.
     let mut buf = Vec::new();
     let exit =
-        f.d.wait("codex:host", &[], None, &mut Out { w: &mut buf })
+        f.d.wait("codex:host", &[], None, &mut Out::new(&mut buf))
             .await
             .unwrap();
     assert_eq!(exit, ipc::exit::NOTHING_RUNNING);
@@ -95,7 +95,7 @@ async fn wait_lists_news_without_taking_it_and_inbox_takes_all() {
     );
     let mut buf = Vec::new();
     let exit =
-        f.d.wait("codex:host", &[], None, &mut Out { w: &mut buf })
+        f.d.wait("codex:host", &[], None, &mut Out::new(&mut buf))
             .await
             .unwrap();
     assert_eq!(exit, ipc::exit::OK);
@@ -108,7 +108,7 @@ async fn wait_lists_news_without_taking_it_and_inbox_takes_all() {
 
     let mut buf = Vec::new();
     let exit =
-        f.d.inbox("codex:host", &[], &mut Out { w: &mut buf })
+        f.d.inbox("codex:host", &[], &mut Out::new(&mut buf))
             .await
             .unwrap();
     assert_eq!(exit, ipc::exit::OK);
@@ -119,7 +119,7 @@ async fn wait_lists_news_without_taking_it_and_inbox_takes_all() {
     assert!(f.d.unseen(&f.d.lock(), "codex:host", &[]).is_empty());
     let mut buf = Vec::new();
     let exit =
-        f.d.inbox("codex:host", &[], &mut Out { w: &mut buf })
+        f.d.inbox("codex:host", &[], &mut Out::new(&mut buf))
             .await
             .unwrap();
     assert_eq!(exit, ipc::exit::NOTHING_RUNNING);
@@ -256,7 +256,7 @@ async fn agents_approve_only_requests_they_have_read_in_full() {
             .unwrap_err();
     assert!(refused.to_string().contains("read"), "{refused}");
     let mut buf = Vec::new();
-    f.d.inbox("codex:host", &[], &mut Out { w: &mut buf })
+    f.d.inbox("codex:host", &[], &mut Out::new(&mut buf))
         .await
         .unwrap();
     let text = replies(&buf);
@@ -318,7 +318,7 @@ async fn watch_merges_news_that_comes_together() {
     let (client, mut server) = tokio::io::duplex(1 << 16);
     let d = f.d.clone();
     let watcher =
-        tokio::spawn(async move { d.watch("codex:host", &mut Out { w: &mut server }).await });
+        tokio::spawn(async move { d.watch("codex:host", &mut Out::new(&mut server)).await });
     let mut reader = ipc::Reader::new(client);
     let Some(Reply::Out { text, .. }) = reader.read::<Reply>().await.unwrap() else {
         panic!("no line");
@@ -332,4 +332,47 @@ async fn watch_merges_news_that_comes_together() {
     tokio::time::sleep(WATCH_GAP + Duration::from_millis(500)).await;
     assert!(!watcher.is_finished());
     watcher.abort();
+}
+
+#[test]
+fn the_request_log_keeps_argument_names_and_ages_out_with_gc() {
+    let f = fixture();
+    std::fs::create_dir_all(f.home.join("daemon")).unwrap();
+    let request = Request::Wait {
+        tasks: vec!["secret-name".into()],
+        timeout_ms: None,
+    };
+    // Times of their own, so trimming at the second keeps exactly one.
+    let mut entry = f.d.request_entry("task:test", &request);
+    entry.as_mut().unwrap().insert("ts".into(), json!(1_000));
+    f.d.record(entry, Some(ipc::exit::NOTHING_NEW), None, 42);
+    assert!(f.d.request_entry("codex:host", &Request::Pending).is_none());
+    let request = Request::Send {
+        task: "test".into(),
+        message: "do the secret thing".into(),
+    };
+    let mut entry = f.d.request_entry("codex:host", &request);
+    entry.as_mut().unwrap().insert("ts".into(), json!(2_000));
+    f.d.record(entry, Some(ipc::exit::ERROR), Some(ErrorCode::NotFound), 0);
+
+    let path = f.home.join("daemon").join("requests.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("secret"));
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines[0]["caller"], "codex sub-agent");
+    assert_eq!(lines[0]["op"], "wait");
+    assert_eq!(lines[0]["args"], json!(["tasks"]));
+    assert_eq!(lines[0]["exit"], 3);
+    assert_eq!(lines[0]["bytes"], 42);
+    assert_eq!(lines[1]["caller"], "codex");
+    assert_eq!(lines[1]["args"], json!(["message", "task"]));
+    assert_eq!(lines[1]["error"], "not_found");
+
+    f.d.trim_requests(lines[1]["ts"].as_u64().unwrap()).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
+    f.d.trim_requests(u64::MAX).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
 }

@@ -84,6 +84,6 @@ CLI 按需启动 daemon。没有运行中的 agent 和客户端连接时，daemo
 
 `axiopera daemon status` 查看 daemon，`daemon stop` 在没有运行任务时停止它。`daemon stop --force` 会中断正在运行的任务，之后可用 `send` 续接。升级二进制前先停止 daemon。
 
-`axiopera gc --days 7` 清理至少 7 天未活动且已停止的任务。存在未提交改动的 worktree 会连同任务保留，分支仅在已合并时删除。仍有子任务的父任务也会保留。
+`axiopera gc --days 7` 清理至少 7 天未活动且已停止的任务，并删除请求日志 `daemon/requests.jsonl` 中更早的行。存在未提交改动的 worktree 会连同任务保留，分支仅在已合并时删除。仍有子任务的父任务也会保留。
 
 卸载前先处理需要保留的 worktree 改动，运行 `gc --days 0` 清理可删除的任务，再停止 daemon。通过 Cargo 安装的执行 `cargo uninstall axiopera`；通过 Release 压缩包安装的删除可执行文件。数据目录按需删除，原生 agent 的会话仍由各自 CLI 管理。

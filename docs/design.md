@@ -40,6 +40,7 @@
     launch.lock
     info.json
     daemon.log
+    requests.jsonl
   tasks/<id>/
     task.json
     events.jsonl
@@ -51,6 +52,8 @@
 `task.json` 记录状态、仓库根目录、原生会话和 worktree 信息，写临时文件后原子替换。`events.jsonl` 只追加。`ledger.json` 保存游标、结果交付标记、Codex 推送目标、待确认批次和已排入的门铃。事件序号在整个 daemon 内单调递增，重启后继续。
 
 提问和答案随任务保存。审批应答通道、尚未送出的兄弟留言和消息消费跟踪 ID 只保存在内存中。
+
+`requests.jsonl` 每个请求记一行：时间、调用方类别（宿主、子 agent 或 `user`）、命令、给出的参数名、退出码、错误类别和输出的字节数，不记参数值和输出内容。客户端先断开时退出码为空。hook 的 `pending` 请求、`daemon status` 和 `daemon stop` 不记录。
 
 清理任务时，在同一把状态锁内检查和删除，防止与续接并发。先处理子任务，再处理父任务。清理条件见[使用文档](usage.md#daemon-与清理)。
 

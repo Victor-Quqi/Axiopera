@@ -55,6 +55,8 @@ pub struct Daemon {
     shutdown: Notify,
     conns: AtomicUsize,
     log: Mutex<Option<File>>,
+    /// Held while appending to or trimming `daemon/requests.jsonl`.
+    requests: Mutex<()>,
 }
 
 struct State {
@@ -115,18 +117,19 @@ struct Entry {
 /// One request's reply stream.
 pub struct Out<'a, W> {
     w: &'a mut W,
+    /// Bytes of text written so far, for the request log.
+    bytes: usize,
 }
 
-impl<W: AsyncWrite + Unpin> Out<'_, W> {
+impl<'a, W: AsyncWrite + Unpin> Out<'a, W> {
+    fn new(w: &'a mut W) -> Self {
+        Out { w, bytes: 0 }
+    }
+
     pub async fn text(&mut self, text: impl Into<String>, data: Value) -> std::io::Result<()> {
-        ipc::write(
-            self.w,
-            &Reply::Out {
-                text: text.into(),
-                data,
-            },
-        )
-        .await
+        let text = text.into();
+        self.bytes += text.len();
+        ipc::write(self.w, &Reply::Out { text, data }).await
     }
 
     async fn done(&mut self, exit: i32) -> std::io::Result<()> {
@@ -269,6 +272,7 @@ impl Daemon {
             shutdown: Notify::new(),
             conns: AtomicUsize::new(0),
             log: Mutex::new(log),
+            requests: Mutex::new(()),
         };
         // Whatever was running when the last daemon died has lost its process.
         let ids: Vec<String> = {
@@ -422,7 +426,7 @@ impl Daemon {
         let Some(mut env) = reader.read::<Envelope>().await? else {
             return Ok(());
         };
-        let mut out = Out { w: &mut w };
+        let mut out = Out::new(&mut w);
         let compatible = env.protocol == ipc::PROTOCOL && env.version == env!("CARGO_PKG_VERSION");
         // Hooks run in every host session; one from another version must not restart us.
         if !compatible && matches!(env.request, Request::Pending) {
@@ -446,7 +450,9 @@ impl Daemon {
             }
             return Ok(());
         }
+        let entry = self.request_entry(&env.caller, &env.request);
         if !env.request.allowed_in_sandbox() && peer.restricted() {
+            self.record(entry, Some(ipc::exit::ERROR), Some(ErrorCode::Sandboxed), 0);
             out.error(
                 ErrorCode::Sandboxed,
                 "re-run this command with escalated permissions outside the agent sandbox",
@@ -462,19 +468,115 @@ impl Daemon {
         // Commands that block indefinitely stop then; the others run to completion.
         let result = if matches!(env.request, Request::Wait { .. } | Request::Watch) {
             tokio::select! {
-                r = self.dispatch(env, &mut out) => r,
-                _ = reader.read::<Value>() => return Ok(()),
+                r = self.dispatch(env, &mut out) => Some(r),
+                _ = reader.read::<Value>() => None,
             }
         } else {
-            self.dispatch(env, &mut out).await
+            Some(self.dispatch(env, &mut out).await)
         };
-        match result {
-            Ok(exit) => out.done(exit).await?,
-            Err(e) => match e.downcast_ref::<RefuseErr>() {
-                Some(RefuseErr(code, msg)) => out.error(*code, msg.clone()).await?,
-                None => out.error(ErrorCode::Internal, format!("{e:#}")).await?,
-            },
+        // Answer before recording: `daemon stop` may end the process right after the answer.
+        let (exit, error, sent) = match result {
+            None => (None, None, Ok(())),
+            Some(Ok(exit)) => (Some(exit), None, out.done(exit).await),
+            Some(Err(e)) => {
+                let (code, msg) = match e.downcast_ref::<RefuseErr>() {
+                    Some(RefuseErr(code, msg)) => (*code, msg.clone()),
+                    None => (ErrorCode::Internal, format!("{e:#}")),
+                };
+                (
+                    Some(ipc::exit::ERROR),
+                    Some(code),
+                    out.error(code, msg).await,
+                )
+            }
+        };
+        self.record(entry, exit, error, out.bytes);
+        Ok(sent?)
+    }
+
+    /// What the request log keeps of a request: the kind of caller, the command and the names
+    /// of the arguments given, never their values. Hook polls and daemon commands are left out.
+    fn request_entry(&self, caller: &str, request: &Request) -> Option<Map<String, Value>> {
+        if matches!(
+            request,
+            Request::Pending | Request::Ping | Request::Stop { .. }
+        ) {
+            return None;
         }
+        let Ok(Value::Object(fields)) = serde_json::to_value(request) else {
+            return None;
+        };
+        let mut op = Value::Null;
+        let mut args = Vec::new();
+        for (name, value) in fields {
+            match value {
+                _ if name == "op" => op = value,
+                Value::Null | Value::Bool(false) => {}
+                Value::Array(a) if a.is_empty() => {}
+                Value::String(s) if s.is_empty() => {}
+                _ => args.push(name),
+            }
+        }
+        let caller = match identity::task_of(caller) {
+            Some(id) => match self.lock().tasks.get(id) {
+                Some(e) => format!("{} sub-agent", json!(e.task.agent).as_str().unwrap_or("")),
+                None => "sub-agent".into(),
+            },
+            None => caller.split(':').next().unwrap_or(caller).to_string(),
+        };
+        let entry = json!({"ts": store::now_ms(), "caller": caller, "op": op, "args": args});
+        entry.as_object().cloned()
+    }
+
+    /// Append a request to `daemon/requests.jsonl` with how it ended: no exit code when the
+    /// client left first.
+    fn record(
+        &self,
+        entry: Option<Map<String, Value>>,
+        exit: Option<i32>,
+        error: Option<ErrorCode>,
+        bytes: usize,
+    ) {
+        let Some(mut entry) = entry else {
+            return;
+        };
+        entry.insert("exit".into(), json!(exit));
+        if let Some(code) = error {
+            entry.insert("error".into(), json!(code));
+        }
+        entry.insert("bytes".into(), json!(bytes));
+        let _held = self.requests.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.opts.home.join("daemon").join("requests.jsonl");
+        let written = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| writeln!(f, "{}", Value::Object(entry)));
+        if let Err(e) = written {
+            self.log(&format!("writing {}: {e}", path.display()));
+        }
+    }
+
+    /// Drop the request log's lines from before `cutoff_ms`.
+    fn trim_requests(&self, cutoff_ms: u64) -> Result<()> {
+        let _held = self.requests.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.opts.home.join("daemon").join("requests.jsonl");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let kept: String = text
+            .lines()
+            .filter(|l| {
+                serde_json::from_str::<Value>(l)
+                    .ok()
+                    .and_then(|v| v["ts"].as_u64())
+                    .is_some_and(|ts| ts >= cutoff_ms)
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let tmp = path.with_extension("jsonl.tmp");
+        std::fs::write(&tmp, kept)?;
+        std::fs::rename(tmp, path)?;
         Ok(())
     }
 
@@ -1160,8 +1262,9 @@ impl Daemon {
         Ok(ipc::exit::OK)
     }
 
-    /// Forget finished tasks nobody touched for `days`, with their worktrees. A worktree with
-    /// uncommitted changes keeps its task, and a task stays while any of its children does.
+    /// Forget finished tasks nobody touched for `days`, with their worktrees, and older lines of
+    /// the request log. A worktree with uncommitted changes keeps its task, and a task stays
+    /// while any of its children does.
     async fn gc<W: AsyncWrite + Unpin>(
         &self,
         caller: &str,
@@ -1176,6 +1279,7 @@ impl Daemon {
             );
         }
         let cutoff = store::now_ms().saturating_sub(days * 86_400_000);
+        self.trim_requests(cutoff)?;
         let settled = |e: &Entry| {
             e.actor.is_none()
                 && e.pending.is_empty()
