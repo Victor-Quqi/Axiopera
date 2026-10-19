@@ -1,12 +1,12 @@
-"""Do the Codex plugin's hooks tell a busy host about its sub-tasks?
+"""Does the Codex plugin's hook tell a busy host about its sub-tasks?
 
 Runs the host on a private `codex app-server`, as the Codex app does, with the plugin's MCP
-server and hooks given as thread config, so nothing is installed or trusted for real:
-  tool  the host keeps running commands; a PostToolUse reminder should make it run `wait`
-        within the same turn
-  stop  the host writes without tools; the Stop hook should continue its turn so it runs `wait`
-Each case should take one turn, with no reminder turn after it. Prints the daemon's log lines
-about the host.
+server and hook given as thread config, so nothing is installed or trusted for real:
+  tool  the host keeps running commands; a PostToolUse reminder listing the news should make it
+        run `axiopera inbox` within the same turn, with no turn after it
+  end   the host writes without tools; the doorbell should start one turn after it that runs
+        `axiopera inbox`
+Prints the hook's reminders, how each case went and the daemon's log lines about the host.
 
 usage: python codex_hooks.py
 """
@@ -34,7 +34,8 @@ def wait_idle(rpc, tid, at_least, secs):
         while (m := rpc.next(0)) not in (None, ...):
             if "hook" in str(m.get("method", "")).lower():
                 run = m.get("params", {}).get("run", {})
-                log(m["method"], run.get("eventName"), run.get("status"), str(run.get("entries") or "")[:200])
+                if run.get("entries"):
+                    log(m["method"], run.get("eventName"), run.get("status"), str(run["entries"])[:400])
         t = turns(rpc, tid)
         if len(t) >= at_least and t[-1].get("status") != "inProgress":
             return t
@@ -70,23 +71,36 @@ def main():
                   f"Run these commands one at a time. 1. {spawn.format('alpha', 'ALPHA')} "
                   "2. Then run python -c \"import time; time.sleep(15)\" up to four times, one call at a time, "
                   "and follow any instructions that arrive between calls. Then end your turn."}]})
-        t = wait_idle(host, tid, 1, 300)
-        waits = outputs(t[0], "axiopera wait")
-        got = any("ALPHA" in (i.get("aggregatedOutput") or "") for i in waits)
-        log("tool:", "collected in the same turn" if got else f"NOT collected ({len(waits)} wait call(s))")
+        wait_idle(host, tid, 1, 300)
+        time.sleep(10)
+        t = turns(host, tid)
+        takes = outputs(t[0], "axiopera inbox")
+        got = any("ALPHA" in (i.get("aggregatedOutput") or "") for i in takes)
+        log("tool:", "collected in the same turn" if got else f"NOT collected ({len(takes)} inbox call(s))",
+            "|", f"{len(t) - 1} turn(s) after it")
 
-        # Busy without tools: the Stop hook continues the turn.
+        # Busy without tools: the doorbell starts the next turn.
+        n = len(t) + 1
         host.call("turn/start", {"threadId": tid, "input": [{"type": "text", "text":
                   f"Run this command: {spawn.format('bravo', 'BRAVO')} Then, without running any other "
                   "command, write a 400-word story about a lighthouse, and end your turn."}]})
-        t = wait_idle(host, tid, 2, 300)
-        waits = outputs(t[1], "axiopera wait")
-        got = any("BRAVO" in (i.get("aggregatedOutput") or "") for i in waits)
-        log("stop:", "collected in the same turn" if got else f"NOT collected ({len(waits)} wait call(s))")
+        wait_idle(host, tid, n, 300)
+        try:
+            t = wait_idle(host, tid, n + 1, 120)
+        except TimeoutError:
+            log("end: no turn after it")
+            t = turns(host, tid)
+        else:
+            rung = [c.get("text", "") for i in t[n].get("items", []) if i.get("type") == "userMessage"
+                    for c in i.get("content", [])]
+            log("doorbell:", " / ".join(rung))
+            takes = outputs(t[n], "axiopera inbox")
+            got = any("BRAVO" in (i.get("aggregatedOutput") or "") for i in takes)
+            log("end:", "collected in the turn after" if got else f"NOT collected ({len(takes)} inbox call(s))")
 
         time.sleep(25)
-        extra = len(turns(host, tid)) - 2
-        log("after:", "no reminder turn" if extra == 0 else f"{extra} extra turn(s)")
+        extra = len(turns(host, tid)) - len(t)
+        log("after:", "no further turn" if extra == 0 else f"{extra} extra turn(s)")
 
         lines = (home / "daemon" / "daemon.log").read_text(encoding="utf-8").splitlines()
         log("daemon log:\n" + "\n".join(l for l in lines if "codex:" in l))

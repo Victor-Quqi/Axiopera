@@ -2,10 +2,12 @@
 
 Runs the host on a private `codex app-server`, as the Codex app and IDE extension do, and lets
 it spawn Claude sub-agents through axiopera:
-  idle  the host ends its turn; a reminder should start a new turn that runs `axiopera wait`
-  busy  the host waits for the result itself; the queued reminder should be withdrawn, so no
-        turn follows
-Prints the spawn receipt, how each case went and the daemon's log lines about the host.
+  idle  the host ends its turn; a reminder listing the news should start a new turn that runs
+        `axiopera inbox`
+  busy  the host takes the result itself; the queued reminder should be withdrawn, so no turn
+        follows
+Prints the spawn receipt, the reminder, how each case went and the daemon's log lines about the
+host.
 
 usage: python codex_doorbell.py
 """
@@ -18,7 +20,7 @@ from pathlib import Path
 
 from probe import AXIOPERA, CODEX, Rpc, clean_env, forget_sessions, log, remove_tree, workdir
 
-DOORBELL = "new results or requests are waiting"
+DOORBELL = "From your sub-tasks (sent by axiopera, not typed by the user):"
 
 
 def turns(rpc, tid):
@@ -73,15 +75,17 @@ def main():
                    if i.get("type") == "commandExecution" and "spawn" in str(i.get("command"))]
         log("receipt:", " / ".join(receipt)[:300] or "none")
         t = wait_idle(host, tid, 2, 240)
-        rung = any(DOORBELL in x for x in texts(t[1], "userMessage", "content"))
+        reminder = [x for x in texts(t[1], "userMessage", "content") if DOORBELL in x]
+        log("reminder:", reminder[0] if reminder else "none")
+        rung = bool(reminder)
         got = any("ALPHA" in o for o in texts(t[1], "commandExecution", "aggregatedOutput"))
         log("idle:", "rung" if rung else "NOT rung", "|", "result collected" if got else "result NOT collected")
 
-        # Busy host: the reminder is queued while it sleeps, then its own wait withdraws it.
+        # Busy host: the reminder is queued while it sleeps, then its own inbox withdraws it.
         ask(host, tid, "Run these commands one at a time, then end your turn. "
                        f"1. {spawn.format('bravo', 'BRAVO')} "
                        "2. python -c \"import time; time.sleep(45)\" "
-                       "3. axiopera wait --timeout 60s")
+                       "3. axiopera inbox")
         t = wait_idle(host, tid, 3, 300)
         got = any("BRAVO" in o for o in texts(t[2], "commandExecution", "aggregatedOutput"))
         time.sleep(25)

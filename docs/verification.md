@@ -10,7 +10,7 @@
 | Linux，WSL2 Ubuntu 24.04 | 三家原生 Linux CLI 的端到端流程、sandbox 回连、进程组取消和 Codex 宿主推送 | Claude Code 2.1.296、Codex 0.162.1、Grok 1.0.52 |
 | macOS | 有平台实现，真实 agent、sandbox 检测及回连尚未实测 | 未验证 |
 
-基础验证在 2026-10-13 至 14 日，补测在 2026-10-17 至 18 日。表中记录已测组合，最低版本尚未确定。
+基础验证在 2026-10-13 至 14 日，补测在 2026-10-17 至 20 日。表中记录已测组合，最低版本尚未确定。
 
 ## 依据
 
@@ -33,8 +33,9 @@
 | [会话与消息](backends.md#会话与消息)：并发续接 | `resume.py` |
 | [宿主通知](backends.md#宿主通知)：Claude 和 Grok 在本轮进行中能否收到后台命令的完成通知 | `background.py busy` |
 | [宿主通知](backends.md#宿主通知)：Codex 推送通道，以及 TUI 退出后会话约一分钟才卸载 | `codex_host_push.py` |
-| [宿主通知](backends.md#宿主通知)：Codex 门铃，包括宿主自行 `wait` 后撤回提醒；app-server 客户端会话的来源为 `vscode` | `codex_doorbell.py` |
-| [宿主通知](backends.md#宿主通知)：Codex 插件 hook 在工具调用之后提醒、在轮末让本轮继续，隐藏的工具仍可由 hook 调用 | `codex_hooks.py`：hook 和 MCP 服务器经线程配置提供，未经插件安装和信任 |
+| [宿主通知](backends.md#宿主通知)：Codex 门铃，包括宿主自行 `inbox` 后撤回提醒；app-server 客户端会话的来源为 `vscode` | `codex_doorbell.py` |
+| [宿主通知](backends.md#宿主通知)：Codex 插件 hook 在工具调用之后提醒，隐藏的工具仍可由 hook 调用；不调工具时由本轮之后的门铃提醒 | `codex_hooks.py`：hook 和 MCP 服务器经线程配置提供，未经插件安装和信任 |
+| [宿主通知](backends.md#宿主通知)：Grok monitor 在工具调用之后和空闲时送达 `watch` 的输出，以及它的速率和行长限制；monitor 启动的命令没有 `GROK_SESSION_ID` | `grok_monitor.py`；手动实验：同一命令经 monitor 和终端工具各运行一次；源码 [Grok monitor rate_limiter.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/rate_limiter.rs)、[event.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/event.rs) |
 | [Skill 与 Codex 插件](usage.md#skill-与-codex-插件)：skill 的读取位置 | Grok 在隔离的主目录中用 `grok inspect` 实测；文档 [Claude skills](https://code.claude.com/docs/en/skills)；源码 [Codex host_roots.rs](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/ext/skills/src/host_roots.rs) |
 | [Skill 与 Codex 插件](usage.md#skill-与-codex-插件)：Codex 插件的安装、卸载和卸载后的残留，包括 hook 的信任记录 | 手动实验：在临时 `CODEX_HOME` 中安装、信任和卸载，再运行 `axiopera plugin cleanup` |
 | [Skill 与 Codex 插件](usage.md#skill-与-codex-插件)：hook 的开销 | 手动实验：直接调用 debug 构建的 `axiopera mcp --codex-hooks`，daemon 未运行和运行时各 20 次 |
