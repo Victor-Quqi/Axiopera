@@ -87,7 +87,12 @@ enum Command {
         tasks: Vec<String>,
     },
     /// A line for each piece of news from your sub-tasks, until stopped. Takes nothing.
-    Watch,
+    Watch {
+        /// Whose sub-tasks, e.g. `grok:<session>`: Grok's monitor tool starts commands without
+        /// the session's GROK_SESSION_ID.
+        #[arg(long)]
+        caller: Option<String>,
+    },
     /// List your sub-tasks, or show one.
     Status {
         task: Option<String>,
@@ -240,9 +245,10 @@ fn main() {
 
 async fn run(cli: Cli) -> Result<i32> {
     let home = paths::default_home();
+    let mut caller = None;
     let request = match cli.command {
         Command::Guide => {
-            print!("{}", include_str!("guide.md"));
+            print!("{}", guide(&client::detect_caller()));
             return Ok(0);
         }
         Command::Plugin {
@@ -308,7 +314,10 @@ async fn run(cli: Cli) -> Result<i32> {
             timeout_ms: timeout.map(|d| d.as_millis() as u64),
         },
         Command::Inbox { tasks } => Request::Inbox { tasks },
-        Command::Watch => Request::Watch,
+        Command::Watch { caller: c } => {
+            caller = c;
+            Request::Watch
+        }
         Command::Status { task, all } => Request::Status { task, all },
         Command::Log { task, tail } => Request::Log { task, tail },
         Command::Result { task, turn, force } => Request::Result { task, turn, force },
@@ -334,8 +343,18 @@ async fn run(cli: Cli) -> Result<i32> {
         home,
         json: cli.json,
     }
-    .run(request)
+    .run(caller, request)
     .await
+}
+
+/// The guide, with the watch command filled in for a Grok session or a sub-agent, as their
+/// monitors cannot tell who started them.
+fn guide(caller: &str) -> String {
+    let text = include_str!("guide.md");
+    if caller.starts_with("grok:") || caller.starts_with("task:") {
+        return text.replace("grok:<session>", caller);
+    }
+    text.to_string()
 }
 
 #[cfg(test)]
@@ -435,6 +454,14 @@ mod tests {
                 assert_eq!(error, expected);
             }
         }
+    }
+
+    #[test]
+    fn the_guide_gives_a_grok_session_its_watch_command() {
+        assert!(guide("grok:s1").contains("`axiopera watch --caller grok:s1`"));
+        // A Grok sub-agent's spawns are its task's, whatever its session.
+        assert!(guide("task:t1").contains("`axiopera watch --caller task:t1`"));
+        assert!(guide("user").contains("`axiopera watch --caller grok:<session>`"));
     }
 
     #[test]

@@ -25,9 +25,12 @@ pub enum Line {
 }
 
 impl Client {
-    /// Send one request and print the replies. Returns the exit code.
-    pub async fn run(&self, request: Request) -> Result<i32> {
-        self.request(request, |line| match line {
+    /// Send one request as `caller` (default: the one detected) and print the replies. Returns
+    /// the exit code.
+    pub async fn run(&self, caller: Option<String>, request: Request) -> Result<i32> {
+        let caller = caller.unwrap_or_else(detect_caller);
+        let launch = !matches!(request, Request::Stop { .. });
+        self.request_as(caller, launch, request, |line| match line {
             Line::Out { text, data } if self.json => {
                 // The text carries result bodies that `data` does not repeat.
                 let mut line = serde_json::json!({"text": text});
@@ -45,9 +48,9 @@ impl Client {
 
     /// Send one request, handing each line of the answer to `sink`. Returns the exit code.
     pub async fn request(&self, request: Request, sink: impl FnMut(Line)) -> Result<i32> {
-        let caller = identity::detect(|k| std::env::var(k).ok(), platform::ancestor_names);
         let launch = !matches!(request, Request::Stop { .. });
-        self.request_as(caller, launch, request, sink).await
+        self.request_as(detect_caller(), launch, request, sink)
+            .await
     }
 
     /// Without `launch`, a daemon that is not running answers nothing.
@@ -128,6 +131,10 @@ impl Client {
         }
         bail!("daemon closed the connection without finishing")
     }
+}
+
+pub fn detect_caller() -> String {
+    identity::detect(|k| std::env::var(k).ok(), platform::ancestor_names)
 }
 
 /// Start the daemon unless another caller is already doing it, then wait for its endpoint.

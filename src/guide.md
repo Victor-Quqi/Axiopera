@@ -18,9 +18,9 @@ Get results
   axiopera wait            blocks until there is something new, lists it, and takes nothing.
   - Claude Code: run `axiopera wait` as a background command; when it exits, run `axiopera inbox`.
   - Codex: if spawn says to use inbox, run `axiopera wait`, then `axiopera inbox`.
-  - Grok: once per session, start `axiopera watch` with your monitor tool, persistent. For each
-    line it prints, run `axiopera inbox`. If told the monitor ended while sub-tasks still run,
-    start it again.
+  - Grok: once per session, start `axiopera watch --caller grok:<session>` with your monitor
+    tool, persistent. For each line it prints, run `axiopera inbox`. If told the monitor ended
+    while sub-tasks still run, start it again.
   Exit codes: 0 success, 1 command error, 3 nothing new yet (or wait timed out),
   4 nothing new and nothing running.
 

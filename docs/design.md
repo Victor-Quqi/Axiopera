@@ -66,7 +66,7 @@ Windows 为每个 agent 建立 `KILL_ON_JOB_CLOSE` Job，禁止 breakaway。先�
 
 ## 身份与 IPC
 
-调用方身份依次取自 `AXIOPERA_TASK_ID`、宿主会话变量，最后回落到终端用户 `user`。多个宿主变量同时存在时，沿祖先进程选择最近的宿主；无法匹配时按 `identity::HOST_VARS` 的顺序选择。
+调用方身份依次取自 `AXIOPERA_TASK_ID`、宿主会话变量，最后回落到终端用户 `user`。`watch --caller` 直接指定调用方，供不传会话变量的 Grok monitor 使用。多个宿主变量同时存在时，沿祖先进程选择最近的宿主；无法匹配时按 `identity::HOST_VARS` 的顺序选择。
 
 Windows 使用命名管道，DACL 放行当前用户 SID 和登录会话 SID，启用 `PIPE_REJECT_REMOTE_CLIENTS`；首个实例使用 `FILE_FLAG_FIRST_PIPE_INSTANCE`。Unix 使用数据目录下的 `daemon/sock`，目录权限为 0700，接入后核对对端 uid。
 
