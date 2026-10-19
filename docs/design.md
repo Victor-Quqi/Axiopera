@@ -124,7 +124,7 @@ spawned、turn_started、steered、input_read、tool、file_changed、answered�
 
 ## Codex 推送与门铃
 
-`spawn` 依次尝试注册推送和门铃，回执告诉主 agent 结果怎样送达。连接方式和适用的会话见[后端文档](backends.md#宿主通知)。
+`spawn` 依次尝试注册推送和门铃，回执告诉主 agent 结果怎样送达；两者都不可用时说明原因：找不到 Codex、Codex 5 秒内没有应答，或会话既不在共享 daemon 上，也不在桌面端或 VS Code 扩展中。查询出错按后一种处理，错误写入 daemon 日志。连接方式和适用的会话见[后端文档](backends.md#宿主通知)。
 
 推送与 `inbox` 按调用方串行，从读取事件到推进游标都持有同一把锁。发出消息但未收到应答时，ledger 保存批次标记、事件序号和结果轮次。下次连接用 `thread/turns/list` 读回完整用户消息，找到标记才确认，找不到则重发。读回失败时按已送达处理并记日志。`inbox` 交付前也核对该批次。
 

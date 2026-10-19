@@ -19,7 +19,7 @@ use crate::store::{CodexHost, Event, PendingPush};
 
 /// Events that arrive close together go out as one message.
 const GATHER: Duration = Duration::from_secs(1);
-/// How long `spawn` may spend finding out whether the caller takes messages.
+/// How long `spawn` may spend finding out whether the caller takes messages; receipts say it.
 const PROBE: Duration = Duration::from_secs(5);
 /// A push that takes longer is tried again later.
 const TIMEOUT: Duration = Duration::from_secs(20);
@@ -38,14 +38,19 @@ pub(super) enum Reach {
 
 impl Daemon {
     /// Register the caller as a host to push to if it is a Codex session the user's Codex
-    /// daemon has open, or to ring if a long-lived client runs it.
-    pub(super) async fn register_host(&self, caller: &str, env: &[(String, String)]) -> Reach {
+    /// daemon has open, or to ring if a long-lived client runs it. A Codex session left to wait
+    /// comes with the reason.
+    pub(super) async fn register_host(
+        &self,
+        caller: &str,
+        env: &[(String, String)],
+    ) -> (Reach, Option<&'static str>) {
         let Some(thread) = caller.strip_prefix("codex:") else {
-            return Reach::Wait;
+            return (Reach::Wait, None);
         };
         let configured = self.opts.agents.get(Agent::Codex).path.as_deref();
         let Ok(exe) = agent::resolve_exe(Agent::Codex, configured, env) else {
-            return Reach::Wait;
+            return (Reach::Wait, Some("Codex was not found"));
         };
         let codex_home = env
             .iter()
@@ -58,28 +63,36 @@ impl Daemon {
             doorbell: false,
         };
         let home = host.codex_home.as_deref();
-        let reach = if self
+        let shared = self
             .probe(caller, "is not on the shared Codex daemon", async {
                 Remote::connect(&host.exe, home)
                     .await?
                     .is_open(thread)
                     .await
             })
-            .await
-        {
+            .await;
+        let reach = if shared == Some(true) {
             Reach::Push
-        } else if self
-            .probe(caller, "has no Codex queue", async {
-                Remote::private(&host.exe, home)
-                    .await?
-                    .serves_queue(thread)
-                    .await
-            })
-            .await
-        {
-            Reach::Doorbell
         } else {
-            return Reach::Wait;
+            let queued = self
+                .probe(caller, "has no Codex queue", async {
+                    Remote::private(&host.exe, home)
+                        .await?
+                        .serves_queue(thread)
+                        .await
+                })
+                .await;
+            let why = match (shared, queued) {
+                (_, Some(true)) => None,
+                (Some(false), Some(false)) => Some(
+                    "it is neither on the shared Codex daemon nor open in the Codex app or IDE extension",
+                ),
+                _ => Some("Codex did not answer within 5 seconds"),
+            };
+            if why.is_some() {
+                return (Reach::Wait, why);
+            }
+            Reach::Doorbell
         };
         host.doorbell = reach == Reach::Doorbell;
         let mut st = self.lock();
@@ -87,24 +100,26 @@ impl Daemon {
         if let Err(e) = st.ledger.save(&self.opts.home) {
             self.log(&format!("saving the ledger: {e:#}"));
         }
-        reach
+        (reach, None)
     }
 
+    /// The check's answer, or None when Codex gave none in time. A failed check counts as no
+    /// and goes to the log.
     async fn probe(
         &self,
         caller: &str,
         failure: &str,
         check: impl Future<Output = anyhow::Result<bool>>,
-    ) -> bool {
+    ) -> Option<bool> {
         match tokio::time::timeout(PROBE, check).await {
-            Ok(Ok(yes)) => yes,
+            Ok(Ok(yes)) => Some(yes),
             Ok(Err(e)) => {
                 self.log(&format!("{caller} {failure}: {e:#}"));
-                false
+                Some(false)
             }
             Err(_) => {
                 self.log(&format!("{caller} {failure}: Codex did not answer"));
-                false
+                None
             }
         }
     }

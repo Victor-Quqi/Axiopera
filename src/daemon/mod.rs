@@ -771,7 +771,7 @@ impl Daemon {
         }
         agent::resolve_exe(s.agent, self.opts.agents.get(s.agent).path.as_deref(), &env)
             .map_err(|e| anyhow!(RefuseErr(ErrorCode::Invalid, format!("{e:#}"))))?;
-        let reach = self.register_host(caller, &env).await;
+        let (reach, unreachable) = self.register_host(caller, &env).await;
 
         let now = store::now_ms();
         let id = store::new_id('t', |id| self.store.exists(id));
@@ -850,16 +850,18 @@ impl Daemon {
                 notes.push(format!("approval requests go to {approver}"));
             }
         }
-        let next = match reach {
-            Reach::Push => {
-                "Results and questions arrive as messages: do not wait or poll; end your turn if nothing else is left."
+        let take = "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some.";
+        let next = match (reach, unreachable) {
+            (Reach::Push, _) => {
+                "Results and questions arrive as messages: do not wait or poll; end your turn if nothing else is left.".to_string()
             }
-            Reach::Doorbell => {
-                "After your turn ends, a message tells you when results or questions are ready for `axiopera inbox`: do not poll; end your turn if nothing else is left."
+            (Reach::Doorbell, _) => {
+                "After your turn ends, a message tells you when results or questions are ready for `axiopera inbox`: do not poll; end your turn if nothing else is left.".to_string()
             }
-            Reach::Wait => {
-                "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some."
+            (Reach::Wait, Some(why)) => {
+                format!("Axiopera cannot send this Codex session messages: {why}. {take}")
             }
+            (Reach::Wait, None) => take.to_string(),
         };
         let state = if self.lock().tasks[&id].actor.is_some() {
             "running"
