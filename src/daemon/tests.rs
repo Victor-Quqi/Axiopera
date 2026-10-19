@@ -138,11 +138,11 @@ fn a_reply_takes_whole_events_and_leaves_the_rest() {
     finish(1, &half);
     finish(2, &half);
     let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
-    let batch = f.d.batch(&events);
+    let batch = f.d.batch(&[], &events);
     assert_eq!(batch.items.len(), 1);
     assert!(batch.items[0].1.ends_with(&format!("{half}\n</result>")));
     assert_eq!(batch.turns, [("test".to_string(), 1)]);
-    assert_eq!(batch.left.len(), 1);
+    assert_eq!(batch.left, 1);
 
     // A result larger than the budget still goes, cut down to fit.
     let f = fixture();
@@ -151,11 +151,80 @@ fn a_reply_takes_whole_events_and_leaves_the_rest() {
     f.d.store.save_turn("test", 1, &huge).unwrap();
     f.d.emit("test", "turn_ended", json!({"turn": 1, "ok": true}));
     let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
-    let batch = f.d.batch(&events);
+    let batch = f.d.batch(&[], &events);
     let text = &batch.items[0].1;
     assert!(text.contains("[truncated") && text.ends_with("END\n</result>"));
     assert!(render::tokens(text) <= render::RESPONSE_TOKENS);
-    assert!(batch.left.is_empty());
+    assert_eq!(batch.left, 0);
+}
+
+#[tokio::test]
+async fn approvals_go_ahead_of_earlier_news_and_reach_the_approver_once() {
+    let f = fixture();
+    f.d.update("test", |t| t.tier = ipc::Tier::Work);
+    let finish = |turn: u32, body: &str| {
+        f.d.update("test", |t| t.turns = turn);
+        f.d.store.save_turn("test", turn, body).unwrap();
+        f.d.emit("test", "turn_ended", json!({"turn": turn, "ok": true}));
+    };
+    let request = |summary: &str| {
+        let (reply, decision) = oneshot::channel();
+        f.d.request_approval(
+            "test",
+            agent::Approval {
+                summary: summary.into(),
+                detail: format!("Bash\ncommand: {summary}"),
+                reply,
+            },
+        );
+        decision
+    };
+    // Two results that fill the budget, then an approval request.
+    let half = "x".repeat(render::RESPONSE_TOKENS * 2);
+    finish(1, &half);
+    finish(2, &half);
+    let _decision = request("rm -rf build");
+    let rid = f.d.lock().approvals.keys().next().unwrap().clone();
+
+    let mut buf = Vec::new();
+    f.d.inbox("codex:host", &[], &mut Out::new(&mut buf))
+        .await
+        .unwrap();
+    let first = replies(&buf);
+    assert!(first.starts_with("[test codex] needs approval"), "{first}");
+    assert!(
+        first.ends_with("1 more: run `axiopera inbox` again."),
+        "{first}"
+    );
+    f.d.resolve(&rid, Some("codex:host"), agent::Decision::Approve)
+        .unwrap();
+
+    // Handed over and decided: no longer news, and not shown again.
+    let (left, _) = f.d.reminder("codex:host").unwrap();
+    assert!(!left.contains("approval"), "{left}");
+    let mut buf = Vec::new();
+    f.d.inbox("codex:host", &[], &mut Out::new(&mut buf))
+        .await
+        .unwrap();
+    let second = replies(&buf);
+    assert!(
+        second.contains("turn 2 finished") && !second.contains("approval"),
+        "{second}"
+    );
+
+    // A request decided before it was taken shows nothing.
+    let _decision = request("ls");
+    let rid = f.d.lock().approvals.keys().next().unwrap().clone();
+    f.d.resolve(&rid, Some("user"), agent::Decision::Approve)
+        .unwrap();
+    assert!(f.d.reminder("codex:host").is_none());
+    let mut buf = Vec::new();
+    let exit =
+        f.d.inbox("codex:host", &[], &mut Out::new(&mut buf))
+            .await
+            .unwrap();
+    assert_eq!(exit, ipc::exit::NOTHING_RUNNING);
+    assert!(f.d.unseen(&f.d.lock(), "codex:host", &[]).is_empty());
 }
 
 #[test]
@@ -325,13 +394,31 @@ async fn watch_merges_news_that_comes_together() {
     };
     assert_eq!(text, "test (codex) asks q1: Which port? (+1 more)");
 
-    // News held back for the next line may belong to a task gc removed meanwhile.
+    // News held back for the next line may be taken meanwhile...
+    f.d.emit("test", "stalled", json!({"quiet_secs": 900}));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    f.d.inbox("codex:host", &[], &mut Out::new(&mut Vec::new()))
+        .await
+        .unwrap();
+    tokio::time::sleep(WATCH_GAP).await;
+    f.d.emit(
+        "test",
+        "question",
+        json!({"id": "q2", "text": "Which host?"}),
+    );
+    let Some(Reply::Out { text, .. }) = reader.read::<Reply>().await.unwrap() else {
+        panic!("no line");
+    };
+    assert_eq!(text, "test (codex) asks q2: Which host?");
+
+    // ...or belong to a task gc removed meanwhile.
     f.d.emit("test", "failed", json!({"error": "gone"}));
     tokio::time::sleep(Duration::from_millis(100)).await;
     f.d.lock().tasks.remove("test");
     tokio::time::sleep(WATCH_GAP + Duration::from_millis(500)).await;
     assert!(!watcher.is_finished());
     watcher.abort();
+    assert!(reader.read::<Reply>().await.unwrap().is_none());
 }
 
 #[tokio::test(start_paused = true)]

@@ -236,6 +236,8 @@ pub struct PendingPush {
     pub marker: String,
     pub events: Vec<(String, u64)>,
     pub turns: Vec<(String, u32)>,
+    #[serde(default)]
+    pub approvals: Vec<String>,
 }
 
 /// A Codex session reached through `exe`.

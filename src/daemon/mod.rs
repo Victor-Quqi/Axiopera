@@ -1544,11 +1544,7 @@ impl Daemon {
             }
             let check = {
                 let st = self.lock();
-                let news: Vec<Event> = self
-                    .unseen(&st, caller, &only)
-                    .into_iter()
-                    .filter(|e| is_news(e, caller))
-                    .collect();
+                let news = self.news(&st, caller, &only);
                 if !news.is_empty() {
                     Check::News(self.news_text(&st, &news), serde_json::to_value(&news)?)
                 } else if !self.live(&st, caller, &only) {
@@ -1586,8 +1582,9 @@ impl Daemon {
         }
     }
 
-    /// Hand the caller what its sub-tasks (or those in `only`) have for it: whole events, oldest
-    /// first, as many as one reply holds. The rest stays for the next call.
+    /// Hand the caller what its sub-tasks (or those in `only`) have for it: approval requests
+    /// waiting for it, then whole events oldest first, as many as one reply holds. The rest stays
+    /// for the next call.
     async fn inbox<W: AsyncWrite + Unpin>(
         self: &Arc<Self>,
         caller: &str,
@@ -1597,40 +1594,40 @@ impl Daemon {
         let only = self.find_all(caller, only)?;
         let delivering = self.delivery(caller).lock_owned().await;
         self.reconcile_before_take(caller).await?;
-        let (events, live) = {
+        let (approvals, events, live) = {
             let st = self.lock();
             (
+                self.waiting_approvals(&st, caller, &only),
                 self.unseen(&st, caller, &only),
                 self.live(&st, caller, &only),
             )
         };
-        if events.is_empty() {
+        let batch = self.batch(&approvals, &events);
+        if batch.items.is_empty() {
+            // At most approval requests already handed over or decided, which show nothing.
+            if !batch.seen.is_empty() {
+                self.mark_seen(caller, &batch.seen, &[], &[])?;
+            }
             drop(delivering);
+            self.retract_doorbell(caller);
             return if live {
                 self.nothing_new(caller, &only, out).await
             } else {
                 self.nothing_running(caller, &only, out).await
             };
         }
-        let batch = self.batch(&events);
         for (e, text) in &batch.items {
             out.text(text.clone(), serde_json::to_value(e)?).await?;
         }
-        if !batch.left.is_empty() {
-            let approvals = batch
-                .left
-                .iter()
-                .filter(|e| e.kind == "approval_request")
-                .count();
-            let more = match approvals {
-                0 => format!("{} more", batch.left.len()),
-                n => format!("{} more, {n} of them approval requests", batch.left.len()),
+        if batch.left > 0 {
+            let more = match batch.left_approvals {
+                0 => format!("{} more", batch.left),
+                n => format!("{} more, {n} of them approval requests", batch.left),
             };
             out.text(format!("{more}: run `axiopera inbox` again."), Value::Null)
                 .await?;
         }
-        let taken: Vec<Event> = batch.items.into_iter().map(|(e, _)| e).collect();
-        self.mark_seen(caller, &taken, &batch.turns)?;
+        self.mark_seen(caller, &batch.seen, &batch.turns, &batch.approvals)?;
         drop(delivering);
         self.retract_doorbell(caller);
         Ok(ipc::exit::OK)
@@ -1843,13 +1840,48 @@ impl Daemon {
         {
             return None;
         }
-        let news: Vec<Event> = self
-            .unseen(&st, caller, &[])
-            .into_iter()
-            .filter(|e| is_news(e, caller))
-            .collect();
+        let news = self.news(&st, caller, &[]);
         let seq = news.iter().map(|e| e.seq).max()?;
         Some((self.news_text(&st, &news), seq))
+    }
+
+    /// What the caller has not taken and is worth interrupting it for. An approval request
+    /// counts while it waits for a decision and has not reached the caller.
+    fn news(&self, st: &State, caller: &str, only: &[String]) -> Vec<Event> {
+        let mut news: Vec<Event> = self
+            .unseen(st, caller, only)
+            .into_iter()
+            .filter(|e| e.kind != "approval_request" && is_news(e, caller))
+            .collect();
+        news.extend(self.waiting_approvals(st, caller, only));
+        news.sort_by_key(|e| e.seq);
+        news
+    }
+
+    /// Approval requests routed to the caller (from the tasks in `only`) that wait for a
+    /// decision and have not reached it, oldest first. They go ahead of other events, whatever
+    /// the caller's cursors.
+    fn waiting_approvals(&self, st: &State, caller: &str, only: &[String]) -> Vec<Event> {
+        let mut found: Vec<Event> = st
+            .approvals
+            .iter()
+            .filter(|(_, p)| p.approver == caller && !p.delivered)
+            .filter_map(|(rid, p)| {
+                let task = st.tasks.get(&p.task)?;
+                if !only.is_empty() && !only.iter().any(|root| within(st, &task.task, root)) {
+                    return None;
+                }
+                task.deliverable
+                    .iter()
+                    .find(|e| {
+                        e.kind == "approval_request"
+                            && e.data.get("id").and_then(Value::as_str) == Some(rid)
+                    })
+                    .cloned()
+            })
+            .collect();
+        found.sort_by_key(|e| e.seq);
+        found
     }
 
     /// Events the caller has not taken yet, oldest first: from its children (or only the tasks
@@ -1891,26 +1923,57 @@ impl Daemon {
         ready
     }
 
-    /// What one reply hands over: whole events, oldest first, within the reply budget; the
-    /// first event goes in any case, its result cut down to fit.
-    fn batch(&self, events: &[Event]) -> Batch {
+    /// What one reply hands over: the waiting `approvals` first, then `events` oldest first;
+    /// whole, within the reply budget. The first goes in any case, a result cut down to fit.
+    /// Approval requests among `events` are passed over: while they wait they come from
+    /// `approvals`, and once decided there is nothing left to do about them.
+    fn batch(&self, approvals: &[Event], events: &[Event]) -> Batch {
         let mut budget = render::RESPONSE_TOKENS;
-        let mut items = Vec::new();
-        let mut turns = Vec::new();
-        for e in events {
-            let first = items.is_empty();
+        let mut b = Batch {
+            items: Vec::new(),
+            turns: Vec::new(),
+            seen: Vec::new(),
+            approvals: Vec::new(),
+            left: 0,
+            left_approvals: 0,
+        };
+        let mut full = false;
+        for e in approvals {
+            let (text, _) = self.render_wake(e, None);
+            let cost = render::tokens(&text);
+            if !b.items.is_empty() && cost > budget {
+                full = true;
+                break;
+            }
+            budget = budget.saturating_sub(cost);
+            b.approvals
+                .extend(e.data.get("id").and_then(Value::as_str).map(str::to_string));
+            b.items.push((e.clone(), text));
+        }
+        for e in events.iter().take_while(|_| !full) {
+            if e.kind == "approval_request" {
+                b.seen.push(e.clone());
+                continue;
+            }
+            let first = b.items.is_empty();
             let (text, turn) = self.render_wake(e, first.then_some(budget));
             let cost = render::tokens(&text);
             if !first && cost > budget {
                 break;
             }
             budget = budget.saturating_sub(cost);
-            turns.extend(turn.map(|t| (e.task.clone(), t)));
-            items.push((e.clone(), text));
+            b.turns.extend(turn.map(|t| (e.task.clone(), t)));
+            b.seen.push(e.clone());
+            b.items.push((e.clone(), text));
         }
-        let left = events[items.len()..].to_vec();
-        items.sort_by_key(|(e, _)| urgency(e));
-        Batch { items, turns, left }
+        b.left_approvals = approvals.len() - b.approvals.len();
+        b.left = b.left_approvals
+            + events[b.seen.len()..]
+                .iter()
+                .filter(|e| e.kind != "approval_request")
+                .count();
+        b.items.sort_by_key(|(e, _)| urgency(e));
+        b
     }
 
     /// Held while handing the caller its events, from reading them to marking them seen.
@@ -1919,26 +1982,29 @@ impl Daemon {
         st.deliveries.entry(caller.to_string()).or_default().clone()
     }
 
-    /// Once rendered events reached the caller: advance its cursors and mark results delivered.
-    fn mark_seen(&self, caller: &str, events: &[Event], turns: &[(String, u32)]) -> Result<()> {
+    /// Once a batch reached the caller: advance its cursors past the events `seen`, and mark the
+    /// results in `turns` and the approval requests in `approvals` delivered.
+    fn mark_seen(
+        &self,
+        caller: &str,
+        seen: &[Event],
+        turns: &[(String, u32)],
+        approvals: &[String],
+    ) -> Result<()> {
         for (task, turn) in turns {
             self.update(task, |t| t.delivered = t.delivered.max(*turn));
         }
         let mut st = self.lock();
-        for e in events {
+        for e in seen {
             let cursor = st
                 .ledger
                 .cursors
                 .entry(cursor_key(caller, &e.task))
                 .or_default();
             *cursor = (*cursor).max(e.seq);
-            if e.kind == "approval_request"
-                && let Some(p) = e
-                    .data
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .and_then(|rid| st.approvals.get_mut(rid))
-            {
+        }
+        for rid in approvals {
+            if let Some(p) = st.approvals.get_mut(rid) {
                 p.delivered = true;
             }
         }
@@ -1990,12 +2056,7 @@ impl Daemon {
     ) -> Result<i32> {
         let (mut rx, mut news) = {
             let st = self.lock();
-            let news: Vec<Event> = self
-                .unseen(&st, caller, &[])
-                .into_iter()
-                .filter(|e| is_news(e, caller))
-                .collect();
-            (self.events.subscribe(), news)
+            (self.events.subscribe(), self.news(&st, caller, &[]))
         };
         let mut due = tokio::time::Instant::now();
         let sub_agent = identity::task_of(caller).is_some();
@@ -2005,11 +2066,7 @@ impl Daemon {
             if sub_agent && news.is_empty() {
                 let idle = {
                     let st = self.lock();
-                    !self.live(&st, caller, &[])
-                        && !self
-                            .unseen(&st, caller, &[])
-                            .iter()
-                            .any(|e| is_news(e, caller))
+                    !self.live(&st, caller, &[]) && self.news(&st, caller, &[]).is_empty()
                 };
                 if !idle {
                     idle_since = None;
@@ -2024,8 +2081,10 @@ impl Daemon {
             if !news.is_empty() && tokio::time::Instant::now() >= due {
                 let line = {
                     let st = self.lock();
-                    // gc may have removed a task since its news came.
-                    news.retain(|e| st.tasks.contains_key(&e.task));
+                    // Since it came, the caller may have taken it, an approval request may have
+                    // been decided, or gc may have removed its task.
+                    let still = self.news(&st, caller, &[]);
+                    news.retain(|e| still.iter().any(|s| s.seq == e.seq));
                     news.first().map(|first| {
                         let line = self.news_line(&st, first);
                         match news.len() {
@@ -2221,8 +2280,13 @@ struct Batch {
     items: Vec<(Event, String)>,
     /// Turns whose result text is included.
     turns: Vec<(String, u32)>,
-    /// Events left for the next reply.
-    left: Vec<Event>,
+    /// Events taken in order, for the caller's cursors to move past.
+    seen: Vec<Event>,
+    /// Approval requests handed over.
+    approvals: Vec<String>,
+    /// How many items are left for the next reply, and how many of them approval requests.
+    left: usize,
+    left_approvals: usize,
 }
 
 fn urgency(e: &Event) -> u8 {

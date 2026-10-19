@@ -15,7 +15,7 @@ use tokio::sync::broadcast;
 use super::{Daemon, RELEASED, is_news};
 use crate::agent::{self, codex_remote::Remote};
 use crate::ipc::Agent;
-use crate::store::{CodexHost, Event, PendingPush};
+use crate::store::{CodexHost, PendingPush};
 
 /// Events that arrive close together go out as one message.
 const GATHER: Duration = Duration::from_secs(1);
@@ -244,6 +244,11 @@ impl Daemon {
                     .or_default();
                 *cursor = (*cursor).max(seq);
             }
+            for rid in &pending.approvals {
+                if let Some(p) = st.approvals.get_mut(rid) {
+                    p.delivered = true;
+                }
+            }
         }
         st.ledger.pending_pushes.remove(caller);
         st.ledger.save(&self.opts.home)?;
@@ -347,14 +352,21 @@ impl Daemon {
         let sent = tokio::time::timeout(TIMEOUT, async {
             let r = remote.insert(Remote::connect(&host.exe, host.codex_home.as_deref()).await?);
             self.reconcile_push(caller, &host.thread, r).await?;
-            let events = self.unseen(&self.lock(), caller, &[]);
-            if !events.iter().any(|e| is_news(e, caller)) {
+            let (approvals, events, news) = {
+                let st = self.lock();
+                (
+                    self.waiting_approvals(&st, caller, &[]),
+                    self.unseen(&st, caller, &[]),
+                    self.news(&st, caller, &[]),
+                )
+            };
+            if news.is_empty() {
                 return Ok(("no events requiring attention".to_string(), false));
             }
             if !r.is_open(&host.thread).await? {
                 anyhow::bail!("the session is closed");
             }
-            let taken = self.batch(&events);
+            let taken = self.batch(&approvals, &events);
             let texts: Vec<&str> = taken.items.iter().map(|(_, t)| t.as_str()).collect();
             let marker = format!(
                 "[axiopera:{}]",
@@ -364,11 +376,11 @@ impl Daemon {
                 "{marker} From your sub-tasks (sent by axiopera, not typed by the user):\n{}",
                 texts.join("\n")
             );
-            let events: Vec<Event> = taken.items.iter().map(|(e, _)| e.clone()).collect();
             let pending = PendingPush {
                 marker,
-                events: events.iter().map(|e| (e.task.clone(), e.seq)).collect(),
+                events: taken.seen.iter().map(|e| (e.task.clone(), e.seq)).collect(),
                 turns: taken.turns.clone(),
+                approvals: taken.approvals.clone(),
             };
             // Save before writing: a daemon crash can also lose the acknowledgement.
             {
@@ -376,9 +388,10 @@ impl Daemon {
                 st.ledger.pending_pushes.insert(caller.to_string(), pending);
                 st.ledger.save(&self.opts.home)?;
             }
-            batch = Some((events, taken.turns));
+            let more = taken.left > 0;
+            batch = Some(taken);
             let how = r.message(&host.thread, &message).await?;
-            anyhow::Ok((how.to_string(), !taken.left.is_empty()))
+            anyhow::Ok((how.to_string(), more))
         })
         .await;
         let outcome = match sent {
@@ -386,8 +399,8 @@ impl Daemon {
             Err(_) => Err("timed out".to_string()),
         };
         if outcome.is_ok() {
-            if let Some((events, turns)) = &batch {
-                if let Err(e) = self.mark_seen(caller, events, turns) {
+            if let Some(b) = &batch {
+                if let Err(e) = self.mark_seen(caller, &b.seen, &b.turns, &b.approvals) {
                     self.log(&format!("saving cursors: {e:#}"));
                 }
                 self.clear_pending_push(caller);
@@ -430,11 +443,7 @@ impl Daemon {
     pub(super) fn retract_doorbell(self: &Arc<Self>, caller: &str) {
         let (id, host) = {
             let mut st = self.lock();
-            if self
-                .unseen(&st, caller, &[])
-                .iter()
-                .any(|e| is_news(e, caller))
-            {
+            if !self.news(&st, caller, &[]).is_empty() {
                 return;
             }
             let Some(id) = st.ledger.doorbells.remove(caller) else {
@@ -473,6 +482,8 @@ impl Daemon {
 mod tests {
     use super::super::tests::fixture;
     use super::*;
+    use crate::daemon::{Out, render};
+    use crate::store::Event;
 
     #[test]
     fn only_actionable_events_start_a_host_turn() {
@@ -557,9 +568,21 @@ mod tests {
                 marker: "[axiopera:receipt]".into(),
                 events: vec![("test".into(), 7)],
                 turns: vec![("test".into(), 1)],
+                approvals: vec!["r1".into()],
             };
+            let (reply, _decision) = tokio::sync::oneshot::channel();
             {
                 let mut st = f.d.lock();
+                st.approvals.insert(
+                    "r1".into(),
+                    super::super::Pending {
+                        task: "test".into(),
+                        approver: "codex:host".into(),
+                        summary: "Bash: ls".into(),
+                        delivered: false,
+                        reply,
+                    },
+                );
                 st.ledger
                     .pending_pushes
                     .insert("codex:host".into(), pending);
@@ -576,6 +599,8 @@ mod tests {
                 st.ledger.cursors.get("codex:host|test").copied(),
                 found.then_some(7)
             );
+            // Approved by whoever got it, though it was taken from no cursor.
+            assert_eq!(st.approvals["r1"].delivered, found);
         }
     }
 
@@ -614,7 +639,7 @@ mod tests {
         f.d.retract_doorbell("codex:host");
         assert!(f.d.lock().ledger.doorbells.contains_key("codex:host"));
         let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
-        f.d.mark_seen("codex:host", &events, &[]).unwrap();
+        f.d.mark_seen("codex:host", &events, &[], &[]).unwrap();
         f.d.retract_doorbell("codex:host");
         assert!(f.d.lock().ledger.doorbells.is_empty());
         assert!(
@@ -622,5 +647,68 @@ mod tests {
                 .doorbells
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn the_reminder_goes_once_only_requests_handed_over_or_decided_are_left() {
+        let f = fixture();
+        f.d.update("test", |t| t.tier = crate::ipc::Tier::Work);
+        let ring = || {
+            let mut st = f.d.lock();
+            st.ledger.codex_hosts.insert(
+                "codex:host".into(),
+                CodexHost {
+                    exe: f.d.opts.home.join("missing-codex"),
+                    codex_home: Some(f.d.opts.home.clone()),
+                    thread: "host".into(),
+                    doorbell: true,
+                },
+            );
+            st.ledger
+                .doorbells
+                .insert("codex:host".into(), "queued".into());
+        };
+        let request = |summary: &str| {
+            let (reply, decision) = tokio::sync::oneshot::channel();
+            f.d.request_approval(
+                "test",
+                crate::agent::Approval {
+                    summary: summary.into(),
+                    detail: format!(
+                        "Bash
+command: {summary}"
+                    ),
+                    reply,
+                },
+            );
+            decision
+        };
+        let inbox = async || {
+            f.d.inbox("codex:host", &[], &mut Out::new(&mut Vec::new()))
+                .await
+                .unwrap()
+        };
+
+        // A note too long to come along with the request handed over ahead of it.
+        ring();
+        let note = "x".repeat(render::RESPONSE_TOKENS * 4);
+        f.d.emit(
+            "test",
+            "message",
+            serde_json::json!({"to": "other", "text": note}),
+        );
+        let _first = request("rm -rf build");
+        inbox().await;
+        assert!(f.d.lock().ledger.doorbells.is_empty());
+        inbox().await;
+
+        // A request decided before the host took it.
+        ring();
+        let _second = request("ls");
+        let rid = f.d.lock().approvals.keys().next().unwrap().clone();
+        f.d.resolve(&rid, Some("user"), crate::agent::Decision::Approve)
+            .unwrap();
+        inbox().await;
+        assert!(f.d.lock().ledger.doorbells.is_empty());
     }
 }
