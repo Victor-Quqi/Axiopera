@@ -356,7 +356,7 @@ fn on_update(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
             let name = u["kind"].as_str().unwrap_or("tool").to_string();
             let _ = events.send(AgentEvent::Tool {
                 name,
-                detail: clip(u["title"].as_str().unwrap_or(""), 160),
+                detail: clip(u["title"].as_str().unwrap_or(""), 200),
             });
         }
         // Auto mode refuses some calls outright; the agent only sees the call fail.

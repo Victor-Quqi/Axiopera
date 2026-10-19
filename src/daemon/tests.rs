@@ -140,7 +140,7 @@ fn a_reply_takes_whole_events_and_leaves_the_rest() {
     let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
     let batch = f.d.batch(&events);
     assert_eq!(batch.items.len(), 1);
-    assert!(batch.items[0].1.ends_with(&half));
+    assert!(batch.items[0].1.ends_with(&format!("{half}\n</result>")));
     assert_eq!(batch.turns, [("test".to_string(), 1)]);
     assert_eq!(batch.left.len(), 1);
 
@@ -153,7 +153,7 @@ fn a_reply_takes_whole_events_and_leaves_the_rest() {
     let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
     let batch = f.d.batch(&events);
     let text = &batch.items[0].1;
-    assert!(text.contains("[truncated") && text.ends_with("END"));
+    assert!(text.contains("[truncated") && text.ends_with("END\n</result>"));
     assert!(render::tokens(text) <= render::RESPONSE_TOKENS);
     assert!(batch.left.is_empty());
 }

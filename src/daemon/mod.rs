@@ -1754,10 +1754,10 @@ impl Daemon {
             let t = &st.tasks[&e.task].task;
             (t.agent, t.delivered)
         };
-        let head = render::event_line(e, agent);
         if e.kind != "turn_ended" {
-            return (head, None);
+            return (render::event_full(e, agent), None);
         }
+        let head = render::event_line(e, agent);
         let turn = e.data.get("turn").and_then(Value::as_u64).unwrap_or(0) as u32;
         if turn <= delivered {
             return (
@@ -1769,16 +1769,15 @@ impl Daemon {
         let body = std::fs::read_to_string(&path).unwrap_or_default();
         let body = match fit {
             Some(budget) => {
-                // One more for the line break.
-                render::result_body(
-                    &body,
-                    &path,
-                    budget.saturating_sub(render::tokens(&head) + 1),
-                )
+                let frame = render::tokens(&format!("{head}\n{}", render::tagged("result", "")));
+                render::result_body(&body, &path, budget.saturating_sub(frame))
             }
             None => body,
         };
-        (format!("{head}\n{body}"), Some(turn))
+        (
+            format!("{head}\n{}", render::tagged("result", &body)),
+            Some(turn),
+        )
     }
 
     async fn watch<W: AsyncWrite + Unpin>(
@@ -1907,8 +1906,10 @@ impl Daemon {
             return Ok(ipc::exit::OK);
         }
         let body = std::fs::read_to_string(&path)?;
+        let frame = render::tokens(&render::tagged("result", ""));
+        let body = render::result_body(&body, &path, render::RESPONSE_TOKENS - frame);
         out.text(
-            render::result_body(&body, &path, render::RESPONSE_TOKENS),
+            render::tagged("result", &body),
             json!({"task": id, "turn": turn, "path": path}),
         )
         .await?;

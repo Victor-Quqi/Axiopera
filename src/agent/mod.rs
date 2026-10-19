@@ -476,22 +476,32 @@ pub fn home_dir() -> PathBuf {
     )
 }
 
-/// Cut a string to at most `max` bytes on a char boundary, for one-line summaries.
+/// One line for summaries: line breaks shown as ↵, cut to `max` characters with a count of
+/// what was left out.
 pub fn clip(s: &str, max: usize) -> String {
-    let line = s.lines().next().unwrap_or("");
-    if line.len() <= max && !s.contains('\n') {
-        return line.to_string();
+    let line = s.trim().lines().collect::<Vec<_>>().join(" ↵ ");
+    let total = line.chars().count();
+    if total <= max {
+        return line;
     }
-    let mut end = max.min(line.len());
-    while !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &line[..end])
+    let kept: String = line.chars().take(max).collect();
+    format!("{kept}…(+{} chars)", total - max)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::clip;
     use super::is_axiopera_command as ok;
+
+    #[test]
+    fn clipped_lines_keep_every_line_and_count_the_rest() {
+        assert_eq!(clip("cargo test", 200), "cargo test");
+        assert_eq!(
+            clip("cd crates\r\ncargo test\n", 200),
+            "cd crates ↵ cargo test"
+        );
+        assert_eq!(clip("审查意见很长", 2), "审查…(+4 chars)");
+    }
 
     #[test]
     fn plain_axiopera_commands() {
