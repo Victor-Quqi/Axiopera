@@ -17,6 +17,38 @@ pub const APPROVAL_TOKENS: usize = 3_500;
 
 /// Characters of free text in a one-line event.
 const LINE: usize = 200;
+/// Characters of a preview in a reminder line.
+pub const PREVIEW: usize = 120;
+/// Bytes of a reminder line: Grok's monitor keeps 500 of each.
+pub const LINE_BYTES: usize = 400;
+/// Lines of news in one reminder.
+const SUMMARY_LINES: usize = 10;
+
+/// News lines as a reminder lists them, ending with how to take the news.
+pub fn summary(lines: &[String]) -> String {
+    let mut text: Vec<String> = lines
+        .iter()
+        .take(SUMMARY_LINES)
+        .map(|l| format!("- {l}"))
+        .collect();
+    if lines.len() > SUMMARY_LINES {
+        text.push(format!("- …and {} more", lines.len() - SUMMARY_LINES));
+    }
+    text.push("Take them with `axiopera inbox`.".into());
+    text.join("\n")
+}
+
+/// The line cut on a character boundary to at most `max` bytes.
+pub fn fit_bytes(line: &str, max: usize) -> String {
+    if line.len() <= max {
+        return line.to_string();
+    }
+    let mut end = max - '…'.len_utf8();
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &line[..end])
+}
 
 /// Rough token count that errs high: four ASCII characters per token, one per other character.
 pub fn tokens(s: &str) -> usize {
@@ -322,6 +354,18 @@ mod tests {
         assert!(out.starts_with("START") && out.ends_with("END"));
         assert!(out.contains("characters omitted; read all of it in r1.txt before deciding"));
         assert!(tokens(&out) <= 1_000);
+    }
+
+    #[test]
+    fn reminders_list_ten_lines_of_bounded_size() {
+        let lines: Vec<String> = (0..12)
+            .map(|i| format!("t{i} (claude) finished turn 1"))
+            .collect();
+        let text = summary(&lines);
+        assert_eq!(text.lines().count(), 12);
+        assert!(text.contains("- …and 2 more\nTake them with `axiopera inbox`."));
+        let long = fit_bytes(&"审".repeat(200), LINE_BYTES);
+        assert!(long.len() <= LINE_BYTES && long.ends_with('…'));
     }
 
     #[test]

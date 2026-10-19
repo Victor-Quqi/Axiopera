@@ -16,7 +16,7 @@
 
 ## 结果与接管
 
-`wait` 阻塞到有新消息，列出后退出，不取走任何内容；`inbox` 取走消息，从不阻塞。`watch` 持续输出事件摘要，同样不取走。每轮结果经 `inbox`、`result` 或宿主推送交付后，再次 `result` 只返回文件路径。需要重新查看正文时用 `result <task> --turn N --force`。
+`wait` 阻塞到有新消息，列出后退出，不取走任何内容；`inbox` 取走消息，从不阻塞。`watch` 每有新消息就输出一行摘要，一直运行到被停止，同样不取走。每轮结果经 `inbox`、`result` 或宿主推送交付后，再次 `result` 只返回文件路径。需要重新查看正文时用 `result <task> --turn N --force`。
 
 回复长度有上限。一次回复放不下的消息整条留到下一次 `inbox`，回复末尾注明还剩几条。单条结果超长时只保留末尾，并注明显示的字符数、总字符数和完整文件路径。`status` 查看任务状态，运行中的任务附带进度：第几轮、本轮已用时间、工具调用次数，以及最近一次调用和距今时间；一轮结束后进程仍在等后台工作时，注明上一轮结束了多久；没有新消息时，`inbox` 和 `wait` 超时也列出这些进度。`log` 查看事件摘要，每个事件一行，换行显示为 `↵`，命令等自由文本截到 200 个字符并注明省略了多少。加上 `--json` 可以读取完整任务字段和事件字段，包括改动文件列表及后端上报的用量。
 
@@ -67,10 +67,7 @@ Codex 插件包含同一个 skill，另带 hook，让宿主在一轮进行中也
 - 安装：`codex plugin marketplace add Victor-Quqi/Axiopera`，再 `codex plugin add axiopera@axiopera`。
 - 卸载：`codex plugin remove axiopera@axiopera`，再 `codex plugin marketplace remove axiopera`。
 
-hook 要在桌面端的插件页或 TUI 的 `/hooks` 中信任后才运行，插件更新后需重新信任。VS Code 扩展官方不支持插件。hook 的作用：
-
-- 工具调用之后，如果有新的结果、提问或审批请求，提醒宿主运行 `inbox`。
-- 一轮即将结束时，如果仍有未取的内容，让这一轮继续一次，取完再结束。
+hook 要在桌面端的插件页或 TUI 的 `/hooks` 中信任后才运行，插件更新后需重新信任。VS Code 扩展官方不支持插件。工具调用之后，如果有新的结果、提问或审批请求，hook 列出每条的一行摘要，提醒宿主运行 `inbox`；一轮结束时仍未取走的，由门铃在本轮结束后提醒。
 
 装了插件后，Codex 每个会话都会启动一个 `axiopera mcp --codex-hooks` 进程。hook 只查询已在运行的 daemon，不会启动它；没有相关任务时立即返回。实测进程启动不到 0.1 秒，每次 hook 调用不到 1 毫秒。删除 `axiopera` 程序前先卸载插件，否则 Codex 无法启动这个进程。
 

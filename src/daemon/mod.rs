@@ -33,6 +33,9 @@ pub use task::Cmd;
 
 /// Broadcast-only signal that a task's process is gone.
 const RELEASED: &str = "_released";
+/// Least time between two lines of `watch`, below the rate Grok's monitor keeps up with: ten
+/// events at once, then one every two seconds.
+const WATCH_GAP: Duration = Duration::from_secs(2);
 
 pub struct Options {
     pub home: PathBuf,
@@ -520,8 +523,8 @@ impl Daemon {
             }
             Request::Inbox { tasks } => self.inbox(&caller, &tasks, out).await,
             Request::Pending => {
-                if let Some(seq) = self.needing_host(&caller) {
-                    out.text(push::REMINDER, json!({"seq": seq})).await?;
+                if let Some((text, seq)) = self.reminder(&caller) {
+                    out.text(text, json!({"seq": seq})).await?;
                 }
                 Ok(ipc::exit::OK)
             }
@@ -1672,18 +1675,71 @@ impl Daemon {
         Ok(ipc::exit::NOTHING_RUNNING)
     }
 
-    /// The news `wait` lists, one line each.
+    /// News as reminders show it: a line each, at most ten, and how to take it.
     fn news_text(&self, st: &State, news: &[Event]) -> String {
-        let mut lines: Vec<String> = news
-            .iter()
-            .map(|e| {
-                let agent = st.tasks[&e.task].task.agent;
-                let line = render::event_line(e, agent);
-                line.lines().next().unwrap_or_default().to_string()
-            })
+        let lines: Vec<String> = news.iter().map(|e| self.news_line(st, e)).collect();
+        render::summary(&lines)
+    }
+
+    /// One line on a piece of news: which task, what happened, and a preview.
+    fn news_line(&self, st: &State, e: &Event) -> String {
+        let t = &st.tasks[&e.task].task;
+        let who = render::task_label(t);
+        let s = |k: &str| e.data.get(k).and_then(Value::as_str).unwrap_or("");
+        let n = |k: &str| e.data.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let line = match e.kind.as_str() {
+            "turn_ended" => {
+                let turn = n("turn") as u32;
+                let result = std::fs::read_to_string(self.store.turn_path(&e.task, turn))
+                    .unwrap_or_default();
+                let preview = agent::clip(&result, render::PREVIEW);
+                if e.data.get("ok") == Some(&Value::Bool(true)) {
+                    format!("{who} finished turn {turn}: {preview}")
+                } else {
+                    format!("{who} turn {turn} failed ({}): {preview}", s("error"))
+                }
+            }
+            "question" => format!(
+                "{who} asks {}: {}",
+                s("id"),
+                agent::clip(s("text"), render::PREVIEW)
+            ),
+            "approval_request" => format!(
+                "{who} needs approval {}: {}",
+                s("id"),
+                agent::clip(s("summary"), render::PREVIEW)
+            ),
+            "stalled" => format!(
+                "{who} no activity for {}",
+                render::duration(n("quiet_secs") * 1000)
+            ),
+            "failed" => format!("{who} failed: {}", agent::clip(s("error"), render::PREVIEW)),
+            "interrupted" => format!("{who} interrupted: {}", s("reason")),
+            "cancelled" => format!("{who} cancelled: {}", s("reason")),
+            _ => render::event_line(e, t.agent),
+        };
+        render::fit_bytes(&line, render::LINE_BYTES)
+    }
+
+    /// The caller's news as reminders show it, and the newest news's sequence number; nothing
+    /// for hosts that get their news pushed.
+    pub(super) fn reminder(&self, caller: &str) -> Option<(String, u64)> {
+        let st = self.lock();
+        if st
+            .ledger
+            .codex_hosts
+            .get(caller)
+            .is_some_and(|h| !h.doorbell)
+        {
+            return None;
+        }
+        let news: Vec<Event> = self
+            .unseen(&st, caller, &[])
+            .into_iter()
+            .filter(|e| is_news(e, caller))
             .collect();
-        lines.push("Take them with `axiopera inbox`.".into());
-        lines.join("\n")
+        let seq = news.iter().map(|e| e.seq).max()?;
+        Some((self.news_text(&st, &news), seq))
     }
 
     /// Events the caller has not taken yet, oldest first: from its children (or only the tasks
@@ -1814,33 +1870,67 @@ impl Daemon {
         )
     }
 
+    /// A line for each piece of news, until stopped; news within `WATCH_GAP` of the last line
+    /// is merged into the next one. Takes nothing.
     async fn watch<W: AsyncWrite + Unpin>(
         self: &Arc<Self>,
         caller: &str,
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
-        let mut rx = self.events.subscribe();
+        let (mut rx, mut news) = {
+            let st = self.lock();
+            let news: Vec<Event> = self
+                .unseen(&st, caller, &[])
+                .into_iter()
+                .filter(|e| is_news(e, caller))
+                .collect();
+            (self.events.subscribe(), news)
+        };
+        let mut due = tokio::time::Instant::now();
         loop {
-            let e = match rx.recv().await {
-                Ok(e) if e.kind == RELEASED => continue,
-                Ok(e) => e,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(broadcast::error::RecvError::Closed) => return Ok(ipc::exit::OK),
-            };
-            let routed_here = e.kind == "approval_request"
-                && e.data.get("approver").and_then(Value::as_str) == Some(caller);
-            let agent = {
-                let st = self.lock();
-                match st.tasks.get(&e.task) {
-                    Some(t) if t.task.parent == caller || caller == "user" || routed_here => {
-                        t.task.agent
-                    }
-                    _ => continue,
+            if !news.is_empty() && tokio::time::Instant::now() >= due {
+                let line = {
+                    let st = self.lock();
+                    // gc may have removed a task since its news came.
+                    news.retain(|e| st.tasks.contains_key(&e.task));
+                    news.first().map(|first| {
+                        let line = self.news_line(&st, first);
+                        match news.len() {
+                            1 => line,
+                            n => render::fit_bytes(
+                                &format!("{line} (+{} more)", n - 1),
+                                render::LINE_BYTES,
+                            ),
+                        }
+                    })
+                };
+                if let Some(line) = line {
+                    out.text(line, serde_json::to_value(&news)?).await?;
+                    due = tokio::time::Instant::now() + WATCH_GAP;
                 }
-            };
-            out.text(render::event_line(&e, agent), serde_json::to_value(&e)?)
-                .await?;
+                news.clear();
+            }
+            let wake = tokio::time::sleep_until(due);
+            tokio::select! {
+                e = rx.recv() => match e {
+                    Ok(e) if is_news(&e, caller) && self.concerns(&e, caller) => news.push(e),
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => return Ok(ipc::exit::OK),
+                },
+                _ = wake, if !news.is_empty() => {}
+            }
         }
+    }
+
+    /// Whether `inbox` would hand the event to the caller.
+    fn concerns(&self, e: &Event, caller: &str) -> bool {
+        if e.kind == "approval_request" {
+            return e.data.get("approver").and_then(Value::as_str) == Some(caller);
+        }
+        self.lock()
+            .tasks
+            .get(&e.task)
+            .is_some_and(|t| t.task.parent == caller)
     }
 
     async fn status<W: AsyncWrite + Unpin>(

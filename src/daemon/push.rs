@@ -26,8 +26,6 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// Retries after a failed push start here and double up to the maximum.
 const RETRY: Duration = Duration::from_secs(30);
 const RETRY_MAX: Duration = Duration::from_secs(600);
-pub(super) const REMINDER: &str = "From your sub-tasks (sent by axiopera, not typed by the user): new results \
-    or requests are waiting. Take them with `axiopera inbox`.";
 
 /// How a host learns of its sub-tasks' events.
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize)]
@@ -395,7 +393,12 @@ impl Daemon {
             {
                 return Ok("its reminder is still queued".to_string());
             }
-            let id = r.enqueue(&host.thread, REMINDER).await?;
+            let Some((news, _)) = self.reminder(caller) else {
+                return Ok("nothing to remind of".to_string());
+            };
+            let text =
+                format!("From your sub-tasks (sent by axiopera, not typed by the user):\n{news}");
+            let id = r.enqueue(&host.thread, &text).await?;
             let mut st = self.lock();
             st.ledger.doorbells.insert(caller.to_string(), id);
             st.ledger.save(&self.opts.home)?;
@@ -406,16 +409,6 @@ impl Daemon {
             Ok(result) => result.map_err(|e| format!("{e:#}")),
             Err(_) => Err("timed out".to_string()),
         }
-    }
-
-    /// The newest unseen event that needs the caller.
-    pub(super) fn needing_host(&self, caller: &str) -> Option<u64> {
-        let st = self.lock();
-        self.unseen(&st, caller, &[])
-            .iter()
-            .filter(|e| is_news(e, caller))
-            .map(|e| e.seq)
-            .max()
     }
 
     /// After the host ran `inbox`: a reminder still queued would start a turn for nothing.

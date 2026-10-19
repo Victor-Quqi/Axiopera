@@ -86,7 +86,7 @@ enum Command {
         /// Only these tasks (default: all of yours).
         tasks: Vec<String>,
     },
-    /// Print every event of your sub-tasks, one line each, until interrupted.
+    /// A line for each piece of news from your sub-tasks, until stopped. Takes nothing.
     Watch,
     /// List your sub-tasks, or show one.
     Status {

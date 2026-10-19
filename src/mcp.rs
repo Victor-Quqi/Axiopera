@@ -2,7 +2,7 @@
 //! outside its sandbox, while its sandboxed shell cannot reach the daemon on Linux or in the
 //! elevated Windows sandbox.
 //!
-//! `axiopera mcp --codex-hooks` serves the hooks of the Codex plugin instead, in every Codex
+//! `axiopera mcp --codex-hooks` serves the hook of the Codex plugin instead, in every Codex
 //! session where the plugin is installed.
 
 use std::collections::HashMap;
@@ -145,37 +145,26 @@ async fn call(client: &Client, params: &Value) -> Value {
 
 /// Codex keeps tools whose visibility leaves out the model from the model.
 fn hook_tools() -> Value {
-    let hidden = json!({"ui": {"visibility": ["app"]}});
-    let session = json!({"type": "string"});
     json!([
         {
             "name": "post_tool_use",
             "description": "For the Axiopera plugin's PostToolUse hook.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"session_id": session},
+                "properties": {"session_id": {"type": "string"}},
                 "required": ["session_id"],
             },
-            "_meta": hidden,
-        },
-        {
-            "name": "stop",
-            "description": "For the Axiopera plugin's Stop hook.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"session_id": session, "stop_hook_active": {"type": "boolean"}},
-                "required": ["session_id"],
-            },
-            "_meta": hidden,
+            "_meta": {"ui": {"visibility": ["app"]}},
         },
     ])
 }
 
-/// Remind the session to run `wait` when its sub-tasks have news: mid-turn once per new
-/// event, and at the end of a turn by continuing it once. Silent while the daemon is down.
+/// After a tool call, list the session's news from its sub-tasks, once per new piece of news.
+/// The turn's end is left to the doorbell. Silent while the daemon is down.
 async fn hook(client: &Client, params: &Value, reminded: &mut HashMap<String, u64>) -> Value {
-    let args = &params["arguments"];
-    let session = args["session_id"].as_str().unwrap_or_default();
+    let session = params["arguments"]["session_id"]
+        .as_str()
+        .unwrap_or_default();
     let mut found = None;
     let caller = format!("codex:{session}");
     let _ = client
@@ -189,15 +178,13 @@ async fn hook(client: &Client, params: &Value, reminded: &mut HashMap<String, u6
         return tool_result(String::new(), false);
     };
     let last = reminded.insert(session.to_string(), seq);
-    let output = match params["name"].as_str() {
-        Some("post_tool_use") if last.is_none_or(|l| l < seq) => json!({
-            "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text},
-        }),
-        Some("stop") if args["stop_hook_active"] != true => {
-            json!({"decision": "block", "reason": text})
-        }
-        _ => return tool_result(String::new(), false),
-    };
+    if params["name"] != "post_tool_use" || last.is_some_and(|l| l >= seq) {
+        return tool_result(String::new(), false);
+    }
+    let text = format!("News from your axiopera sub-tasks:\n{text}");
+    let output = json!({
+        "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text},
+    });
     tool_result(output.to_string(), false)
 }
 

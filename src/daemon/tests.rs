@@ -276,3 +276,60 @@ async fn agents_approve_only_requests_they_have_read_in_full() {
     f.d.resolve(&rid, Some("codex:host"), agent::Decision::Deny("no".into()))
         .unwrap();
 }
+
+#[test]
+fn reminders_list_news_but_not_for_hosts_that_get_it_pushed() {
+    let f = fixture();
+    f.d.emit("test", "message", json!({"to": "other", "text": "a note"}));
+    assert!(f.d.reminder("codex:host").is_none());
+    f.d.emit(
+        "test",
+        "question",
+        json!({"id": "q1", "text": "Which port?"}),
+    );
+    let (text, _) = f.d.reminder("codex:host").unwrap();
+    assert_eq!(
+        text,
+        "- test (codex) asks q1: Which port?\nTake them with `axiopera inbox`."
+    );
+    let host = store::CodexHost {
+        exe: "codex".into(),
+        codex_home: None,
+        thread: "host".into(),
+        doorbell: false,
+    };
+    f.d.lock()
+        .ledger
+        .codex_hosts
+        .insert("codex:host".into(), host);
+    assert!(f.d.reminder("codex:host").is_none());
+}
+
+#[tokio::test]
+async fn watch_merges_news_that_comes_together() {
+    let f = fixture();
+    f.d.emit(
+        "test",
+        "question",
+        json!({"id": "q1", "text": "Which port?"}),
+    );
+    f.d.emit("test", "stalled", json!({"quiet_secs": 600}));
+    f.d.emit("test", "message", json!({"to": "other", "text": "a note"}));
+    let (client, mut server) = tokio::io::duplex(1 << 16);
+    let d = f.d.clone();
+    let watcher =
+        tokio::spawn(async move { d.watch("codex:host", &mut Out { w: &mut server }).await });
+    let mut reader = ipc::Reader::new(client);
+    let Some(Reply::Out { text, .. }) = reader.read::<Reply>().await.unwrap() else {
+        panic!("no line");
+    };
+    assert_eq!(text, "test (codex) asks q1: Which port? (+1 more)");
+
+    // News held back for the next line may belong to a task gc removed meanwhile.
+    f.d.emit("test", "failed", json!({"error": "gone"}));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    f.d.lock().tasks.remove("test");
+    tokio::time::sleep(WATCH_GAP + Duration::from_millis(500)).await;
+    assert!(!watcher.is_finished());
+    watcher.abort();
+}
