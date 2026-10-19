@@ -181,6 +181,12 @@ impl Store {
         self.dir(id).join("turns").join(format!("{turn}.md"))
     }
 
+    pub fn approval_path(&self, id: &str, request: &str) -> PathBuf {
+        self.dir(id)
+            .join("approvals")
+            .join(format!("{request}.txt"))
+    }
+
     pub fn save_turn(&self, id: &str, turn: u32, text: &str) -> Result<PathBuf> {
         let path = self.turn_path(id, turn);
         fs::write(&path, text)?;

@@ -1,6 +1,6 @@
 //! Codex over `codex app-server` (JSON-RPC), one process per task.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +22,8 @@ struct State {
     usage: Option<Value>,
     inputs: super::Inputs,
     recorded: Vec<u64>,
+    /// Changes of file edits not finished yet, by item ID, for their approval requests.
+    patches: HashMap<String, Value>,
 }
 
 pub struct Codex {
@@ -208,7 +210,13 @@ async fn pump(
                 on_notification(&method, &params, &state, &events)
             }
             Incoming::Request { id, method, params } => {
-                let summary = summary(&method, &params);
+                let (summary, detail) = {
+                    let patches = &state.lock().unwrap().patches;
+                    (
+                        summary(&method, &params, patches),
+                        request_detail(&method, &params, patches),
+                    )
+                };
                 if !FORWARDED.contains(&method.as_str()) {
                     let _ = events.send(AgentEvent::Blocked(summary));
                     let _ = match refusal(&method) {
@@ -217,7 +225,7 @@ async fn pump(
                     };
                     continue;
                 }
-                let decision = super::ask_approval(&events, summary);
+                let decision = super::ask_approval(&events, summary, detail);
                 let rpc = rpc.clone();
                 tokio::spawn(async move {
                     match decision.await {
@@ -276,6 +284,15 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                     detail,
                 });
             }
+            Some("fileChange") => {
+                if let Some(id) = item["id"].as_str() {
+                    state
+                        .lock()
+                        .unwrap()
+                        .patches
+                        .insert(id.to_string(), item["changes"].clone());
+                }
+            }
             Some("mcpToolCall") => {
                 let name = format!(
                     "{}.{}",
@@ -304,6 +321,9 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                     item["text"].as_str().unwrap_or("").to_string();
             }
             Some("fileChange") => {
+                if let Some(id) = item["id"].as_str() {
+                    state.lock().unwrap().patches.remove(id);
+                }
                 for c in item["changes"].as_array().into_iter().flatten() {
                     if let Some(path) = c["path"].as_str() {
                         let _ = events.send(AgentEvent::FileChanged(path.to_string()));
@@ -362,14 +382,79 @@ const FORWARDED: [&str; 3] = [
     "item/permissions/requestApproval",
 ];
 
-fn summary(method: &str, p: &Value) -> String {
-    let what = p["command"]
-        .as_str()
-        .or(p["reason"].as_str())
-        .or(p["message"].as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| p["permissions"].to_string());
-    format!("{method}: {}", clip(&what, 200))
+fn summary(method: &str, p: &Value, patches: &HashMap<String, Value>) -> String {
+    let text = |k: &str| p[k].as_str().map(str::to_string);
+    let (kind, what) = match method {
+        "item/commandExecution/requestApproval" => ("shell", text("command").or(text("reason"))),
+        "item/fileChange/requestApproval" => {
+            let paths: Vec<&str> = patches
+                .get(p["itemId"].as_str().unwrap_or_default())
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|c| c["path"].as_str())
+                .collect();
+            let paths = (!paths.is_empty()).then(|| paths.join(", "));
+            ("edit", paths.or(text("reason")))
+        }
+        "item/permissions/requestApproval" => ("permissions", text("reason")),
+        _ => (method, text("message").or(text("reason"))),
+    };
+    let what = what.unwrap_or_else(|| p["permissions"].to_string());
+    format!("{kind}: {}", clip(&what, 200))
+}
+
+/// The whole request: a command with its directory and reason, or a file edit's diffs.
+fn request_detail(method: &str, p: &Value, patches: &HashMap<String, Value>) -> String {
+    let mut lines = Vec::new();
+    let field = |k: &str| p[k].as_str().filter(|v| !v.is_empty());
+    if let Some(command) = field("command") {
+        lines.push(format!("command:\n{command}"));
+    }
+    for (k, label) in [
+        ("cwd", "cwd"),
+        ("reason", "reason"),
+        ("grantRoot", "grant root"),
+    ] {
+        if let Some(v) = field(k) {
+            lines.push(format!("{label}: {v}"));
+        }
+    }
+    if method == "item/permissions/requestApproval" {
+        lines.push(format!("permissions: {}", p["permissions"]));
+    }
+    let item = p["itemId"].as_str().unwrap_or_default();
+    for change in patches
+        .get(item)
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let path = change["path"].as_str().unwrap_or("?");
+        let diff = change["diff"].as_str().unwrap_or("");
+        let count = |sign: char, header: &str| {
+            diff.lines()
+                .filter(|l| l.starts_with(sign) && !l.starts_with(header))
+                .count()
+        };
+        let kind = match change["kind"]["type"].as_str() {
+            Some("update") => match change["kind"]["move_path"].as_str() {
+                Some(to) => format!("update and move to {to}"),
+                None => "update".to_string(),
+            },
+            Some(other) => other.to_string(),
+            None => "change".to_string(),
+        };
+        lines.push(format!(
+            "{kind} {path} (+{} -{}):\n{diff}",
+            count('+', "+++"),
+            count('-', "---")
+        ));
+    }
+    if lines.is_empty() {
+        return format!("{method}\n{}", super::arguments(p));
+    }
+    lines.join("\n")
 }
 
 /// Approval without anything that persists (no acceptForSession, no execpolicy amendment).

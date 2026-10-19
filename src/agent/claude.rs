@@ -411,8 +411,9 @@ async fn pump(
                 let tool = req["tool_name"].as_str().unwrap_or("?").to_string();
                 let input = req["input"].clone();
                 let summary = format!("{tool}: {}", tool_detail(&input));
-                let approval =
-                    (tier != Tier::Read).then(|| super::ask_approval(&events, summary.clone()));
+                let detail = format!("{tool}\n{}", super::arguments(&input));
+                let approval = (tier != Tier::Read)
+                    .then(|| super::ask_approval(&events, summary.clone(), detail));
                 let stdin = stdin.clone();
                 let pending = pending.clone();
                 let events = events.clone();

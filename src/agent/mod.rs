@@ -55,6 +55,8 @@ pub type Events = mpsc::UnboundedSender<AgentEvent>;
 pub struct Approval {
     /// One line on what the agent wants to do.
     pub summary: String,
+    /// Everything the request says, for whoever decides: a summary can hide what matters.
+    pub detail: String,
     pub reply: oneshot::Sender<Decision>,
 }
 
@@ -67,9 +69,17 @@ pub enum Decision {
 
 /// Hand a request to the daemon and wait for its decision; a dropped request is a refusal.
 /// Adapters await this off their message loop, which must keep running meanwhile.
-fn ask_approval(events: &Events, summary: String) -> impl Future<Output = Decision> + use<> {
+fn ask_approval(
+    events: &Events,
+    summary: String,
+    detail: String,
+) -> impl Future<Output = Decision> + use<> {
     let (reply, rx) = oneshot::channel();
-    let _ = events.send(AgentEvent::Approval(Approval { summary, reply }));
+    let _ = events.send(AgentEvent::Approval(Approval {
+        summary,
+        detail,
+        reply,
+    }));
     async move { rx.await.unwrap_or_else(|_| Decision::Deny(REFUSED.into())) }
 }
 
@@ -474,6 +484,25 @@ pub fn home_dir() -> PathBuf {
     PathBuf::from(
         std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default(),
     )
+}
+
+/// Every argument of a tool call in full, one per line; multi-line and long values start on a
+/// line of their own.
+pub fn arguments(input: &Value) -> String {
+    let Some(fields) = input.as_object() else {
+        return serde_json::to_string_pretty(input).unwrap_or_default();
+    };
+    fields
+        .iter()
+        .map(|(k, v)| match v {
+            Value::String(s) if s.contains('\n') || s.chars().count() > 200 => {
+                format!("{k}:\n{s}")
+            }
+            Value::String(s) => format!("{k}: {s}"),
+            other => format!("{k}: {other}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// One line for summaries: line breaks shown as ↵, cut to `max` characters with a count of

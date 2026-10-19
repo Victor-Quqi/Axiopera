@@ -81,6 +81,8 @@ struct Pending {
     /// Caller key of whoever decides.
     approver: String,
     summary: String,
+    /// The full request reached the approver through `inbox` or a push.
+    delivered: bool,
     reply: oneshot::Sender<agent::Decision>,
 }
 
@@ -1247,7 +1249,11 @@ impl Daemon {
 
     /// Route an agent's approval request to whoever may decide it, or refuse it at once.
     pub fn request_approval(self: &Arc<Self>, id: &str, a: agent::Approval) {
-        let agent::Approval { summary, reply } = a;
+        let agent::Approval {
+            summary,
+            detail,
+            reply,
+        } = a;
         let read_only = self
             .lock()
             .tasks
@@ -1269,16 +1275,25 @@ impl Daemon {
                     task: id.to_string(),
                     approver: approver.clone(),
                     summary: summary.clone(),
+                    delivered: false,
                     reply,
                 },
             );
             (rid, approver)
         };
-        self.emit(
-            id,
-            "approval_request",
-            json!({"id": rid, "summary": summary, "approver": approver}),
-        );
+        let mut data =
+            json!({"id": rid, "summary": summary, "approver": approver, "detail": detail});
+        // Too long to show whole: the approver reads the rest from a file.
+        if render::tokens(&detail) > render::APPROVAL_TOKENS {
+            let file = self.store.approval_path(id, &rid);
+            match std::fs::create_dir_all(file.parent().unwrap())
+                .and_then(|()| std::fs::write(&file, &detail))
+            {
+                Ok(()) => data["file"] = json!(file),
+                Err(e) => self.log(&format!("writing {}: {e:#}", file.display())),
+            }
+        }
+        self.emit(id, "approval_request", data);
         let d = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(d.opts.approval_timeout).await;
@@ -1304,6 +1319,16 @@ impl Daemon {
                 return refuse(
                     ErrorCode::Invalid,
                     format!("{rid} is for {} to decide", p.approver),
+                );
+            }
+            // An agent approves what it has read in full, not a one-line reminder of it.
+            if let (Some(by), agent::Decision::Approve) = (by, &decision)
+                && by != "user"
+                && !p.delivered
+            {
+                return refuse(
+                    ErrorCode::Invalid,
+                    format!("read {rid} in full first: run `axiopera inbox`"),
                 );
             }
             st.approvals.remove(rid).unwrap()
@@ -1741,6 +1766,15 @@ impl Daemon {
                 .entry(cursor_key(caller, &e.task))
                 .or_default();
             *cursor = (*cursor).max(e.seq);
+            if e.kind == "approval_request"
+                && let Some(p) = e
+                    .data
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|rid| st.approvals.get_mut(rid))
+            {
+                p.delivered = true;
+            }
         }
         st.ledger.save(&self.opts.home)?;
         Ok(())

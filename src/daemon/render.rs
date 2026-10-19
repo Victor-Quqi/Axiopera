@@ -12,6 +12,9 @@ use crate::store::{Event, Status, Task};
 /// characters of a command's output, 5,000 tokens of ASCII by this count.
 pub const RESPONSE_TOKENS: usize = 4_500;
 
+/// Tokens of an approval request shown whole; longer ones show their ends and point to a file.
+pub const APPROVAL_TOKENS: usize = 3_500;
+
 /// Characters of free text in a one-line event.
 const LINE: usize = 200;
 
@@ -154,13 +157,22 @@ pub fn event_full(e: &Event, agent: Agent) -> String {
             tagged("question", &s("text")),
             s("id")
         ),
-        "approval_request" => format!(
-            "{who} needs approval {}: {}\ndecide with: axiopera approve {}  |  axiopera deny {} --reason \"...\"",
-            s("id"),
-            s("summary"),
-            s("id"),
-            s("id")
-        ),
+        "approval_request" => {
+            let detail = s("detail");
+            let request = match get(e, "file").as_str() {
+                Some(file) if tokens(&detail) > APPROVAL_TOKENS => {
+                    excerpt(&detail, APPROVAL_TOKENS, Path::new(file))
+                }
+                _ => detail,
+            };
+            format!(
+                "{who} needs approval {}:\n{}\ndecide with: axiopera approve {}  |  axiopera deny {} --reason \"...\"",
+                s("id"),
+                tagged("request", &request),
+                s("id"),
+                s("id")
+            )
+        }
         "message" => format!("{who} told {}:\n{}", s("to"), tagged("note", &s("text"))),
         "failed" => format!("{who} failed: {}", s("error")),
         _ => event_line(e, agent),
@@ -172,6 +184,37 @@ pub fn tagged(tag: &str, text: &str) -> String {
     let close = format!("</{tag}>");
     let text = text.trim_end().replace(&close, &format!("<\\/{tag}>"));
     format!("<{tag}>\n{text}\n{close}")
+}
+
+/// The start and end of a text within `max_tokens`, with how much is left out and where the
+/// whole text is.
+pub fn excerpt(text: &str, max_tokens: usize, path: &Path) -> String {
+    let total = text.chars().count();
+    let note = |omitted: usize| {
+        format!(
+            "\n…[{omitted} of {total} characters omitted; read all of it in {} before deciding]…\n",
+            path.display()
+        )
+    };
+    let mut room = max_tokens.saturating_sub(tokens(&note(total))) * 4 / 2;
+    let fit = |chars: &mut dyn Iterator<Item = char>, room: &mut usize| {
+        let mut kept = 0;
+        for c in chars {
+            let cost = if c.is_ascii() { 1 } else { 4 };
+            if cost > *room {
+                break;
+            }
+            *room -= cost;
+            kept += 1;
+        }
+        kept
+    };
+    let mut tail_room = room;
+    let head = fit(&mut text.chars(), &mut room);
+    let tail = fit(&mut text.chars().rev().take(total - head), &mut tail_room);
+    let start: String = text.chars().take(head).collect();
+    let end: String = text.chars().skip(total - tail).collect();
+    format!("{start}{}{end}", note(total - head - tail))
 }
 
 /// The text as is, or its tail within `max_tokens` with a note on what is shown and where the
@@ -269,6 +312,15 @@ mod tests {
             "[truncated: showing the last {shown} of 20003 characters; full text: x.md]"
         )));
         assert!(out.ends_with("END"));
+        assert!(tokens(&out) <= 1_000);
+    }
+
+    #[test]
+    fn long_requests_keep_both_ends_within_budget() {
+        let text = format!("START{}END", "命".repeat(10_000));
+        let out = excerpt(&text, 1_000, Path::new("r1.txt"));
+        assert!(out.starts_with("START") && out.ends_with("END"));
+        assert!(out.contains("characters omitted; read all of it in r1.txt before deciding"));
         assert!(tokens(&out) <= 1_000);
     }
 

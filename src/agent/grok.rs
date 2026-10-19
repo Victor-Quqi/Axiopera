@@ -241,7 +241,19 @@ async fn pump(
                     Some(c) => format!("{title}: {}", clip(c, 200)),
                     None => clip(title, 200),
                 };
-                let decision = super::ask_approval(&events, summary);
+                let call = &params["toolCall"];
+                let mut detail = format!("{title}\n{}", super::arguments(&call["rawInput"]));
+                for diff in call["content"].as_array().into_iter().flatten() {
+                    if diff["type"] == "diff" {
+                        detail.push_str(&format!(
+                            "\nedit {}:\n--- old\n{}\n+++ new\n{}",
+                            diff["path"].as_str().unwrap_or("?"),
+                            diff["oldText"].as_str().unwrap_or(""),
+                            diff["newText"].as_str().unwrap_or("")
+                        ));
+                    }
+                }
+                let decision = super::ask_approval(&events, summary, detail);
                 let (allow, reject) = (
                     option("allow_once"),
                     option("reject_once").unwrap_or_else(|| "reject-once".into()),

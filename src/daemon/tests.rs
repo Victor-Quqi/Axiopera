@@ -179,6 +179,7 @@ fn progress_tells_the_turn_its_tool_calls_and_what_it_waits_for() {
             task: "test".into(),
             approver: "codex:host".into(),
             summary: "Bash: rm -rf build".into(),
+            delivered: false,
             reply,
         },
     );
@@ -230,4 +231,48 @@ fn durations_read_at_a_glance() {
     assert_eq!(render::duration(45_000), "45s");
     assert_eq!(render::duration(252_000), "4m12s");
     assert_eq!(render::duration(3_900_000), "1h05m");
+}
+
+#[tokio::test]
+async fn agents_approve_only_requests_they_have_read_in_full() {
+    let f = fixture();
+    f.d.update("test", |t| t.tier = ipc::Tier::Work);
+    let request = |summary: &str| {
+        let (reply, decision) = oneshot::channel();
+        f.d.request_approval(
+            "test",
+            agent::Approval {
+                summary: summary.into(),
+                detail: "Bash\ncommand:\nrm -rf build\nrm -rf ~".into(),
+                reply,
+            },
+        );
+        let rid = f.d.lock().approvals.keys().next().unwrap().clone();
+        (rid, decision)
+    };
+    let (rid, decision) = request("Bash: rm -rf build ↵ rm -rf ~");
+    let refused =
+        f.d.resolve(&rid, Some("codex:host"), agent::Decision::Approve)
+            .unwrap_err();
+    assert!(refused.to_string().contains("read"), "{refused}");
+    let mut buf = Vec::new();
+    f.d.inbox("codex:host", &[], &mut Out { w: &mut buf })
+        .await
+        .unwrap();
+    let text = replies(&buf);
+    assert!(
+        text.contains("<request>\nBash\ncommand:\nrm -rf build\nrm -rf ~\n</request>"),
+        "{text}"
+    );
+    f.d.resolve(&rid, Some("codex:host"), agent::Decision::Approve)
+        .unwrap();
+    assert!(matches!(decision.await.unwrap(), agent::Decision::Approve));
+
+    // A person decides without that, and anyone may deny.
+    let (rid, _decision) = request("Bash: ls");
+    f.d.resolve(&rid, Some("user"), agent::Decision::Approve)
+        .unwrap();
+    let (rid, _decision) = request("Bash: ls");
+    f.d.resolve(&rid, Some("codex:host"), agent::Decision::Deny("no".into()))
+        .unwrap();
 }
