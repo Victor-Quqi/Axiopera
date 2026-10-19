@@ -493,7 +493,7 @@ mod tests {
 
     #[test]
     fn plain_axiopera_commands() {
-        assert!(ok("axiopera inbox"));
+        assert!(ok("axiopera answers"));
         assert!(ok(r#"axiopera ask "Which port (8080 or 3000)?""#));
         assert!(ok("axiopera ask 'it''s fine; really'"));
         assert!(ok(r#"  axiopera reply q7k2m "use 8080 & restart""#));
@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn anything_else_needs_approval() {
         assert!(!ok("axiopera-evil ask x"));
-        assert!(!ok("rm -rf / ; axiopera inbox"));
+        assert!(!ok("rm -rf / ; axiopera answers"));
         assert!(!ok(r#"axiopera ask "x"; rm -rf /"#));
         assert!(!ok("axiopera ask x && calc"));
         assert!(!ok("axiopera ask x | calc"));

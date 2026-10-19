@@ -26,7 +26,7 @@ Grok 的 work 档不限制内置文件工具写入项目外。Windows 上 Claude
 | Claude Linux 启用 sandbox | socket 连接被拦截 |
 | Grok Linux 启用 sandbox | 可以连接，派发请求被 daemon 拒绝 |
 
-Codex 子 agent 始终通过 Axiopera 注入的 MCP server 调用 `ask`、`tell`、`inbox`，其进程在 Codex sandbox 外。MCP 配置显式携带任务 ID 和数据目录。其他 shell 调用需要依宿主提示提权重跑。
+Codex 子 agent 始终通过 Axiopera 注入的 MCP server 调用 `ask`、`tell`、`answers`，其进程在 Codex sandbox 外。MCP 配置显式携带任务 ID 和数据目录。其他 shell 调用需要依宿主提示提权重跑。
 
 Codex work 档会为工作目录或 worktree 添加文件系统 ACE，这是原生 Windows sandbox 的行为。`full` 使用 `on-request`，使原生危险操作判断可以发出审批。线程配置将已配置 MCP 服务器的 `default_tools_approval_mode` 设为 `approve`，单个工具显式设置的 prompt 仍生效。
 

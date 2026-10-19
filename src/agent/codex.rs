@@ -164,7 +164,7 @@ impl Codex {
     }
 }
 
-/// ask, tell and inbox as MCP tools. Codex starts MCP servers outside its sandbox, so they reach
+/// ask, tell and answers as MCP tools. Codex starts MCP servers outside its sandbox, so they reach
 /// the daemon where its sandboxed shell cannot (Linux, the elevated Windows sandbox). It passes
 /// MCP servers only a few environment variables; ours get the two they need.
 fn axiopera_mcp(spec: &StartSpec) -> Result<Value> {

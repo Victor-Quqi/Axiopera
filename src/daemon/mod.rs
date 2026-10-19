@@ -494,7 +494,7 @@ impl Daemon {
             }
             Request::Ask { text } => self.ask(&caller, text, out).await,
             Request::Reply { id, text } => self.reply(&caller, &id, text, env.env, out).await,
-            Request::Inbox => self.inbox(&caller, out).await,
+            Request::Answers => self.answers(&caller, out).await,
             Request::Gc { days } => {
                 self.gc(&caller, days, env.env.unwrap_or_default(), out)
                     .await
@@ -890,14 +890,14 @@ impl Daemon {
             })
         });
         self.emit(&task, "question", json!({"id": qid, "text": text}));
-        let inbox = match self.lock().tasks.get(&task).map(|e| e.task.agent) {
-            Some(Agent::Codex) => "the `inbox` tool",
-            _ => "`axiopera inbox`",
+        let answers = match self.lock().tasks.get(&task).map(|e| e.task.agent) {
+            Some(Agent::Codex) => "the `answers` tool",
+            _ => "`axiopera answers`",
         };
         out.text(
             format!(
                 "asked {qid}. Keep working on whatever does not depend on the answer; it will \
-                 arrive as a new message ({inbox} shows it too)."
+                 arrive as a new message ({answers} shows it too)."
             ),
             json!({"id": qid}),
         )
@@ -971,7 +971,7 @@ impl Daemon {
         Ok(ipc::exit::OK)
     }
 
-    async fn inbox<W: AsyncWrite + Unpin>(
+    async fn answers<W: AsyncWrite + Unpin>(
         &self,
         caller: &str,
         out: &mut Out<'_, W>,
@@ -979,7 +979,7 @@ impl Daemon {
         let Some(task) = identity::task_of(caller) else {
             return refuse(
                 ErrorCode::Invalid,
-                "only sub-agents started by axiopera have an inbox",
+                "only sub-agents started by axiopera ask questions",
             );
         };
         let questions = self

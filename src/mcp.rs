@@ -1,4 +1,4 @@
-//! `axiopera mcp`: ask, tell and inbox as MCP tools for a sub-agent. Codex starts MCP servers
+//! `axiopera mcp`: ask, tell and answers as MCP tools for a sub-agent. Codex starts MCP servers
 //! outside its sandbox, while its sandboxed shell cannot reach the daemon on Linux or in the
 //! elevated Windows sandbox.
 //!
@@ -100,7 +100,7 @@ fn tools() -> Value {
             },
         },
         {
-            "name": "inbox",
+            "name": "answers",
             "description": "Your questions to your parent, with the answers so far.",
             "inputSchema": {"type": "object", "properties": {}},
             "annotations": {"readOnlyHint": true},
@@ -123,7 +123,7 @@ async fn call(client: &Client, params: &Value) -> Value {
             to: arg("to"),
             text: arg("message"),
         },
-        "inbox" => Request::Inbox,
+        "answers" => Request::Answers,
         other => return tool_result(format!("no tool named {other}"), true),
     };
     let mut lines = Vec::new();

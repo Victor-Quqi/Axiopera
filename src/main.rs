@@ -117,8 +117,8 @@ enum Command {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
     },
-    /// For sub-agents: your questions and their answers.
-    Inbox,
+    /// For sub-agents: your questions and the answers so far.
+    Answers,
     /// Let a sub-agent do what it asked approval for, this once.
     Approve { id: String },
     /// Refuse a sub-agent's approval request.
@@ -141,7 +141,7 @@ enum Command {
     },
     /// How to use axiopera, for agents.
     Guide,
-    /// Serve ask, tell and inbox as MCP tools; axiopera sets this up for Codex sub-agents.
+    /// Serve ask, tell and answers as MCP tools; axiopera sets this up for Codex sub-agents.
     #[command(hide = true)]
     Mcp {
         /// Serve the Codex plugin's hooks instead.
@@ -313,7 +313,7 @@ async fn run(cli: Cli) -> Result<i32> {
             id,
             text: task_text(answer, file)?,
         },
-        Command::Inbox => Request::Inbox,
+        Command::Answers => Request::Answers,
         Command::Approve { id } => Request::Approve { id },
         Command::Deny { id, reason } => Request::Deny { id, reason },
         Command::Gc { days } => Request::Gc { days },

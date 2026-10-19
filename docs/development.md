@@ -9,7 +9,7 @@
 | `src/daemon/mod.rs`、`task.rs` | 请求处理、任务调度和轮次驱动 |
 | `src/daemon/push.rs`、`render.rs` | 宿主推送和输出格式 |
 | `src/agent/` | 原生 CLI 协议适配 |
-| `src/mcp.rs` | 子 agent 的 ask、tell、inbox 工具，Codex 插件的 hook |
+| `src/mcp.rs` | 子 agent 的 ask、tell、answers 工具，Codex 插件的 hook |
 | `src/plugin.rs` | Codex 插件卸载后的清理 |
 | `plugins/axiopera/`、`.agents/plugins/` | skill、Codex 插件和 marketplace |
 | `src/platform/` | 进程树、IPC 和 sandbox 检测 |

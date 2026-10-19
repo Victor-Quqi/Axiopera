@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 
 /// Bump on any incompatible change to the types below.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// Longest accepted line; task descriptions and environments travel inline.
 const MAX_LINE: usize = 16 << 20;
@@ -99,7 +99,7 @@ pub enum Request {
         id: String,
         text: String,
     },
-    Inbox,
+    Answers,
     Approve {
         id: String,
     },
