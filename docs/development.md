@@ -38,12 +38,12 @@ cargo package --locked --target-dir target/package-verify
 各文档按用途维护，同一事实只在一处陈述，其他位置链接过去：
 
 - `README.md` 与 `README.zh-CN.md`：用户介绍、安装和快速上手，两种语言同步维护。
-- `src/guide.md`：`axiopera guide` 的输出，面向主 agent，只保留完成协作所需的操作说明。修改命令时同步。
+- `src/guide.md`：`axiopera guide` 的输出，面向主 agent，只保留完成协作所需的操作说明。以 `@claude `、`@codex `、`@grok ` 开头的行只属于该宿主。修改命令时同步。
 - `docs/usage.md`：用户配置、任务操作和维护。
 - `docs/backends.md`：权限映射和协议差异。修改适配器前先查，修改后端行为时同步。
 - `docs/verification.md`：已测版本、后端结论的依据和探针用法。新增或修改后端结论时在此登记依据，正文不标注来源。
 - `docs/design.md`：内部状态、持久化和并发机制。修改状态或交付逻辑时同步。
-- `plugins/axiopera/`：skill 只让 agent 去读 `axiopera guide`，说明写在 guide 里。改动 Codex hook 会让用户重新信任；插件在 Codex 中留下的内容有变化时，同步 `src/plugin.rs` 和[使用文档](usage.md#skill-与-codex-插件)。
+- `plugins/axiopera/`：skill 只让 agent 去读 `axiopera guide --host`，说明写在 guide 里。改动 Codex hook 会让用户重新信任；插件在 Codex 中留下的内容有变化时，同步 `src/plugin.rs` 和[使用文档](usage.md#skill-与-codex-插件)。
 
 增删命令或选项前，参考数据目录中 `daemon/requests.jsonl` 记录的实际用法，字段见[存储](design.md#存储)。
 

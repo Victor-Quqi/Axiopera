@@ -52,7 +52,7 @@ daemon 启动时读取配置。修改后运行 `axiopera daemon stop`，下一�
 
 ## Skill 与 Codex 插件
 
-skill 让 agent 在派发任务前先运行 `axiopera guide`，效果与在项目说明中写明这一点相同。skill 就是仓库中的 [`plugins/axiopera/skills/axiopera/`](../plugins/axiopera/skills/axiopera) 目录，复制到 agent 的 skills 目录即可，删除该目录即卸载：
+skill 让 agent 在派发任务前先运行 `axiopera guide --host <宿主>`，效果与在项目说明中写明这一点相同。`--host` 只输出该宿主取结果的方式，不带时输出全部宿主的。skill 就是仓库中的 [`plugins/axiopera/skills/axiopera/`](../plugins/axiopera/skills/axiopera) 目录，复制到 agent 的 skills 目录即可，删除该目录即卸载：
 
 | agent | 位置 |
 |---|---|

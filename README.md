@@ -45,7 +45,7 @@ The [usage guide](docs/usage.md#skill-与-codex-插件) covers the hooks and uni
 
 Or add this to your agent's project instructions instead:
 
-> When delegating tasks through Axiopera, run `axiopera guide` first.
+> When delegating tasks through Axiopera, first run `axiopera guide --host <your harness: claude, codex or grok>`.
 
 Or try a task from your terminal:
 

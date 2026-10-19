@@ -45,7 +45,7 @@ hook 和卸载方法见[使用与配置](docs/usage.md#skill-与-codex-插件)�
 
 也可以不装 skill，在 agent 的项目说明中加入：
 
-> 通过 Axiopera 派发子任务前，先运行 `axiopera guide`。
+> 通过 Axiopera 派发子任务前，先运行 `axiopera guide --host <你的宿主：claude、codex 或 grok>`。
 
 也可以在终端尝试：
 

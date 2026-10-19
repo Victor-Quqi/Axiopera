@@ -151,7 +151,11 @@ enum Command {
         days: u64,
     },
     /// How to use axiopera, for agents.
-    Guide,
+    Guide {
+        /// Only what applies to this host.
+        #[arg(long, value_enum)]
+        host: Option<Agent>,
+    },
     /// Serve ask, tell and answers as MCP tools; axiopera sets this up for Codex sub-agents.
     #[command(hide = true)]
     Mcp {
@@ -247,8 +251,8 @@ async fn run(cli: Cli) -> Result<i32> {
     let home = paths::default_home();
     let mut caller = None;
     let request = match cli.command {
-        Command::Guide => {
-            print!("{}", guide(&client::detect_caller()));
+        Command::Guide { host } => {
+            print!("{}", guide(host, &client::detect_caller()));
             return Ok(0);
         }
         Command::Plugin {
@@ -347,14 +351,42 @@ async fn run(cli: Cli) -> Result<i32> {
     .await
 }
 
-/// The guide, with the watch command filled in for a Grok session or a sub-agent, as their
-/// monitors cannot tell who started them.
-fn guide(caller: &str) -> String {
-    let text = include_str!("guide.md");
-    if caller.starts_with("grok:") || caller.starts_with("task:") {
-        return text.replace("grok:<session>", caller);
+/// The guide for one host, or for all with each one's part labelled; lines in `guide.md`
+/// that start with `@<host> ` apply to that host only. The watch command is filled in for a
+/// Grok session or a sub-agent, as their monitors cannot tell who started them.
+fn guide(host: Option<Agent>, caller: &str) -> String {
+    let mut text = String::new();
+    let mut labelled = None;
+    for line in include_str!("guide.md").lines() {
+        let Some((tag, rest)) = line.strip_prefix('@').and_then(|l| l.split_once(' ')) else {
+            text.push_str(line);
+            text.push('\n');
+            labelled = None;
+            continue;
+        };
+        let (name, label) = match tag {
+            "claude" => (Agent::Claude, "Claude Code"),
+            "codex" => (Agent::Codex, "Codex"),
+            _ => (Agent::Grok, "Grok"),
+        };
+        match host {
+            Some(h) if h == name => text.push_str("  "),
+            Some(_) => continue,
+            None => {
+                if labelled != Some(name) {
+                    text.push_str(&format!("  {label}:\n"));
+                    labelled = Some(name);
+                }
+                text.push_str("    ");
+            }
+        }
+        text.push_str(rest);
+        text.push('\n');
     }
-    text.to_string()
+    if caller.starts_with("grok:") || caller.starts_with("task:") {
+        text = text.replace("grok:<session>", caller);
+    }
+    text
 }
 
 #[cfg(test)]
@@ -457,11 +489,22 @@ mod tests {
     }
 
     #[test]
-    fn the_guide_gives_a_grok_session_its_watch_command() {
-        assert!(guide("grok:s1").contains("`axiopera watch --caller grok:s1`"));
+    fn the_guide_gives_each_host_its_part() {
+        let all = guide(None, "user");
+        assert!(!all.contains('@'));
+        for label in ["  Claude Code:\n    ", "  Codex:\n    ", "  Grok:\n    "] {
+            assert_eq!(all.matches(label).count(), 1, "{label}");
+        }
+        let claude = guide(Some(Agent::Claude), "claude:s0");
+        assert!(claude.contains("\n  Run `axiopera wait` as a background command"));
+        assert!(!claude.contains("Codex:") && !claude.contains("watch --caller"));
+        let grok = guide(Some(Agent::Grok), "grok:s1");
+        assert!(grok.contains("`axiopera watch --caller grok:s1`"));
+        assert!(!grok.contains("background command"));
+        assert!(all.contains("`axiopera watch --caller grok:<session>`"));
         // A Grok sub-agent's spawns are its task's, whatever its session.
-        assert!(guide("task:t1").contains("`axiopera watch --caller task:t1`"));
-        assert!(guide("user").contains("`axiopera watch --caller grok:<session>`"));
+        let sub_agent = guide(Some(Agent::Grok), "task:t1");
+        assert!(sub_agent.contains("`axiopera watch --caller task:t1`"));
     }
 
     #[test]
