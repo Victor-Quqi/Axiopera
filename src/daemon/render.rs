@@ -12,8 +12,9 @@ use crate::store::{Event, Status, Task};
 /// characters of a command's output, 5,000 tokens of ASCII by this count.
 pub const RESPONSE_TOKENS: usize = 4_500;
 
-/// Tokens of an approval request shown whole; longer ones show their ends and point to a file.
-pub const APPROVAL_TOKENS: usize = 3_500;
+/// Tokens of a sub-agent's question, note or approval request shown whole; longer ones show
+/// their ends and point to a file.
+pub const WHOLE_TOKENS: usize = 3_500;
 
 /// Characters of free text in a one-line event.
 const LINE: usize = 200;
@@ -182,30 +183,35 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
 pub fn event_full(e: &Event, agent: Agent) -> String {
     let who = format!("[{} {}]", e.task, agent_name(agent));
     let s = |k: &str| get(e, k).as_str().unwrap_or("").to_string();
+    // Too long to show whole: its ends, and the file that has all of it.
+    let whole = |k: &str, then: &str| {
+        let text = s(k);
+        match get(e, "file").as_str() {
+            Some(file) if tokens(&text) > WHOLE_TOKENS => {
+                excerpt(&text, WHOLE_TOKENS, Path::new(file), then)
+            }
+            _ => text,
+        }
+    };
     match e.kind.as_str() {
         "question" => format!(
             "{who} asks {}:\n{}\nanswer with: axiopera reply {} \"...\"",
             s("id"),
-            tagged("question", &s("text")),
+            tagged("question", &whole("text", " before answering")),
             s("id")
         ),
-        "approval_request" => {
-            let detail = s("detail");
-            let request = match get(e, "file").as_str() {
-                Some(file) if tokens(&detail) > APPROVAL_TOKENS => {
-                    excerpt(&detail, APPROVAL_TOKENS, Path::new(file))
-                }
-                _ => detail,
-            };
-            format!(
-                "{who} needs approval {}:\n{}\ndecide with: axiopera approve {}  |  axiopera deny {} --reason \"...\"",
-                s("id"),
-                tagged("request", &request),
-                s("id"),
-                s("id")
-            )
-        }
-        "message" => format!("{who} told {}:\n{}", s("to"), tagged("note", &s("text"))),
+        "approval_request" => format!(
+            "{who} needs approval {}:\n{}\ndecide with: axiopera approve {}  |  axiopera deny {} --reason \"...\"",
+            s("id"),
+            tagged("request", &whole("detail", " before deciding")),
+            s("id"),
+            s("id")
+        ),
+        "message" => format!(
+            "{who} told {}:\n{}",
+            s("to"),
+            tagged("note", &whole("text", ""))
+        ),
         "failed" => format!("{who} failed: {}", s("error")),
         _ => event_line(e, agent),
     }
@@ -219,12 +225,12 @@ pub fn tagged(tag: &str, text: &str) -> String {
 }
 
 /// The start and end of a text within `max_tokens`, with how much is left out and where the
-/// whole text is.
-pub fn excerpt(text: &str, max_tokens: usize, path: &Path) -> String {
+/// whole text is; `then` ends the advice to read it.
+pub fn excerpt(text: &str, max_tokens: usize, path: &Path, then: &str) -> String {
     let total = text.chars().count();
     let note = |omitted: usize| {
         format!(
-            "\n…[{omitted} of {total} characters omitted; read all of it in {} before deciding]…\n",
+            "\n…[{omitted} of {total} characters omitted; read all of it in {}{then}]…\n",
             path.display()
         )
     };
@@ -350,7 +356,7 @@ mod tests {
     #[test]
     fn long_requests_keep_both_ends_within_budget() {
         let text = format!("START{}END", "命".repeat(10_000));
-        let out = excerpt(&text, 1_000, Path::new("r1.txt"));
+        let out = excerpt(&text, 1_000, Path::new("r1.txt"), " before deciding");
         assert!(out.starts_with("START") && out.ends_with("END"));
         assert!(out.contains("characters omitted; read all of it in r1.txt before deciding"));
         assert!(tokens(&out) <= 1_000);

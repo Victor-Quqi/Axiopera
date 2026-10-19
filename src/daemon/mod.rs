@@ -1046,7 +1046,9 @@ impl Daemon {
                 asked_ms: store::now_ms(),
             })
         });
-        self.emit(&task, "question", json!({"id": qid, "text": text}));
+        let mut data = json!({"id": qid, "text": text});
+        self.keep_whole(&mut data, &task, "questions", &qid, &text);
+        self.emit(&task, "question", data);
         let answers = match self.lock().tasks.get(&task).map(|e| e.task.agent) {
             Some(Agent::Codex) => "the `answers` tool",
             _ => "`axiopera answers`",
@@ -1209,7 +1211,10 @@ impl Daemon {
                 }
             }
         };
-        self.emit(me, "message", json!({"to": to, "text": text}));
+        let mut data = json!({"to": to, "text": text});
+        let name = store::new_id('n', |n| self.store.text_path(me, "notes", n).exists());
+        self.keep_whole(&mut data, me, "notes", &name, &text);
+        self.emit(me, "message", data);
         out.text(
             format!("{to}: {how}; your parent gets a copy"),
             json!({"task": to, "result": how}),
@@ -1396,16 +1401,7 @@ impl Daemon {
         };
         let mut data =
             json!({"id": rid, "summary": summary, "approver": approver, "detail": detail});
-        // Too long to show whole: the approver reads the rest from a file.
-        if render::tokens(&detail) > render::APPROVAL_TOKENS {
-            let file = self.store.approval_path(id, &rid);
-            match std::fs::create_dir_all(file.parent().unwrap())
-                .and_then(|()| std::fs::write(&file, &detail))
-            {
-                Ok(()) => data["file"] = json!(file),
-                Err(e) => self.log(&format!("writing {}: {e:#}", file.display())),
-            }
-        }
+        self.keep_whole(&mut data, id, "approvals", &rid, &detail);
         self.emit(id, "approval_request", data);
         let d = self.clone();
         tokio::spawn(async move {
@@ -1414,6 +1410,20 @@ impl Daemon {
                 "Denied: nobody approved this in time. Continue without it, or explain in your final report why it is needed.".into(),
             ));
         });
+    }
+
+    /// Keep a text too long to show whole in a file, and note the file in the event's `data`.
+    fn keep_whole(&self, data: &mut Value, task: &str, kind: &str, name: &str, text: &str) {
+        if render::tokens(text) <= render::WHOLE_TOKENS {
+            return;
+        }
+        let file = self.store.text_path(task, kind, name);
+        match std::fs::create_dir_all(file.parent().unwrap())
+            .and_then(|()| std::fs::write(&file, text))
+        {
+            Ok(()) => data["file"] = json!(file),
+            Err(e) => self.log(&format!("writing {}: {e:#}", file.display())),
+        }
     }
 
     /// Answer an approval request. `by` is the deciding caller, or None for the timeout.

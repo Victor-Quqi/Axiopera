@@ -159,6 +159,28 @@ fn a_reply_takes_whole_events_and_leaves_the_rest() {
 }
 
 #[tokio::test]
+async fn long_questions_show_their_ends_and_where_the_rest_is() {
+    let f = fixture();
+    let long = format!("START{}END", "q".repeat(render::WHOLE_TOKENS * 8));
+    f.d.ask("task:test", long.clone(), &mut Out::new(&mut Vec::new()))
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    f.d.inbox("codex:host", &[], &mut Out::new(&mut buf))
+        .await
+        .unwrap();
+    let text = replies(&buf);
+    assert!(text.contains("<question>\nSTART") && text.contains("END\n</question>"));
+    assert!(render::tokens(&text) <= render::RESPONSE_TOKENS);
+    let file = text
+        .split("read all of it in ")
+        .nth(1)
+        .and_then(|rest| rest.split(" before answering").next())
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(file).unwrap(), long);
+}
+
+#[tokio::test]
 async fn approvals_go_ahead_of_earlier_news_and_reach_the_approver_once() {
     let f = fixture();
     f.d.update("test", |t| t.tier = ipc::Tier::Work);

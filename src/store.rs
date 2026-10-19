@@ -181,10 +181,10 @@ impl Store {
         self.dir(id).join("turns").join(format!("{turn}.md"))
     }
 
-    pub fn approval_path(&self, id: &str, request: &str) -> PathBuf {
-        self.dir(id)
-            .join("approvals")
-            .join(format!("{request}.txt"))
+    /// Where a task's text too long to show whole is kept: an approval request, a question or
+    /// a note, under `approvals`, `questions` or `notes`.
+    pub fn text_path(&self, id: &str, kind: &str, name: &str) -> PathBuf {
+        self.dir(id).join(kind).join(format!("{name}.txt"))
     }
 
     pub fn save_turn(&self, id: &str, turn: u32, text: &str) -> Result<PathBuf> {
