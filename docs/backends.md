@@ -30,6 +30,15 @@ Codex 子 agent 始终通过 Axiopera 注入的 MCP server 调用 `ask`、`tell`
 
 Codex work 档会为工作目录或 worktree 添加文件系统 ACE，这是原生 Windows sandbox 的行为。`full` 使用 `on-request`，使原生危险操作判断可以发出审批。线程配置将已配置 MCP 服务器的 `default_tools_approval_mode` 设为 `approve`，单个工具显式设置的 prompt 仍生效。
 
+work 档需要判定的操作交给各后端自己的自动判定，判定请求经会话所用的 API 发出。以下表现来自源码、文档和二进制字符串，未用第三方 API 实测：
+
+- Codex 的 auto_review 使用固定的审查模型：以 API key 登录时为 `gpt-5.6-luna`，否则为 `codex-auto-review`。会话模型的目录条目设置了 `auto_review_model_override` 时用它；provider 的模型目录中没有首选模型时才改用会话模型。自定义 provider 未配置模型目录时使用 Codex 内置目录，其中包含这两个模型。接口不提供审查模型时审查失败，操作被拒，不转为审批。可以让中转映射该模型名，或在 `model_catalog_json` 中为会话模型设置指向自身的 `auto_review_model_override`；顶层 `review_model` 不影响审查。
+- Windows 上未配置 Codex 的 Windows sandbox 时，Codex 把 `workspace-write` 降为 `read-only` 且不报错，没有命中规则的命令都要经过审查。
+- Claude 的分类器默认使用 Sonnet 5，首次请求失败后改用会话模型；失败为 HTTP 401 时不改用，需要审查的操作全部被拒，不转为询问。会话模型不支持 auto 时，会话以 `default` 启动，非只读操作都经 `can_use_tool` 转来审批。
+- Grok 的分类器使用会话模型和端点。请求失败或超时时转为审批；返回内容无法解析时拒绝。
+
+Codex 的审查失败和 sandbox 降级由适配器识别，在下一条轮末结果上提示主 agent，每个进程各提示一次。
+
 ## 审批
 
 read 档按上述只读规则裁决，其他需要批准的请求直接拒绝。work 和 full 档转发以下请求，路由和超时见[内部设计](design.md#审批路由)。

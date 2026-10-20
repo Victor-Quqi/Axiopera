@@ -40,6 +40,8 @@ pub enum AgentEvent {
     InputRead(u64),
     /// The agent started a turn by itself, e.g. when background work ended.
     TurnStarted,
+    /// A problem in the agent's own setup that its parent should hear of.
+    Notice(String),
     TurnEnded {
         ok: bool,
         result: String,

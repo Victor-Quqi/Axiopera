@@ -109,6 +109,8 @@ struct Entry {
     /// Events for `inbox`, in order.
     deliverable: Vec<Event>,
     blocked: usize,
+    /// Notices from the adapter, for the end of the turn.
+    notices: Vec<String>,
     /// The running turn so far, for progress reports: when it started, how many tools it
     /// called, and the last call with its time.
     in_turn: bool,
@@ -239,6 +241,7 @@ impl Daemon {
                 .collect();
             let entry = Entry {
                 blocked: 0,
+                notices: Vec::new(),
                 in_turn: false,
                 turn_started_ms: 0,
                 tool_calls: 0,
@@ -332,6 +335,10 @@ impl Daemon {
             entry.task.updated_ms = event.ts;
             match kind {
                 "blocked" => entry.blocked += 1,
+                "notice" => {
+                    let text = event.data.get("text").and_then(Value::as_str);
+                    entry.notices.extend(text.map(str::to_string));
+                }
                 "turn_started" => {
                     entry.in_turn = true;
                     entry.turn_started_ms = event.ts;
@@ -818,6 +825,7 @@ impl Daemon {
             let mut st = self.lock();
             let entry = Entry {
                 blocked: 0,
+                notices: Vec::new(),
                 in_turn: false,
                 turn_started_ms: 0,
                 tool_calls: 0,

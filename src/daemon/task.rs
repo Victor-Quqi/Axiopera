@@ -267,6 +267,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                         }
                     }
                     AgentEvent::Blocked(detail) => d.emit(id, "blocked", json!({"detail": detail})),
+                    AgentEvent::Notice(text) => d.emit(id, "notice", json!({"text": text})),
                     AgentEvent::TurnStarted => {
                         // Unless it is the turn we have just started.
                         let turn = d
@@ -429,13 +430,16 @@ fn end_turn(
         let open: Vec<String> = e.task.open_questions().map(|q| q.id.clone()).collect();
         (e.task.changed_files.len(), open)
     });
-    let blocked = {
+    let (blocked, notices) = {
         let mut st = d.lock();
-        st.tasks
-            .get_mut(id)
-            .map_or(0, |e| std::mem::take(&mut e.blocked))
+        st.tasks.get_mut(id).map_or((0, Vec::new()), |e| {
+            (
+                std::mem::take(&mut e.blocked),
+                std::mem::take(&mut e.notices),
+            )
+        })
     };
-    d.emit(id, "turn_ended", json!({"unread": unread, "unconfirmed": unconfirmed, "blocked": blocked, "turn": turn, "ok": ok, "error": error, "usage": usage, "chars": result.len(), "files": files, "open_questions": open}));
+    d.emit(id, "turn_ended", json!({"unread": unread, "unconfirmed": unconfirmed, "blocked": blocked, "notices": notices, "turn": turn, "ok": ok, "error": error, "usage": usage, "chars": result.len(), "files": files, "open_questions": open}));
     Ok(())
 }
 
@@ -589,6 +593,7 @@ mod tests {
     fn turn_end_reports_late_input_and_resets_refusals() {
         let f = fixture();
         f.d.emit("test", "blocked", json!({"detail": "denied"}));
+        f.d.emit("test", "notice", json!({"text": "the sandbox is off"}));
         end_turn(
             &f.d,
             "test",
@@ -608,5 +613,8 @@ mod tests {
         let line = super::super::render::event_line(&events[0], Agent::Codex);
         assert!(line.contains("this result predates 2 parent message(s)"));
         assert!(line.contains("axiopera log test"));
+        assert!(line.ends_with("; the sandbox is off"), "{line}");
+        let next = super::super::render::event_line(&events[1], Agent::Codex);
+        assert!(!next.contains("sandbox"), "{next}");
     }
 }

@@ -119,6 +119,7 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
         "tool" => format!("{who} {}: {}", s("name"), s("detail")),
         "file_changed" => format!("{who} changed {}", s("path")),
         "blocked" => format!("{who} blocked: {}", s("detail")),
+        "notice" => format!("{who} notice: {}", s("text")),
         "question" => format!("{who} asks {}: {}", s("id"), clip(&s("text"), LINE)),
         "answered" => format!("{who} question {} answered", s("id")),
         "approval_request" => format!("{who} needs approval {}: {}", s("id"), s("summary")),
@@ -150,6 +151,9 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
                     n("blocked"),
                     e.task
                 ));
+            }
+            for notice in get(e, "notices").as_array().into_iter().flatten() {
+                line.push_str(&format!("; {}", notice.as_str().unwrap_or("")));
             }
             let open: Vec<&str> = get(e, "open_questions")
                 .as_array()

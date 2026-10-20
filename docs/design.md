@@ -96,7 +96,7 @@ daemon 用调用方经 IPC 传来的环境启动子 agent。环境只留在内�
 
 | 事件 | 内容 |
 |---|---|
-| turn_ended | 本轮状态、结果、未处理输入或确认缺口、拒绝次数和未回答的问题 |
+| turn_ended | 本轮状态、结果、未处理输入或确认缺口、拒绝次数、适配器的提示和未回答的问题 |
 | question | 子 agent 的提问 |
 | approval_request | 只交给审批方的请求 |
 | stalled、failed、cancelled、interrupted、detached | 状态变化 |
@@ -104,7 +104,7 @@ daemon 用调用方经 IPC 传来的环境启动子 agent。环境只留在内�
 
 其中兄弟留言抄送、交接通知和调用方自己发起的取消不算新消息：不让 `wait` 返回，不触发推送和提醒，随下一次 `inbox` 一起交出。超时或其他调用方的取消仍算新消息。
 
-spawned、turn_started、steered、input_read、tool、file_changed、answered、approved、denied、blocked 只写事件日志。`blocked` 在轮末汇总次数，避免每次拒绝都提醒主 agent。改动文件从工具事件提取，共享目录下的 Git diff 无法归属到某个任务。
+spawned、turn_started、steered、input_read、tool、file_changed、answered、approved、denied、blocked、notice 只写事件日志。`blocked` 在轮末汇总次数，避免每次拒绝都提醒主 agent。`notice` 是适配器发现的后端设置问题，原文附在下一条轮末结果上。改动文件从工具事件提取，共享目录下的 Git diff 无法归属到某个任务。
 
 `wait` 只等不取，`inbox` 只取不等。游标按调用方和任务保存，只有 `inbox` 和推送推进游标；指定任务时不会消费其他任务的事件。结果正文的交付标记独立于游标，正文实际写给客户端后才标记。再次取正文的规则见[使用文档](usage.md#结果与接管)。
 

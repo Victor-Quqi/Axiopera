@@ -24,6 +24,8 @@ struct State {
     recorded: Vec<u64>,
     /// Changes of file edits not finished yet, by item ID, for their approval requests.
     patches: HashMap<String, Value>,
+    /// The auto_review reviewer could not review; said once.
+    review_failed: bool,
 }
 
 pub struct Codex {
@@ -99,6 +101,9 @@ impl Codex {
             id: thread.clone(),
             file,
         });
+        if let Some(notice) = sandbox_notice(spec.tier, &reply) {
+            let _ = events.send(AgentEvent::Notice(notice));
+        }
         Ok(Codex {
             proc,
             rpc,
@@ -164,6 +169,17 @@ impl Codex {
     pub fn busy(&self) -> bool {
         self.state.lock().unwrap().turn.is_some()
     }
+}
+
+/// Without its Windows sandbox, Codex runs workspace-write as read-only and asks about every
+/// command, without saying so.
+fn sandbox_notice(tier: Tier, reply: &Value) -> Option<String> {
+    let downgraded = tier == Tier::Work && reply["sandbox"]["type"] == "readOnly";
+    (cfg!(windows) && downgraded).then(|| {
+        "Codex runs read-only because its Windows sandbox is not set up, so every command \
+         needs its automatic review"
+            .to_string()
+    })
 }
 
 /// ask, tell and answers as MCP tools. Codex starts MCP servers outside its sandbox, so they reach
@@ -344,6 +360,15 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                     "auto review {status}: {}",
                     clip(rationale, 300)
                 )));
+                // Reported as denied, but the reviewer never judged the action.
+                if let Some(error) = rationale.strip_prefix("Automatic approval review failed: ")
+                    && !std::mem::replace(&mut state.lock().unwrap().review_failed, true)
+                {
+                    let _ = events.send(AgentEvent::Notice(format!(
+                        "Codex's automatic review fails, so it refuses whatever needs approval: {}",
+                        clip(error, 1_000)
+                    )));
+                }
             }
         }
         "turn/completed" => {
@@ -495,6 +520,44 @@ mod tests {
             state,
             events,
         );
+    }
+
+    #[test]
+    fn a_failed_review_is_told_once_apart_from_refusals() {
+        let state = Mutex::new(State::default());
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let review = |rationale: &str| {
+            on_notification(
+                "item/autoApprovalReview/completed",
+                &json!({"review": {"status": "denied", "rationale": rationale}}),
+                &state,
+                &events,
+            );
+        };
+        review("Network access to an unknown host is risky.");
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Blocked(_))));
+        assert!(rx.try_recv().is_err());
+        for _ in 0..2 {
+            review("Automatic approval review failed: model gpt-5.6-luna does not exist");
+        }
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Blocked(_))));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AgentEvent::Notice(n)) if n.ends_with("needs approval: model gpt-5.6-luna does not exist")
+        ));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Blocked(_))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_work_thread_without_the_windows_sandbox_is_told() {
+        let reply = |sandbox: &str| json!({"sandbox": {"type": sandbox}});
+        assert_eq!(
+            sandbox_notice(Tier::Work, &reply("readOnly")).is_some(),
+            cfg!(windows)
+        );
+        assert!(sandbox_notice(Tier::Work, &reply("workspaceWrite")).is_none());
+        assert!(sandbox_notice(Tier::Read, &reply("readOnly")).is_none());
     }
 
     #[test]
