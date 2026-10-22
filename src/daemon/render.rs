@@ -326,9 +326,6 @@ pub fn status_line(t: &Task, live: bool) -> String {
     if let Some(name) = &t.name {
         line.push_str(&format!("  name {name}"));
     }
-    if let Some(w) = &t.worktree {
-        line.push_str(&format!("  worktree {}", w.branch));
-    }
     if t.stalled {
         line.push_str("  STALLED");
     }

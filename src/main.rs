@@ -9,7 +9,6 @@ mod paths;
 mod platform;
 mod plugin;
 mod store;
-mod worktree;
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -60,9 +59,6 @@ enum Command {
         /// Cancel the task after this long, e.g. 30m.
         #[arg(long, value_parser = parse_duration)]
         timeout: Option<Duration>,
-        /// Work in a new git worktree on branch axiopera/<name or ID>, from your HEAD.
-        #[arg(long)]
-        worktree: bool,
     },
     /// Message a task: steers its running turn, or starts a new turn in the same session.
     Send {
@@ -144,11 +140,10 @@ enum Command {
     Tell { to: String, message: Vec<String> },
     /// Hand a task over to you: axiopera stops driving it and prints the native resume command.
     Detach { task: String },
-    /// Remove finished tasks untouched for a while, and their worktrees if nothing in them is
-    /// uncommitted; trim the request log to the same age.
+    /// Remove stopped tasks and the request log now; the daemon does it by itself after 30 days.
     Gc {
-        /// Untouched for at least this many days.
-        #[arg(long, default_value_t = 7)]
+        /// Keep what was active within this many days.
+        #[arg(long, default_value_t = 0)]
         days: u64,
     },
     /// How to use axiopera, for agents.
@@ -288,7 +283,6 @@ async fn run(cli: Cli) -> Result<i32> {
             cwd,
             name,
             timeout,
-            worktree,
         } => {
             let cwd = match cwd {
                 Some(c) => std::path::absolute(c)?,
@@ -303,7 +297,6 @@ async fn run(cli: Cli) -> Result<i32> {
                 model,
                 effort,
                 timeout_secs: timeout.map(|d| d.as_secs()),
-                worktree,
             })
         }
         Command::Send {

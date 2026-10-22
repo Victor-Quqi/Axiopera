@@ -4,7 +4,7 @@
 
 ## 任务与工作目录
 
-默认情况下，子 agent 使用调用方的工作目录。`spawn --worktree` 从当前仓库的 HEAD 创建分支 `axiopera/<别名或任务 ID>`，并在 Axiopera 的数据目录下检出。当前工作区未提交的改动不会带入。调用方在仓库子目录时，子 agent 使用新 worktree 中对应的子目录。
+子 agent 在调用方的工作目录中运行，可用 `--cwd` 另行指定。Axiopera 不为任务建立独立的工作副本：同时修改同一仓库的任务，由主 agent 各建一个 Git worktree，再用 `--cwd` 指定。
 
 主 agent 负责检查子 agent 的改动、提交和合并分支。子 agent 的权限由 `--tier` 指定，默认 `work`。各档位在不同 backend 上的具体行为见[权限](backends.md#权限)。
 
@@ -84,6 +84,6 @@ CLI 按需启动 daemon。没有运行中的 agent 和客户端连接时，daemo
 
 `axiopera daemon status` 查看 daemon，`daemon stop` 在没有运行任务时停止它。`daemon stop --force` 会中断正在运行的任务，之后可用 `send` 续接。升级二进制前先停止 daemon。
 
-`axiopera gc --days 7` 清理至少 7 天未活动且已停止的任务，并删除请求日志 `daemon/requests.jsonl` 中更早的行。存在未提交改动的 worktree 会连同任务保留，分支仅在已合并时删除。仍有子任务的父任务也会保留。
+Axiopera 自动删除 30 天未活动且已停止的任务，以及请求日志 `daemon/requests.jsonl` 和 daemon 日志 `daemon/daemon.log` 中 30 天前的行。`axiopera gc` 立即删除所有已停止的任务和请求日志，`--days N` 保留最近 N 天有活动的。运行中或排队中的任务，以及仍有子任务的父任务，都不会被删除；收到兄弟任务的留言也算一次活动。任务删除后不能再对它 `send`、`result` 或 `log`。
 
-卸载前先处理需要保留的 worktree 改动，运行 `gc --days 0` 清理可删除的任务，再停止 daemon。通过 Cargo 安装的执行 `cargo uninstall axiopera`；通过 Release 压缩包安装的删除可执行文件。数据目录按需删除，原生 agent 的会话仍由各自 CLI 管理。
+卸载前先停止 daemon。通过 Cargo 安装的执行 `cargo uninstall axiopera`；通过 Release 压缩包安装的删除可执行文件。数据目录按需删除，原生 agent 的会话仍由各自 CLI 管理。

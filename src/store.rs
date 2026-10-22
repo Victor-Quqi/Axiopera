@@ -85,8 +85,6 @@ pub struct Task {
     pub changed_files: Vec<String>,
     #[serde(default)]
     pub questions: Vec<Question>,
-    #[serde(default)]
-    pub worktree: Option<crate::worktree::Worktree>,
     pub stalled: bool,
     pub detached: bool,
     pub created_ms: u64,
@@ -228,6 +226,10 @@ pub struct Ledger {
     /// Reminders queued for hosts that have not run `wait` since, by queued message ID.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub doorbells: std::collections::HashMap<String, String>,
+    /// The last event sequence number given out, as of the last gc, which may have removed the
+    /// events it was recovered from.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 /// A batch written without an acknowledged reply, recoverable after a daemon restart.

@@ -13,7 +13,7 @@
 | `src/plugin.rs` | Codex 插件卸载后的清理 |
 | `plugins/axiopera/`、`.agents/plugins/` | skill、Codex 插件和 marketplace |
 | `src/platform/` | 进程树、IPC 和 sandbox 检测 |
-| `src/store.rs`、`worktree.rs` | 任务存储和 Git worktree |
+| `src/store.rs` | 任务存储 |
 | `src/config.rs`、`paths.rs`、`identity.rs` | 配置、路径和调用方身份 |
 
 ## 构建与检查

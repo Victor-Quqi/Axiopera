@@ -47,16 +47,15 @@
     turns/<n>.md
     approvals/<请求 ID>.txt、questions/<提问 ID>.txt、notes/<编号>.txt
   ledger.json
-  worktrees/<repo>-<hash>/<id>/
 ```
 
-`task.json` 记录状态、仓库根目录、原生会话和 worktree 信息，写临时文件后原子替换。`events.jsonl` 只追加。`ledger.json` 保存游标、结果交付标记、Codex 推送目标、待确认批次和已排入的门铃。事件序号在整个 daemon 内单调递增，重启后继续。
+`task.json` 记录状态、工作目录和原生会话，写临时文件后原子替换。`events.jsonl` 只追加。`ledger.json` 保存游标、结果交付标记、Codex 推送目标、待确认批次和已排入的门铃。事件序号在整个 daemon 内单调递增，重启后继续；清理前先把当前序号记入 ledger，任务全被删除后也不会回退。
 
 提问和答案随任务保存。审批应答通道、尚未送出的兄弟留言和消息消费跟踪 ID 只保存在内存中。
 
 `requests.jsonl` 每个请求记一行：时间、调用方类别（宿主、子 agent 或 `user`）、命令、给出的参数名、退出码、错误类别和输出的字节数，不记参数值和输出内容。客户端先断开时退出码为空。hook 的 `pending` 请求、`daemon status` 和 `daemon stop` 不记录。
 
-清理任务时，在同一把状态锁内检查和删除，防止与续接并发。先处理子任务，再处理父任务。清理条件见[使用文档](usage.md#daemon-与清理)。
+daemon 启动时和连续运行期间每 24 小时自动清理一次。清理任务时，在同一把状态锁内检查和删除，防止与续接并发。先处理子任务，再处理父任务。`daemon.log` 只在启动时、打开文件之前裁剪，运行期间文件一直打开。清理条件见[使用文档](usage.md#daemon-与清理)。
 
 ## daemon 生命周期
 

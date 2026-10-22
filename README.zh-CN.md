@@ -10,7 +10,7 @@
 
 - 在任务运行中追加要求。
 - 让 agent 提问、互相留言。
-- 为每个任务选择模型和权限，也可以使用独立的工作目录。
+- 为每个任务选择模型和权限。
 - 需要亲自接手时，通过原来的 agent CLI 继续会话。
 
 每个 agent 从你提供的任务描述开始工作，请在描述中交代所需上下文。
@@ -28,7 +28,7 @@ cargo install axiopera --locked
 axiopera --version
 ```
 
-独立工作目录功能需要 Git。Windows 和 Linux 已有实测，macOS 待验证，详见[已测版本](docs/verification.md#已测版本)。
+Windows 和 Linux 已有实测，macOS 待验证，详见[已测版本](docs/verification.md#已测版本)。
 
 ## 开始使用
 

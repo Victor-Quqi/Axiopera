@@ -367,6 +367,9 @@ impl Daemon {
                 anyhow::bail!("the session is closed");
             }
             let taken = self.batch(&approvals, &events);
+            if !self.worth_pushing(caller, &taken) {
+                return Ok(("nothing left to send".to_string(), false));
+            }
             let texts: Vec<&str> = taken.items.iter().map(|(_, t)| t.as_str()).collect();
             let marker = format!(
                 "[axiopera:{}]",
@@ -409,6 +412,13 @@ impl Daemon {
             self.clear_pending_push(caller);
         }
         outcome
+    }
+
+    /// Whether to send `taken`: not if gc removed the tasks all news was about while it was
+    /// being put together. What is left then, such as copies of sibling notes, waits for the
+    /// next push or inbox. A batch filled with such copies goes out while news follows it.
+    fn worth_pushing(&self, caller: &str, taken: &super::Batch) -> bool {
+        !taken.items.is_empty() && !self.news(&self.lock(), caller, &[]).is_empty()
     }
 
     /// Queue a reminder for the host's next turn, unless the last one is still queued.
@@ -484,6 +494,30 @@ mod tests {
     use super::*;
     use crate::daemon::{Out, render};
     use crate::store::Event;
+
+    #[test]
+    fn a_push_goes_out_while_news_follows_notes_and_not_once_gc_took_the_news() {
+        let f = fixture();
+        let note = "n".repeat(render::RESPONSE_TOKENS * 3);
+        f.d.emit(
+            "test",
+            "message",
+            serde_json::json!({"to": "sibling", "text": note}),
+        );
+        let result = "r".repeat(render::RESPONSE_TOKENS * 2);
+        f.d.store.save_turn("test", 1, &result).unwrap();
+        f.d.emit(
+            "test",
+            "turn_ended",
+            serde_json::json!({"turn": 1, "ok": true}),
+        );
+        let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
+        let taken = f.d.batch(&[], &events);
+        assert_eq!(taken.items.len(), 1, "the note fills the first push");
+        assert!(f.d.worth_pushing("codex:host", &taken));
+        f.d.collect(u64::MAX).unwrap();
+        assert!(!f.d.worth_pushing("codex:host", &taken));
+    }
 
     #[test]
     fn only_actionable_events_start_a_host_turn() {

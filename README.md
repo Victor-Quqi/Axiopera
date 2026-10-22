@@ -10,7 +10,7 @@ Ask Codex to review Claude's changes, split a task across models, or leave a lon
 
 - Send new instructions while a task is running.
 - Let agents ask questions and exchange notes.
-- Give each task its own model and permissions, with an optional separate working copy.
+- Give each task its own model and permissions.
 - Continue a task in its original agent CLI when you want to take over.
 
 Each agent starts with the task description you provide. Include the context it needs.
@@ -28,7 +28,7 @@ cargo install axiopera --locked
 axiopera --version
 ```
 
-Git is required for separate working copies. Windows and Linux have been tested; macOS still needs validation. See the [tested versions](docs/verification.md#已测版本).
+Windows and Linux have been tested; macOS still needs validation. See the [tested versions](docs/verification.md#已测版本).
 
 ## Get started
 

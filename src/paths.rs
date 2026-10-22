@@ -13,7 +13,7 @@ pub fn default_home() -> PathBuf {
     PathBuf::from(home).join(".axiopera")
 }
 
-/// FNV-1a: a short name that stays the same across versions (pipe names, worktree folders).
+/// FNV-1a: a short name that stays the same across versions (pipe names).
 pub fn fnv1a(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |h, b| {
         (h ^ *b as u64).wrapping_mul(0x100000001b3)

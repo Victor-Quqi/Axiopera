@@ -55,8 +55,6 @@ pub struct Spawn {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub worktree: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -136,12 +134,11 @@ impl Request {
         )
     }
 
-    /// Requests that may start an agent process or run git, and so carry the caller's
-    /// environment.
+    /// Requests that may start an agent process, and so carry the caller's environment.
     pub fn needs_env(&self) -> bool {
         matches!(
             self,
-            Request::Spawn(_) | Request::Send { .. } | Request::Reply { .. } | Request::Gc { .. }
+            Request::Spawn(_) | Request::Send { .. } | Request::Reply { .. }
         )
     }
 }

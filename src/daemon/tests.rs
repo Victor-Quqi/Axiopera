@@ -12,25 +12,38 @@ impl Drop for Fixture {
 }
 
 pub(super) fn fixture() -> Fixture {
-    let home = std::env::temp_dir().join(format!("axiopera-test-{}", uuid::Uuid::new_v4()));
-    let task: Task = serde_json::from_value(json!({
-        "id": "test", "parent": "codex:host", "agent": "codex", "tier": "read",
-        "cwd": ".", "status": "idle", "turns": 0, "delivered": 0,
-        "changed_files": [], "stalled": false, "detached": false,
-        "created_ms": 0, "updated_ms": 0,
-    }))
-    .unwrap();
-    Store::new(&home).save(&task).unwrap();
-    let opts = Options {
-        home: home.clone(),
+    fixture_with(&[])
+}
+
+fn options(home: &Path) -> Options {
+    Options {
+        home: home.to_path_buf(),
         idle: Duration::from_secs(10),
         concurrency: 0,
         stall: Duration::from_secs(60),
         approval_timeout: Duration::from_secs(60),
         agents: config::Agents::default(),
-    };
+    }
+}
+
+/// The task "test", and more tasks given as changes to its fields.
+pub(super) fn fixture_with(more: &[Value]) -> Fixture {
+    let home = std::env::temp_dir().join(format!("axiopera-test-{}", uuid::Uuid::new_v4()));
+    let base = json!({
+        "id": "test", "parent": "codex:host", "agent": "codex", "tier": "read",
+        "cwd": ".", "status": "idle", "turns": 0, "delivered": 0,
+        "changed_files": [], "stalled": false, "detached": false,
+        "created_ms": 0, "updated_ms": 0,
+    });
+    for changes in std::iter::once(&json!({})).chain(more) {
+        let mut fields = base.clone();
+        let fields_map = fields.as_object_mut().unwrap();
+        fields_map.extend(changes.as_object().unwrap().clone());
+        let task: Task = serde_json::from_value(fields).unwrap();
+        Store::new(&home).save(&task).unwrap();
+    }
     Fixture {
-        d: Arc::new(Daemon::load(opts, None)),
+        d: Arc::new(Daemon::load(options(&home), None)),
         home,
     }
 }
@@ -526,4 +539,109 @@ fn the_request_log_keeps_argument_names_and_ages_out_with_gc() {
     assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 1);
     f.d.trim_requests(u64::MAX).unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+}
+
+#[test]
+fn gc_takes_children_before_parents_and_leaves_running_and_recent_tasks() {
+    let now = store::now_ms();
+    let f = fixture_with(&[
+        json!({"id": "kid", "parent": "task:test"}),
+        json!({"id": "busy"}),
+        json!({"id": "mom"}),
+        json!({"id": "baby", "parent": "task:mom", "updated_ms": now}),
+    ]);
+    // Loading turns a running task into an interrupted one, so it starts running here.
+    f.d.lock().tasks.get_mut("busy").unwrap().task.status = Status::Running;
+    let left = |d: &Daemon| {
+        let mut ids: Vec<String> = d.lock().tasks.keys().cloned().collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(f.d.collect(1_000).unwrap(), 2);
+    assert_eq!(left(&f.d), ["baby", "busy", "mom"]);
+    assert!(!f.home.join("tasks").join("kid").exists());
+    assert_eq!(f.d.collect(u64::MAX).unwrap(), 2);
+    assert_eq!(left(&f.d), ["busy"]);
+}
+
+#[tokio::test]
+async fn a_note_kept_for_a_stopped_task_gives_it_time_before_gc() {
+    let f = fixture_with(&[json!({"id": "sib"})]);
+    f.d.tell(
+        "task:sib",
+        "test",
+        "the API moved".into(),
+        &mut Out::new(&mut Vec::new()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.d.lock().tasks["test"].mail.len(), 1);
+    f.d.collect(1_000).unwrap();
+    assert!(f.d.lock().tasks.contains_key("test"));
+}
+
+#[test]
+fn sequence_numbers_go_on_after_gc_removed_every_task() {
+    let f = fixture();
+    f.d.emit("test", "turn_ended", json!({"turn": 1}));
+    let before = f.d.lock().seq;
+    assert_eq!(f.d.collect(u64::MAX).unwrap(), 1);
+    let again = Daemon::load(options(&f.home), None);
+    assert_eq!(again.lock().seq, before);
+}
+
+#[test]
+fn a_reply_passes_over_news_of_a_task_gc_removed_meanwhile() {
+    let f = fixture();
+    let event = |task: &str, seq: u64| -> Event {
+        serde_json::from_value(json!({
+            "seq": seq, "ts": 0, "task": task, "kind": "failed", "error": "boom",
+        }))
+        .unwrap()
+    };
+    let b = f.d.batch(&[], &[event("gone", 1), event("test", 2)]);
+    assert_eq!(b.seen.len(), 2);
+    assert_eq!(b.items.len(), 1);
+    assert_eq!(b.items[0].0.task, "test");
+    f.d.mark_seen("codex:host", &b.seen, &[], &[]).unwrap();
+    assert!(
+        !f.d.lock()
+            .ledger
+            .cursors
+            .keys()
+            .any(|k| k.ends_with("|gone"))
+    );
+}
+
+#[test]
+fn task_files_from_before_worktrees_went_still_load() {
+    let task: Task = serde_json::from_value(json!({
+        "id": "old", "parent": "user", "agent": "claude", "tier": "work",
+        "cwd": ".", "status": "idle", "turns": 1, "delivered": 1,
+        "changed_files": [], "worktree": null, "stalled": false, "detached": false,
+        "created_ms": 0, "updated_ms": 0,
+    }))
+    .unwrap();
+    assert_eq!(task.id, "old");
+}
+
+#[test]
+fn the_daemon_log_drops_entries_before_the_cutoff_with_their_extra_lines() {
+    let dir = std::env::temp_dir().join(format!("axiopera-test-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("daemon.log");
+    assert!(super::trim_log(&path, 2_000).is_ok());
+    std::fs::write(
+        &path,
+        "1000 old\nmore of old\n2000 kept\nmore of kept\n3000 new\n",
+    )
+    .unwrap();
+    super::trim_log(&path, 1_500).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "2000 kept\nmore of kept\n3000 new\n"
+    );
+    super::trim_log(&path, 9_000).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+    std::fs::remove_dir_all(&dir).unwrap();
 }

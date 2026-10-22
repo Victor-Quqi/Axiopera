@@ -9,8 +9,7 @@ Dispatch
   axiopera spawn claude --tier read --name review -f task.md
   Tiers: read (look, don't change; MCP: read-only tools only, none on Grok),
          work (default: the agent's own auto mode), full (the agent's full-access mode).
-  Options: --model, --effort, --name (use it instead of the ID), --cwd, --timeout 30m,
-  --worktree (an isolated git worktree).
+  Options: --model, --effort, --name (use it instead of the ID), --cwd, --timeout 30m.
 
 Get results
   axiopera inbox           takes what your sub-tasks have for you: results, questions, approval

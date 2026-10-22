@@ -26,7 +26,6 @@ use crate::ipc::{self, Agent, Envelope, ErrorCode, Reply, Request};
 use crate::paths;
 use crate::platform;
 use crate::store::{self, Event, Ledger, Status, Store, Task};
-use crate::worktree;
 use push::Reach;
 
 pub use task::Cmd;
@@ -40,6 +39,11 @@ const WATCH_GAP: Duration = Duration::from_secs(2);
 /// The monitor running it would otherwise keep the sub-agent busy, so its process is never
 /// released. Long enough for the spawn that usually follows starting the watch.
 const WATCH_IDLE: Duration = Duration::from_secs(60);
+const DAY_MS: u64 = 86_400_000;
+/// Stopped tasks untouched this many days, and older log lines, go without being asked.
+const AUTO_GC_DAYS: u64 = 30;
+/// A daemon that keeps running does that again this often.
+const AUTO_GC_EVERY: Duration = Duration::from_secs(86_400);
 
 pub struct Options {
     pub home: PathBuf,
@@ -178,10 +182,16 @@ pub async fn run(opts: Options) -> Result<()> {
     if lock.try_lock().is_err() {
         return Ok(()); // another daemon owns this home
     }
+    let log_path = daemon_dir.join("daemon.log");
+    // Trimmed only here: the daemon keeps the file open while it runs.
+    let trimmed = trim_log(
+        &log_path,
+        store::now_ms().saturating_sub(AUTO_GC_DAYS * DAY_MS),
+    );
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(daemon_dir.join("daemon.log"))
+        .open(&log_path)
         .ok();
     let mut listener = platform::Listener::bind(&opts.home).context("creating the endpoint")?;
     std::fs::write(
@@ -195,6 +205,10 @@ pub async fn run(opts: Options) -> Result<()> {
 
     let d = Arc::new(Daemon::load(opts, log));
     d.log(&format!("started, pid {}", std::process::id()));
+    if let Err(e) = trimmed {
+        d.log(&format!("trimming daemon.log: {e:#}"));
+    }
+    d.auto_gc();
     tokio::spawn(d.clone().watchdog());
     tokio::spawn(d.clone().pusher());
 
@@ -257,6 +271,7 @@ impl Daemon {
             };
             tasks.insert(entry.task.id.clone(), entry);
         }
+        seq = seq.max(ledger.seq);
         let (events, _) = broadcast::channel(1024);
         let d = Daemon {
             opts,
@@ -393,8 +408,13 @@ impl Daemon {
 
     async fn watchdog(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
+        let mut last_gc = Instant::now();
         loop {
             tick.tick().await;
+            if last_gc.elapsed() >= AUTO_GC_EVERY {
+                last_gc = Instant::now();
+                self.auto_gc();
+            }
             let idle = {
                 let st = self.lock();
                 st.running == 0
@@ -650,10 +670,7 @@ impl Daemon {
             Request::Ask { text } => self.ask(&caller, text, out).await,
             Request::Reply { id, text } => self.reply(&caller, &id, text, env.env, out).await,
             Request::Answers => self.answers(&caller, out).await,
-            Request::Gc { days } => {
-                self.gc(&caller, days, env.env.unwrap_or_default(), out)
-                    .await
-            }
+            Request::Gc { days } => self.gc(&caller, days, out).await,
             Request::Tell { to, text } => self.tell(&caller, &to, text, out).await,
             Request::Detach { task } => self.detach(&caller, &task, out).await,
             Request::Approve { id } => {
@@ -786,14 +803,7 @@ impl Daemon {
 
         let now = store::now_ms();
         let id = store::new_id('t', |id| self.store.exists(id));
-        let (cwd, worktree) = if s.worktree {
-            let name = s.name.as_deref().unwrap_or(&id);
-            let (wt, cwd) = worktree::create(&self.opts.home, &s.cwd, &id, name, &env)
-                .map_err(|e| anyhow!(RefuseErr(ErrorCode::Invalid, format!("{e:#}"))))?;
-            (cwd, Some(wt))
-        } else {
-            (s.cwd.clone(), None)
-        };
+        let cwd = s.cwd.clone();
         let task = Task {
             id: id.clone(),
             name: s.name.clone(),
@@ -814,7 +824,6 @@ impl Daemon {
             delivered: 0,
             changed_files: Vec::new(),
             questions: Vec::new(),
-            worktree: worktree.clone(),
             stalled: false,
             detached: false,
             created_ms: now,
@@ -849,13 +858,6 @@ impl Daemon {
         self.schedule(&id);
 
         let mut notes = render::capability_notes(s.agent, s.tier);
-        if let Some(wt) = &worktree {
-            notes.push(format!(
-                "Worktree: {}; your uncommitted changes are absent. To merge its work, commit there, then run `git merge {}`.",
-                wt.path.display(),
-                wt.branch
-            ));
-        }
         if s.tier != ipc::Tier::Read {
             let approver = approver(&self.lock(), &id);
             if approver != caller {
@@ -990,7 +992,9 @@ impl Daemon {
         };
         let handed = 'handoff: {
             let mut st = self.lock();
-            let entry = st.tasks.get_mut(id).unwrap();
+            let Some(entry) = st.tasks.get_mut(id) else {
+                return refuse(ErrorCode::NotFound, format!("no task {id}"));
+            };
             if entry.task.status.is_final() {
                 return refuse(ErrorCode::Invalid, format!("{id} was cancelled"));
             }
@@ -1198,7 +1202,9 @@ impl Daemon {
         );
         let how = {
             let mut st = self.lock();
-            let entry = st.tasks.get_mut(&to).unwrap();
+            let Some(entry) = st.tasks.get_mut(&to) else {
+                return refuse(ErrorCode::NotFound, format!("no task {to}"));
+            };
             if entry.task.parent != parent || to == me {
                 return refuse(ErrorCode::Invalid, format!("{to} is not your sibling"));
             }
@@ -1215,6 +1221,12 @@ impl Daemon {
                 }
                 _ => {
                     entry.mail.push(message);
+                    // Counts as activity, so gc gives the task time to take the note; set under
+                    // the same lock, so gc cannot remove the task in between.
+                    entry.task.updated_ms = store::now_ms();
+                    if let Err(e) = self.store.save(&entry.task) {
+                        self.log(&format!("saving {to}: {e:#}"));
+                    }
                     "kept for its next turn"
                 }
             }
@@ -1241,7 +1253,9 @@ impl Daemon {
         let id = self.find(caller, reference)?;
         let task = {
             let mut st = self.lock();
-            let entry = st.tasks.get_mut(&id).unwrap();
+            let Some(entry) = st.tasks.get_mut(&id) else {
+                return refuse(ErrorCode::NotFound, format!("no task {id}"));
+            };
             if entry.actor.is_some() {
                 return refuse(
                     ErrorCode::Invalid,
@@ -1281,14 +1295,11 @@ impl Daemon {
         Ok(ipc::exit::OK)
     }
 
-    /// Forget finished tasks nobody touched for `days`, with their worktrees, and older lines of
-    /// the request log. A worktree with uncommitted changes keeps its task, and a task stays
-    /// while any of its children does.
+    /// Forget stopped tasks untouched for `days`, and older lines of the request log.
     async fn gc<W: AsyncWrite + Unpin>(
         &self,
         caller: &str,
         days: u64,
-        env: Vec<(String, String)>,
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
         if identity::task_of(caller).is_some() {
@@ -1297,13 +1308,38 @@ impl Daemon {
                 "gc is for the main session or the user, not sub-agents",
             );
         }
-        let cutoff = store::now_ms().saturating_sub(days * 86_400_000);
-        self.trim_requests(cutoff)?;
+        let removed = self.collect(store::now_ms().saturating_sub(days * DAY_MS))?;
+        out.text(
+            format!("removed {removed} task(s)"),
+            json!({"removed": removed}),
+        )
+        .await?;
+        Ok(ipc::exit::OK)
+    }
+
+    /// `gc` by itself, for what nobody touched in `AUTO_GC_DAYS`.
+    fn auto_gc(&self) {
+        match self.collect(store::now_ms().saturating_sub(AUTO_GC_DAYS * DAY_MS)) {
+            Ok(0) => {}
+            Ok(n) => self.log(&format!("gc: removed {n} task(s)")),
+            Err(e) => self.log(&format!("gc: {e:#}")),
+        }
+    }
+
+    /// Forget stopped tasks untouched since `cutoff_ms`, and older lines of the request log. A
+    /// task stays while any of its children does. Returns how many tasks went.
+    fn collect(&self, cutoff_ms: u64) -> Result<usize> {
+        self.trim_requests(cutoff_ms)?;
+        {
+            let mut st = self.lock();
+            st.ledger.seq = st.seq;
+            st.ledger.save(&self.opts.home)?;
+        }
         let settled = |e: &Entry| {
             e.actor.is_none()
                 && e.pending.is_empty()
                 && !matches!(e.task.status, Status::Queued | Status::Running)
-                && e.task.updated_ms < cutoff
+                && e.task.updated_ms < cutoff_ms
         };
         // Children first, so their parents can go in the same run.
         let mut old: Vec<(usize, String)> = {
@@ -1324,7 +1360,6 @@ impl Daemon {
         };
         old.sort_by_key(|(depth, _)| std::cmp::Reverse(*depth));
         let mut removed = 0;
-        let mut notes = Vec::new();
         for (_, id) in old {
             // Checked and removed under one lock, so nothing can resume the task halfway.
             let mut st = self.lock();
@@ -1335,42 +1370,25 @@ impl Daemon {
             if !settled(e) || st.tasks.values().any(|c| c.task.parent == key) {
                 continue;
             }
-            if let Some(wt) = &e.task.worktree {
-                match worktree::remove(wt, &env) {
-                    Ok(note) => notes.extend(note.map(|n| format!("{id}: {n}"))),
-                    Err(err) => {
-                        notes.push(format!("kept {id}: {} ({err:#})", wt.path.display()));
-                        continue;
-                    }
-                }
-            }
             st.tasks.remove(&id);
             let suffix = format!("|{id}");
             st.ledger.cursors.retain(|k, _| !k.ends_with(&suffix));
             self.store.remove(&id)?;
             removed += 1;
         }
-        {
-            let mut st = self.lock();
-            let State { tasks, ledger, .. } = &mut *st;
-            ledger
-                .codex_hosts
-                .retain(|host, _| tasks.values().any(|e| e.task.parent == *host));
-            ledger
-                .pending_pushes
-                .retain(|host, _| ledger.codex_hosts.contains_key(host));
-            ledger
-                .doorbells
-                .retain(|host, _| ledger.codex_hosts.contains_key(host));
-            ledger.save(&self.opts.home)?;
-        }
-        let mut text = format!("removed {removed} task(s)");
-        for n in &notes {
-            text.push_str(&format!("\n  {n}"));
-        }
-        out.text(text, json!({"removed": removed, "notes": notes}))
-            .await?;
-        Ok(ipc::exit::OK)
+        let mut st = self.lock();
+        let State { tasks, ledger, .. } = &mut *st;
+        ledger
+            .codex_hosts
+            .retain(|host, _| tasks.values().any(|e| e.task.parent == *host));
+        ledger
+            .pending_pushes
+            .retain(|host, _| ledger.codex_hosts.contains_key(host));
+        ledger
+            .doorbells
+            .retain(|host, _| ledger.codex_hosts.contains_key(host));
+        ledger.save(&self.opts.home)?;
+        Ok(removed)
     }
 
     /// Route an agent's approval request to whoever may decide it, or refuse it at once.
@@ -1957,7 +1975,9 @@ impl Daemon {
         };
         let mut full = false;
         for e in approvals {
-            let (text, _) = self.render_wake(e, None);
+            let Some((text, _)) = self.render_wake(e, None) else {
+                continue;
+            };
             let cost = render::tokens(&text);
             if !b.items.is_empty() && cost > budget {
                 full = true;
@@ -1974,7 +1994,10 @@ impl Daemon {
                 continue;
             }
             let first = b.items.is_empty();
-            let (text, turn) = self.render_wake(e, first.then_some(budget));
+            let Some((text, turn)) = self.render_wake(e, first.then_some(budget)) else {
+                b.seen.push(e.clone());
+                continue;
+            };
             let cost = render::tokens(&text);
             if !first && cost > budget {
                 break;
@@ -2014,6 +2037,10 @@ impl Daemon {
         }
         let mut st = self.lock();
         for e in seen {
+            // A task gc removed meanwhile took its cursors along.
+            if !st.tasks.contains_key(&e.task) {
+                continue;
+            }
             let cursor = st
                 .ledger
                 .cursors
@@ -2031,26 +2058,30 @@ impl Daemon {
     }
 
     /// Render one event; a turn's result text is included the first time only. With `fit`, the
-    /// result is cut down to that many tokens.
-    fn render_wake(&self, e: &Event, fit: Option<usize>) -> (String, Option<u32>) {
+    /// result is cut down to that many tokens. Nothing if gc has removed the task.
+    fn render_wake(&self, e: &Event, fit: Option<usize>) -> Option<(String, Option<u32>)> {
         let (agent, delivered) = {
             let st = self.lock();
-            let t = &st.tasks[&e.task].task;
+            let t = &st.tasks.get(&e.task)?.task;
             (t.agent, t.delivered)
         };
         if e.kind != "turn_ended" {
-            return (render::event_full(e, agent), None);
+            return Some((render::event_full(e, agent), None));
         }
         let head = render::event_line(e, agent);
         let turn = e.data.get("turn").and_then(Value::as_u64).unwrap_or(0) as u32;
         if turn <= delivered {
-            return (
+            return Some((
                 format!("{head}\n(result already delivered; no new content)"),
                 None,
-            );
+            ));
         }
         let path = self.store.turn_path(&e.task, turn);
-        let body = std::fs::read_to_string(&path).unwrap_or_default();
+        let body = match std::fs::read_to_string(&path) {
+            Ok(body) => body,
+            Err(_) if !self.lock().tasks.contains_key(&e.task) => return None,
+            Err(_) => String::new(),
+        };
         let body = match fit {
             Some(budget) => {
                 let frame = render::tokens(&format!("{head}\n{}", render::tagged("result", "")));
@@ -2058,10 +2089,10 @@ impl Daemon {
             }
             None => body,
         };
-        (
+        Some((
             format!("{head}\n{}", render::tagged("result", &body)),
             Some(turn),
-        )
+        ))
     }
 
     /// A line for each piece of news, until stopped, or for a sub-agent until it has been idle
@@ -2194,7 +2225,9 @@ impl Daemon {
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
         let id = self.find(caller, reference)?;
-        let agent = self.lock().tasks[&id].task.agent;
+        let Some(agent) = self.lock().tasks.get(&id).map(|e| e.task.agent) else {
+            return refuse(ErrorCode::NotFound, format!("no task {id}"));
+        };
         let events = self.store.events(&id);
         let start = events.len().saturating_sub(tail);
         let text = events[start..]
@@ -2216,10 +2249,13 @@ impl Daemon {
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
         let id = self.find(caller, reference)?;
-        let (turns, delivered) = {
-            let st = self.lock();
-            let t = &st.tasks[&id].task;
-            (t.turns, t.delivered)
+        let Some((turns, delivered)) = self
+            .lock()
+            .tasks
+            .get(&id)
+            .map(|e| (e.task.turns, e.task.delivered))
+        else {
+            return refuse(ErrorCode::NotFound, format!("no task {id}"));
         };
         let turn = turn.unwrap_or(turns);
         let path = self.store.turn_path(&id, turn);
@@ -2363,6 +2399,32 @@ pub fn agent_env(
         }
     }
     env
+}
+
+/// Drop the start of `daemon.log` up to its first entry from `cutoff_ms` on. Each entry starts
+/// with its time; lines without one belong to the entry above.
+fn trim_log(path: &Path, cutoff_ms: u64) -> Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut at = 0;
+    let mut start = text.len();
+    for line in text.split_inclusive('\n') {
+        let time = line.split(' ').next().and_then(|t| t.parse::<u64>().ok());
+        if time.is_some_and(|t| t >= cutoff_ms) {
+            start = at;
+            break;
+        }
+        at += line.len();
+    }
+    if start > 0 {
+        let tmp = path.with_extension("log.tmp");
+        std::fs::write(&tmp, &text[start..])?;
+        std::fs::rename(tmp, path)?;
+    }
+    Ok(())
 }
 
 /// Defaults, overridden by `config.toml` in `home`.
