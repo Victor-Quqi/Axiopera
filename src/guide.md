@@ -1,8 +1,7 @@
 axiopera: run other coding agents (claude, codex, grok) as your sub-agents.
 
 Use axiopera for a different agent or model, or for work that must continue after your
-session ends. For same-agent delegation that needs your full context, use your built-in
-sub-agents: axiopera sub-agents see only the task you write.
+session ends.
 
 Dispatch
   axiopera spawn codex "Fix the failing test in tests/parser.rs; run cargo test before finishing."
