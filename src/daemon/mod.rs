@@ -6,7 +6,7 @@ mod task;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -73,9 +73,6 @@ struct State {
     ledger: Ledger,
     /// Tasks with a live actor (an agent process running or shutting down).
     running: usize,
-    /// Of those, the ones spawned by a session or a person rather than by another task.
-    top_running: usize,
-    queue: VecDeque<String>,
     last_active: Instant,
     stopping: bool,
     /// Approval requests waiting for a decision, by request ID. In memory only: they die with
@@ -281,8 +278,6 @@ impl Daemon {
                 tasks,
                 ledger,
                 running: 0,
-                top_running: 0,
-                queue: VecDeque::new(),
                 last_active: Instant::now(),
                 stopping: false,
                 approvals: HashMap::new(),
@@ -765,6 +760,9 @@ impl Daemon {
                 format!("{} is not a directory", s.cwd.display()),
             );
         }
+        if let Some(why) = self.at_limit(&self.lock(), caller) {
+            return refuse(ErrorCode::Invalid, why);
+        }
         if self.depth(caller) >= 2 {
             return refuse(
                 ErrorCode::Invalid,
@@ -832,6 +830,12 @@ impl Daemon {
         self.store.save(&task)?;
         {
             let mut st = self.lock();
+            // Again under the lock that adds the task, so spawns at once cannot pass it together.
+            if let Some(why) = self.at_limit(&st, caller) {
+                drop(st);
+                let _ = self.store.remove(&id);
+                return refuse(ErrorCode::Invalid, why);
+            }
             let entry = Entry {
                 blocked: 0,
                 notices: Vec::new(),
@@ -894,7 +898,7 @@ impl Daemon {
         Ok(ipc::exit::OK)
     }
 
-    /// Start an actor for the task if a slot is free, otherwise queue it.
+    /// Start an actor for the task.
     fn schedule(self: &Arc<Self>, id: &str) {
         let mut st = self.lock();
         if st.stopping {
@@ -906,20 +910,8 @@ impl Daemon {
         if entry.actor.is_some() || entry.task.status.is_final() || entry.task.detached {
             return;
         }
-        // Only top-level tasks count against the limit: a parent waiting for its children
-        // holds a slot, and queueing the children behind it would deadlock.
-        let top = identity::task_of(&entry.task.parent).is_none();
-        if top && st.top_running >= self.opts.concurrency {
-            if !st.queue.iter().any(|q| q == id) {
-                st.queue.push_back(id.to_string());
-            }
-            drop(st);
-            self.set_status(id, Status::Queued);
-            return;
-        }
         let (tx, rx) = mpsc::unbounded_channel();
         st.running += 1;
-        st.top_running += top as usize;
         st.tasks.get_mut(id).unwrap().actor = Some(tx);
         drop(st);
         tokio::spawn(task::run(self.clone(), id.to_string(), rx));
@@ -927,25 +919,17 @@ impl Daemon {
 
     /// Called by an actor when its process is gone.
     fn actor_done(self: &Arc<Self>, id: &str) {
-        let (next, again) = {
+        let again = {
             let mut st = self.lock();
             st.running -= 1;
-            if st
-                .tasks
-                .get(id)
-                .is_some_and(|e| identity::task_of(&e.task.parent).is_none())
-            {
-                st.top_running -= 1;
-            }
             st.last_active = Instant::now();
             // Whoever asked is gone; its requests can no longer be acted on.
             st.approvals.retain(|_, p| p.task != id);
-            let again = st.tasks.get_mut(id).is_some_and(|e| {
+            st.tasks.get_mut(id).is_some_and(|e| {
                 e.actor = None;
                 e.releasing = false;
                 !e.pending.is_empty() && !e.task.status.is_final()
-            });
-            (st.queue.pop_front(), again)
+            })
         };
         // Not an event of its own: lets `wait` notice the task went idle.
         let _ = self.events.send(Event {
@@ -958,9 +942,28 @@ impl Daemon {
         if again {
             self.schedule(id);
         }
-        if let Some(next) = next {
-            self.schedule(&next);
+    }
+
+    /// Why `caller` may not start another task now: `concurrency` caps the top-level tasks
+    /// running at once, across sessions. It guards against runaway spawning, so going over
+    /// it is refused rather than queued. Nested tasks share their parent's place, which it
+    /// holds while it waits for them; new turns of existing tasks are not limited.
+    fn at_limit(&self, st: &State, caller: &str) -> Option<String> {
+        if identity::task_of(caller).is_some() {
+            return None;
         }
+        let running = st
+            .tasks
+            .values()
+            .filter(|e| identity::task_of(&e.task.parent).is_none())
+            .filter(|e| e.actor.is_some() || !e.pending.is_empty())
+            .count();
+        (running >= self.opts.concurrency).then(|| {
+            format!(
+                "{running} top-level tasks, yours and other sessions', are running: the most `concurrency` allows ({}). Wait for one to finish, or raise it",
+                self.opts.home.join("config.toml").display()
+            )
+        })
     }
 
     async fn send<W: AsyncWrite + Unpin>(
@@ -1500,7 +1503,6 @@ impl Daemon {
         let mut n = self.cancel_children(id, by);
         let actor = {
             let mut st = self.lock();
-            st.queue.retain(|q| q != id);
             let Some(entry) = st.tasks.get_mut(id) else {
                 return n;
             };
@@ -2433,7 +2435,7 @@ pub fn options(home: PathBuf) -> Result<Options> {
     let minutes = |m: Option<u64>, default: u64| Duration::from_secs(m.unwrap_or(default) * 60);
     Ok(Options {
         idle: Duration::from_secs(600),
-        concurrency: c.concurrency.unwrap_or(4).max(1),
+        concurrency: c.concurrency.unwrap_or(50).max(1),
         stall: minutes(c.stall_minutes, 10),
         // Short, because a sub-agent waits for the decision and some hosts only see the request
         // when their turn ends; a denied sub-agent reports what it needed instead.

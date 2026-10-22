@@ -580,13 +580,13 @@ mod tests {
         {
             let mut st = f.d.lock();
             st.running = 1;
-            st.top_running = 1;
+            // Keeps the next turn from starting a real agent here.
+            st.stopping = true;
         }
         f.d.actor_done("test");
         let st = f.d.lock();
         assert_eq!(st.tasks["test"].pending, ["during shutdown"]);
-        assert_eq!(st.tasks["test"].task.status, Status::Queued);
-        assert_eq!(st.queue.front().map(String::as_str), Some("test"));
+        assert!(st.tasks["test"].actor.is_none());
     }
 
     #[test]

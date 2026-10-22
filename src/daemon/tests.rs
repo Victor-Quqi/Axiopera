@@ -19,7 +19,7 @@ fn options(home: &Path) -> Options {
     Options {
         home: home.to_path_buf(),
         idle: Duration::from_secs(10),
-        concurrency: 0,
+        concurrency: 50,
         stall: Duration::from_secs(60),
         approval_timeout: Duration::from_secs(60),
         agents: config::Agents::default(),
@@ -578,6 +578,36 @@ async fn a_note_kept_for_a_stopped_task_gives_it_time_before_gc() {
     assert_eq!(f.d.lock().tasks["test"].mail.len(), 1);
     f.d.collect(1_000).unwrap();
     assert!(f.d.lock().tasks.contains_key("test"));
+}
+
+#[test]
+fn top_level_spawns_stop_at_the_limit_while_nested_ones_go_on() {
+    let f = fixture_with(&[
+        json!({"id": "a"}),
+        json!({"id": "b", "parent": "claude:other"}),
+        json!({"id": "kid", "parent": "task:a"}),
+    ]);
+    let d = Daemon::load(
+        Options {
+            concurrency: 2,
+            ..options(&f.home)
+        },
+        None,
+    );
+    {
+        let mut st = d.lock();
+        for id in ["a", "kid"] {
+            st.tasks.get_mut(id).unwrap().actor = Some(mpsc::unbounded_channel().0);
+        }
+        // About to start: counts as running.
+        st.tasks.get_mut("b").unwrap().pending.push("go".into());
+    }
+    let why = d.at_limit(&d.lock(), "codex:host").unwrap();
+    assert!(why.starts_with("2 top-level tasks"), "{why}");
+    assert!(why.contains("config.toml"), "{why}");
+    assert!(d.at_limit(&d.lock(), "task:a").is_none());
+    d.lock().tasks.get_mut("b").unwrap().pending.clear();
+    assert!(d.at_limit(&d.lock(), "codex:host").is_none());
 }
 
 #[test]

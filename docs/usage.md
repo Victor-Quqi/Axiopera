@@ -31,12 +31,12 @@
 数据目录默认为 `~/.axiopera/`，环境变量 `AXIOPERA_HOME` 可以覆盖它。配置文件是该目录下的 `config.toml`，所有字段均可省略。以下三项是默认值：
 
 ```toml
-concurrency = 4
+concurrency = 50
 stall_minutes = 10
 approval_timeout_minutes = 2
 ```
 
-`concurrency` 只计算顶层任务，嵌套任务共用父任务的名额。超过上限的任务排队。持续没有事件达到 `stall_minutes` 时，任务标为 stalled 并通知调用方；任务继续运行。`spawn --timeout` 才会在到期时取消任务。
+`concurrency` 是同时运行的顶层任务上限，所有会话共用，嵌套任务不计入。它用于防止失控派发：达到上限时新的 `spawn` 直接报错，不排队；已有任务经 `send` 或 `reply` 开始的新一轮不受限制。持续没有事件达到 `stall_minutes` 时，任务标为 stalled 并通知调用方；任务继续运行。`spawn --timeout` 才会在到期时取消任务。
 
 每个 backend 可以设置默认模型和可执行文件路径。例如：
 
@@ -84,6 +84,6 @@ CLI 按需启动 daemon。没有运行中的 agent 和客户端连接时，daemo
 
 `axiopera daemon status` 查看 daemon，`daemon stop` 在没有运行任务时停止它。`daemon stop --force` 会中断正在运行的任务，之后可用 `send` 续接。升级二进制前先停止 daemon。
 
-Axiopera 自动删除 30 天未活动且已停止的任务，以及请求日志 `daemon/requests.jsonl` 和 daemon 日志 `daemon/daemon.log` 中 30 天前的行。`axiopera gc` 立即删除所有已停止的任务和请求日志，`--days N` 保留最近 N 天有活动的。运行中或排队中的任务，以及仍有子任务的父任务，都不会被删除；收到兄弟任务的留言也算一次活动。任务删除后不能再对它 `send`、`result` 或 `log`。
+Axiopera 自动删除 30 天未活动且已停止的任务，以及请求日志 `daemon/requests.jsonl` 和 daemon 日志 `daemon/daemon.log` 中 30 天前的行。`axiopera gc` 立即删除所有已停止的任务和请求日志，`--days N` 保留最近 N 天有活动的。运行中或即将开始运行的任务，以及仍有子任务的父任务，都不会被删除；收到兄弟任务的留言也算一次活动。任务删除后不能再对它 `send`、`result` 或 `log`。
 
 卸载前先停止 daemon。通过 Cargo 安装的执行 `cargo uninstall axiopera`；通过 Release 压缩包安装的删除可执行文件。数据目录按需删除，原生 agent 的会话仍由各自 CLI 管理。
