@@ -1,6 +1,7 @@
 """Check release tags and package native binaries. Requires Python 3.11+."""
 
 import argparse
+import json
 from pathlib import Path
 import subprocess
 import tarfile
@@ -9,6 +10,7 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parent.parent
+CODEX_PLUGIN = ROOT / "plugins" / "axiopera" / ".codex-plugin" / "plugin.json"
 
 
 def version():
@@ -20,6 +22,9 @@ def check_tag(tag):
     expected = f"v{version()}"
     if tag != expected:
         raise SystemExit(f"Tag {tag!r} does not match Cargo.toml version {expected!r}")
+    plugin = json.loads(CODEX_PLUGIN.read_text(encoding="utf-8")).get("version")
+    if plugin != version():
+        raise SystemExit(f"Codex plugin version {plugin!r} does not match Cargo.toml version {version()!r}")
 
 
 def package(target, binary, output):
