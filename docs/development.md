@@ -43,7 +43,7 @@ cargo package --locked --target-dir target/package-verify
 - `docs/backends.md`：权限映射和协议差异。修改适配器前先查，修改后端行为时同步。
 - `docs/verification.md`：已测版本、后端结论的依据和探针用法。新增或修改后端结论时在此登记依据，正文不标注来源。
 - `docs/design.md`：内部状态、持久化和并发机制。修改状态或交付逻辑时同步。
-- `plugins/axiopera/`：skill 只让 agent 去读 `axiopera guide --host`，说明写在 guide 里。改动 Codex hook 会让用户重新信任；插件在 Codex 中留下的内容有变化时，同步 `src/plugin.rs` 和[使用文档](usage.md#skill-与-codex-插件)。
+- `plugins/axiopera/`：skill 只让 agent 去读 `axiopera guide --host`，说明写在 guide 里。插件改动可能让用户重新信任 hook，条件见[使用文档](usage.md#skill-与-codex-插件)；插件在 Codex 中留下的内容有变化时，同步 `src/plugin.rs` 和使用文档。
 
 增删命令或选项前，参考数据目录中 `daemon/requests.jsonl` 记录的实际用法，字段见[存储](design.md#存储)。
 
