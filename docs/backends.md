@@ -21,7 +21,7 @@ Grok 的 work 档不限制内置文件工具写入项目外。Windows 上 Claude
 | 后端环境 | 回连方式 |
 |---|---|
 | Codex Windows unelevated | 命名管道 DACL 允许受限令牌中的登录会话 SID，shell 可以连接 |
-| Codex Windows elevated | shell 以单独账户运行，无法连接该管道 |
+| Codex Windows elevated | shell 以单独账户运行，找不到按当前用户命名的管道 |
 | Codex Linux 受限网络 | `connect()` 被拦截，shell 无法连接 Unix socket |
 | Claude Linux 启用 sandbox | socket 连接被拦截 |
 | Grok Linux 启用 sandbox | 可以连接，派发请求被 daemon 拒绝 |
@@ -99,7 +99,7 @@ Grok 的 `_x.ai/session/interjection` 只确认入队。轮末输出注明消费
 
 Claude 和 Grok 由宿主进程在后台命令退出时唤醒，与界面无关。Grok 的 monitor 把命令的每行输出作为一个事件：宿主忙时在当前这次工具调用之后送入本轮，空闲时开启一轮。monitor 每行保留 500 字节，最多连发 10 个事件，之后每 2 秒补 1 个，超出的丢弃；命令自行退出时，最后几行可能丢失。monitor 启动的命令没有 `GROK_SESSION_ID`，因此 `watch` 用 `--caller grok:<会话>` 指明调用方；`guide` 直接给出填好调用方的命令：Grok 会话填会话 ID，Grok 子 agent 填任务 ID。无人值守的 `grok -p` 默认等所有后台任务结束才退出，而 persistent monitor 不会自行结束，因此这样运行 Grok 时加 `--no-wait-for-background`，该选项不在 `--help` 中列出。Axiopera 不向 Claude inbox socket 推送，因为 Linux 上脱离宿主进程树的 daemon 会触发入站批准，而且该接口没有送达回执。
 
-Codex 交互式会话挂在用户级 app-server daemon 上时，Axiopera 经 `codex app-server proxy` 连接其 WebSocket JSON-RPC。用 `thread/loaded/list` 确认会话已加载，再按轮次状态调用 `turn/steer` 或 `turn/start`。`codex exec`、`--no-daemon`、带 `-c` 配置覆盖、Windows 管理员终端中的会话不在该 daemon 上；桌面端和 VS Code 扩展的会话也不在，它们各自以 stdio 启动私有 app-server。
+Codex 交互式会话挂在用户级 app-server daemon 上时，Axiopera 经 `codex app-server proxy` 连接其 WebSocket JSON-RPC。用 `thread/loaded/list` 确认会话已加载，再按轮次状态调用 `turn/steer` 或 `turn/start`。`codex exec`、`--no-daemon`、带 `-c` 配置覆盖（Codex 0.164 起只开关 feature 的除外，未实测）、Windows 管理员终端中的会话不在该 daemon 上；桌面端和 VS Code 扩展的会话也不在，它们各自以 stdio 启动私有 app-server。
 
 不在共享 daemon 上的会话，由 Axiopera 另起的私有 `codex app-server` 用 `thread/read` 读取来源。来源为 `vscode` 表示 app-server 客户端的会话，桌面端和 VS Code 扩展都属于此类，Axiopera 对其使用门铃：
 
@@ -114,4 +114,4 @@ Codex 插件的 hook 用 `mcp_tool` 处理器调用插件自带的 MCP 服务器
 
 Windows 上 Codex 经 PowerShell `-Command` 执行命令，外部程序的非零退出码一律报告为 1。
 
-TUI 退出后，Codex daemon 约一分钟才卸载会话，这段时间到达的事件仍可能开启一轮。推送去重、门铃和重试见[内部设计](design.md#codex-推送与门铃)。
+TUI 退出后，会话无人订阅且无活动满 `thread_unload_delay_secs` 才被 daemon 卸载，默认值在 daemon 0.162 及以前为 60 秒，0.163 起为 30 分钟。这段时间到达的事件仍会开启一轮，协议也不提供会话是否还有订阅者。推送去重、门铃和重试见[内部设计](design.md#codex-推送与门铃)。
