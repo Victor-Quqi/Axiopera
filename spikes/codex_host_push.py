@@ -171,7 +171,7 @@ def main():
         log("spawn alpha:", axiopera("spawn", "claude", "--tier", "read", "--model", "haiku", "--name", "alpha",
                                      "Reply with exactly ALPHA").splitlines()[-1])
         turns = daemon.wait_idle(tid, 2, 240)
-        pushed = [t for t in user_texts(turns[-1]) if "[axiopera]" in t]
+        pushed = [t for t in user_texts(turns[-1]) if t.startswith("[axiopera:") and "ALPHA" in t]
         log("idle:", "new turn" if len(turns) == 2 and pushed else "NOT pushed", "|", " / ".join(pushed)[:200])
 
         # Busy host: the result should be steered into the running turn.
@@ -222,13 +222,16 @@ def main():
         remove_tree(home)
         for rollout in filter(None, rollouts):
             Path(rollout).unlink(missing_ok=True)
-        # The shared daemon keeps the thread loaded for about a minute, its MCP servers in `work`.
+        # The shared daemon keeps the thread loaded, its MCP servers in `work`, for a minute before
+        # daemon 0.163 and for 30 minutes since.
         for _ in range(30):
             try:
                 remove_tree(work)
                 break
             except PermissionError:
                 time.sleep(5)
+        else:
+            log(f"{work} is still in use; remove it once the daemon unloads the thread")
 
 
 if __name__ == "__main__":
