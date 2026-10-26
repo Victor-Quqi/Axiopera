@@ -16,6 +16,7 @@ Get results
   axiopera wait            blocks until there is something new, lists it, and takes nothing.
 @claude Run `axiopera wait` as a background command. When it exits, run `axiopera inbox`, and
 @claude start `axiopera wait` again while sub-tasks still run.
+@claude Native subagents share your inbox; all agents must specify task IDs for wait and inbox.
 @codex The output of spawn says how results reach you.
 @grok Before you spawn, start `axiopera watch --caller grok:<session>` with your monitor tool,
 @grok persistent, unless it is running; start it again if told it ended while sub-tasks run.
