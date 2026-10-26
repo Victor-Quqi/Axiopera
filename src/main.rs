@@ -496,9 +496,11 @@ mod tests {
         assert!(grok.contains("`axiopera watch --caller grok:s1`"));
         assert!(!grok.contains("background command"));
         assert!(all.contains("`axiopera watch --caller grok:<session>`"));
-        // A Grok sub-agent's spawns are its task's, whatever its session.
+        // Monitor commands need the full caller because they omit the native session variable.
         let sub_agent = guide(Some(Agent::Grok), "task:t1");
         assert!(sub_agent.contains("`axiopera watch --caller task:t1`"));
+        let native = guide(Some(Agent::Grok), "task:t1/grok:child");
+        assert!(native.contains("`axiopera watch --caller task:t1/grok:child`"));
     }
 
     #[test]

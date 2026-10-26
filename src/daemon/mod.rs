@@ -611,7 +611,7 @@ impl Daemon {
         env: Envelope,
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
-        let caller = env.caller.clone();
+        let caller = self.resolve_caller(&env.caller);
         match env.request {
             Request::Ping => {
                 let running = self.lock().running;
@@ -709,6 +709,23 @@ impl Daemon {
                 Ok(ipc::exit::OK)
             }
         }
+    }
+
+    /// Preserve the task's original identity for its own native session and MCP server.
+    /// Other native sessions under that task get separate inboxes with the same ancestry.
+    fn resolve_caller(&self, caller: &str) -> String {
+        if let Some((id, native)) = identity::task_session(caller)
+            && let Some((host, session)) = native.split_once(':')
+            && let Some(entry) = self.lock().tasks.get(id)
+            && entry.task.session.as_deref() == Some(session)
+            && matches!(
+                (entry.task.agent, host),
+                (Agent::Claude, "claude") | (Agent::Codex, "codex") | (Agent::Grok, "grok")
+            )
+        {
+            return format!("task:{id}");
+        }
+        caller.to_string()
     }
 
     /// Resolve a task reference: an ID, or a name among the caller's children.
@@ -1366,11 +1383,15 @@ impl Daemon {
         for (_, id) in old {
             // Checked and removed under one lock, so nothing can resume the task halfway.
             let mut st = self.lock();
-            let key = format!("task:{id}");
             let Some(e) = st.tasks.get(&id) else {
                 continue;
             };
-            if !settled(e) || st.tasks.values().any(|c| c.task.parent == key) {
+            if !settled(e)
+                || st
+                    .tasks
+                    .values()
+                    .any(|c| identity::task_of(&c.task.parent) == Some(id.as_str()))
+            {
                 continue;
             }
             st.tasks.remove(&id);
@@ -1542,10 +1563,9 @@ impl Daemon {
     pub fn cancel_children(self: &Arc<Self>, id: &str, by: &str) -> usize {
         let children: Vec<String> = {
             let st = self.lock();
-            let key = format!("task:{id}");
             st.tasks
                 .values()
-                .filter(|e| e.task.parent == key)
+                .filter(|e| identity::task_of(&e.task.parent) == Some(id))
                 .map(|e| e.task.id.clone())
                 .collect()
         };

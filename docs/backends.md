@@ -87,7 +87,7 @@ Grok 的 `_x.ai/session/interjection` 只确认入队。轮末输出注明消费
 
 并发续接同一会话时，Claude 和 Grok 可以出现各自写入、互相看不到新轮次的情况，Codex 则拒绝第二个 writer。因此 Axiopera 在空闲时释放进程，并在续接前核对会话文件。
 
-Codex 和 Grok 内置子 agent 的终端命令分别带有独立的 `CODEX_THREAD_ID` 和 `GROK_SESSION_ID`，直接作为宿主使用时，Axiopera 的收件箱按各自线程或会话隔离。若宿主由 Axiopera 启动，它的内置子 agent 会继承同一个 `AXIOPERA_TASK_ID`；该身份优先于原生线程或会话 ID，因此两者共用收件箱。此时所有参与者都应使用带任务 ID 的 `wait`、`inbox`，避免取走彼此的消息。
+Codex 和 Grok 内置子 agent 的终端命令分别带有独立的 `CODEX_THREAD_ID` 和 `GROK_SESSION_ID`，Axiopera 按各自线程或会话隔离收件箱；由 Axiopera 启动的宿主再开内置子 agent 时同样隔离，并保留外层任务的归属和限制。Claude 主 agent 与内置子 agent 共享原生会话身份；两者都使用 Axiopera 时，所有参与者都应使用带任务 ID 的 `wait`、`inbox`，避免取走彼此的消息。
 
 ## 宿主通知
 

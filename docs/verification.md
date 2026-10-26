@@ -36,8 +36,8 @@
 | [会话与消息](backends.md#会话与消息)：后台命令结束后自行开启一轮 | `background.py` |
 | [结果与接管](usage.md#结果与接管)：审批请求先于更早的结果交出，交出前不能批准；过长的提问和留言只给首尾，全文写入文件；agent 自行开启的一轮从开始就计入进度 | `delivery.py` |
 | [会话与消息](backends.md#会话与消息)：并发续接 | `resume.py` |
-| [会话与消息](backends.md#会话与消息)：Grok 原生子 agent 的独立会话身份，以及继承 Axiopera 任务身份后共用收件箱 | `grok_native_identity.py`，Windows、Grok 1.0.67，2026-10-26：分别直接启动 Grok、经 Axiopera 启动 Grok，再各派一个原生子 agent；采集真实身份后，在独立数据目录中用预置完成结果依次重放主、子代理的 `inbox`，验证消息归属与消费 |
-| [会话与消息](backends.md#会话与消息)：Codex 原生子 agent 的独立线程身份，以及继承 Axiopera 任务身份后共用收件箱 | `codex_native_identity.py`，Windows、Codex 0.164.0，2026-10-26：直接启动使用 `danger-full-access`，经 Axiopera 启动使用 `full`，再各派一个原生子 agent；采集真实身份后，在独立数据目录中用预置完成结果依次重放主、子代理的 `inbox`，验证消息归属与消费 |
+| [会话与消息](backends.md#会话与消息)：Grok 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `grok_native_identity.py`，Windows、Grok 1.0.67，2026-10-26：直接启动使用 auto，经 Axiopera 启动使用 work，再各派一个原生子 agent；原生子 agent 实际派发只读 Axiopera 任务，主代理先 `inbox` 未取走结果，子 agent 随后成功收取；另用采集的身份与预置结果检查原任务及子会话的归属 |
+| [会话与消息](backends.md#会话与消息)：Codex 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `codex_native_identity.py`，Windows、Codex 0.164.0，2026-10-26：直接启动使用 `danger-full-access`，经 Axiopera 启动使用 full，再各派一个原生子 agent；原生子 agent 实际派发只读 Axiopera 任务，主代理先 `inbox` 未取走结果，子 agent 随后成功收取；另用采集的身份与预置结果检查原任务及子线程的归属 |
 | [宿主通知](backends.md#宿主通知)：Claude 和 Grok 在本轮进行中能否收到后台命令的完成通知 | `background.py busy` |
 | [宿主通知](backends.md#宿主通知)：Codex 推送通道，以及 TUI 退出后会话的卸载时间 | `codex_host_push.py`；手动实验：TUI 退出后轮询 `thread/loaded/list`，daemon 0.160.0 和 `--remote` 连接的 0.164.0 app-server 各一次；源码 0.162.0 [config_toml.rs](https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/config/src/config_toml.rs#L346-L348)、0.164.0 [config_toml.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/config/src/config_toml.rs#L349-L352) |
 | [宿主通知](backends.md#宿主通知)：只开关 feature 的 `-c` 不让 TUI 离开共享 daemon | 源码 Codex 0.164.0 [daemon_startup.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/tui/src/daemon_startup.rs#L90-L126) |

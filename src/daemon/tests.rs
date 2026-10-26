@@ -91,6 +91,164 @@ fn replies(buf: &[u8]) -> String {
 }
 
 #[tokio::test]
+async fn native_child_inboxes_are_separate_and_the_task_session_keeps_its_identity() {
+    for (agent, host) in [
+        (Agent::Claude, "claude"),
+        (Agent::Codex, "codex"),
+        (Agent::Grok, "grok"),
+    ] {
+        let native = format!("task:test/{host}:native");
+        let root = format!("task:test/{host}:root");
+        let f = fixture_with(&[
+            json!({"id": "root_job", "parent": "task:test", "name": "job", "turns": 1}),
+            json!({"id": "native_job", "parent": native, "name": "job", "turns": 1}),
+        ]);
+        f.d.update("test", |t| {
+            t.agent = agent;
+            t.session = Some("root".into());
+        });
+        assert_eq!(f.d.resolve_caller(&root), "task:test");
+        assert_eq!(f.d.resolve_caller("task:test"), "task:test");
+        assert_eq!(f.d.resolve_caller(&native), native);
+        assert_eq!(
+            f.d.resolve_caller("task:missing/codex:root"),
+            "task:missing/codex:root"
+        );
+        let other = format!(
+            "task:test/{}:root",
+            if host == "grok" { "codex" } else { "grok" }
+        );
+        assert_eq!(f.d.resolve_caller(&other), other);
+        assert_eq!(
+            f.d.find(&f.d.resolve_caller(&root), "job").unwrap(),
+            "root_job"
+        );
+        assert_eq!(f.d.find(&native, "job").unwrap(), "native_job");
+        for (id, body) in [("root_job", "ROOT_RESULT"), ("native_job", "NATIVE_RESULT")] {
+            f.d.store.save_turn(id, 1, body).unwrap();
+            f.d.emit(id, "turn_ended", json!({"turn": 1, "ok": true}));
+        }
+        // Dispatch tests the same caller normalization used by CLI, watch and MCP requests.
+        for (caller, own, other) in [
+            (&root, "ROOT_RESULT", "NATIVE_RESULT"),
+            (&native, "NATIVE_RESULT", "ROOT_RESULT"),
+        ] {
+            let mut buf = Vec::new();
+            f.d.dispatch(
+                Envelope {
+                    protocol: ipc::PROTOCOL,
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    caller: caller.clone(),
+                    cwd: f.home.clone(),
+                    env: None,
+                    request: Request::Inbox { tasks: vec![] },
+                },
+                &mut Out::new(&mut buf),
+            )
+            .await
+            .unwrap();
+            let text = replies(&buf);
+            assert!(text.contains(own) && !text.contains(other), "{text}");
+        }
+        let again = Daemon::load(options(&f.home), None);
+        assert_eq!(again.resolve_caller(&root), "task:test");
+        assert_eq!(again.resolve_caller(&native), native);
+        assert!(again.unseen(&again.lock(), &native, &[]).is_empty());
+        assert!(again.unseen(&again.lock(), "task:test", &[]).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn native_callers_keep_the_owning_tasks_depth_and_tier_limits() {
+    let native = "task:test/grok:native";
+    let f = fixture_with(&[json!({"id": "kid", "parent": native})]);
+    assert_eq!(f.d.depth(native), 1);
+    assert_eq!(f.d.depth("task:kid/codex:native"), 2);
+    let spawn = ipc::Spawn {
+        agent: Agent::Grok,
+        tier: ipc::Tier::Work,
+        task: "unreachable".into(),
+        cwd: f.home.clone(),
+        name: None,
+        model: None,
+        effort: None,
+        timeout_secs: None,
+    };
+    for (caller, expected) in [
+        (native, "cannot spawn a Work task"),
+        ("task:kid/codex:native", "two levels deep"),
+    ] {
+        let error =
+            f.d.spawn(
+                caller,
+                spawn.clone(),
+                vec![],
+                &mut Out::new(&mut Vec::new()),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+    assert_eq!(f.d.lock().tasks.len(), 2);
+    let st = f.d.lock();
+    assert!(within(&st, &st.tasks["kid"].task, "test"));
+}
+
+#[tokio::test]
+async fn native_callers_receive_approvals_under_the_owning_tasks_tier() {
+    let native = "task:test/codex:native";
+    let f = fixture_with(&[json!({"id": "kid", "parent": native, "tier": "work"})]);
+    assert_eq!(approver(&f.d.lock(), "kid"), "codex:host");
+    f.d.update("test", |t| t.tier = ipc::Tier::Full);
+    assert_eq!(approver(&f.d.lock(), "kid"), native);
+    let (reply, decision) = oneshot::channel();
+    f.d.request_approval(
+        "kid",
+        agent::Approval {
+            summary: "review".into(),
+            detail: "NATIVE_APPROVAL".into(),
+            reply,
+        },
+    );
+    let rid = f.d.lock().approvals.keys().next().unwrap().clone();
+    let mut buf = Vec::new();
+    f.d.inbox("task:test", &[], &mut Out::new(&mut buf))
+        .await
+        .unwrap();
+    assert!(!replies(&buf).contains("NATIVE_APPROVAL"));
+    assert!(
+        f.d.resolve(&rid, Some("task:test"), agent::Decision::Approve)
+            .is_err()
+    );
+    let mut buf = Vec::new();
+    f.d.inbox(native, &[], &mut Out::new(&mut buf))
+        .await
+        .unwrap();
+    assert!(replies(&buf).contains("NATIVE_APPROVAL"));
+    f.d.resolve(&rid, Some(native), agent::Decision::Approve)
+        .unwrap();
+    assert!(matches!(decision.await.unwrap(), agent::Decision::Approve));
+}
+
+#[test]
+fn cancelling_an_owner_also_cancels_tasks_spawned_by_its_native_children() {
+    let f = fixture_with(&[
+        json!({"id": "native_job", "parent": "task:test/grok:native"}),
+        json!({"id": "root_job", "parent": "task:test"}),
+        json!({"id": "unrelated"}),
+    ]);
+    assert_eq!(
+        f.d.cancel_tree("test", "cancelled by request", "codex:host"),
+        3
+    );
+    let st = f.d.lock();
+    for id in ["test", "native_job", "root_job"] {
+        assert_eq!(st.tasks[id].task.status, Status::Cancelled);
+    }
+    assert_eq!(st.tasks["unrelated"].task.status, Status::Idle);
+}
+
+#[tokio::test]
 async fn wait_lists_news_without_taking_it_and_inbox_takes_all() {
     let f = fixture();
     f.d.emit("test", "message", json!({"to": "other", "text": "a note"}));
@@ -545,10 +703,10 @@ fn the_request_log_keeps_argument_names_and_ages_out_with_gc() {
 fn gc_takes_children_before_parents_and_leaves_running_and_recent_tasks() {
     let now = store::now_ms();
     let f = fixture_with(&[
-        json!({"id": "kid", "parent": "task:test"}),
+        json!({"id": "kid", "parent": "task:test/grok:native"}),
         json!({"id": "busy"}),
         json!({"id": "mom"}),
-        json!({"id": "baby", "parent": "task:mom", "updated_ms": now}),
+        json!({"id": "baby", "parent": "task:mom/codex:native", "updated_ms": now}),
     ]);
     // Loading turns a running task into an interrupted one, so it starts running here.
     f.d.lock().tasks.get_mut("busy").unwrap().task.status = Status::Running;
@@ -606,6 +764,7 @@ fn top_level_spawns_stop_at_the_limit_while_nested_ones_go_on() {
     assert!(why.starts_with("2 top-level tasks"), "{why}");
     assert!(why.contains("config.toml"), "{why}");
     assert!(d.at_limit(&d.lock(), "task:a").is_none());
+    assert!(d.at_limit(&d.lock(), "task:a/grok:native").is_none());
     d.lock().tasks.get_mut("b").unwrap().pending.clear();
     assert!(d.at_limit(&d.lock(), "codex:host").is_none());
 }
