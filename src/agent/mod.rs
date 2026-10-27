@@ -4,6 +4,7 @@ mod claude;
 mod codex;
 pub mod codex_remote;
 mod grok;
+pub mod models;
 mod rpc;
 
 use std::collections::VecDeque;
@@ -368,11 +369,21 @@ pub struct Proc {
 
 impl Proc {
     pub fn spawn(exe: &Path, args: &[String], spec: &StartSpec) -> Result<(Proc, ChildStdout)> {
+        Self::spawn_with(exe, args, &spec.cwd, &spec.env, spec.trace.as_deref())
+    }
+
+    pub fn spawn_with(
+        exe: &Path,
+        args: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        trace: Option<&Path>,
+    ) -> Result<(Proc, ChildStdout)> {
         let mut cmd = tokio::process::Command::new(exe);
         cmd.args(args)
-            .current_dir(&spec.cwd)
+            .current_dir(cwd)
             .env_clear()
-            .envs(spec.env.iter().map(|(k, v)| (k, v)))
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -383,7 +394,7 @@ impl Proc {
             .with_context(|| format!("starting {}", exe.display()))?;
         let stdin = Writer {
             stdin: Arc::new(tokio::sync::Mutex::new(child.stdin.take())),
-            trace: Trace::open(spec.trace.as_deref())?,
+            trace: Trace::open(trace)?,
         };
         let stdout = child.stdout.take().unwrap();
         let stderr: Arc<Mutex<VecDeque<String>>> = Arc::default();

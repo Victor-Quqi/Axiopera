@@ -492,7 +492,10 @@ impl Daemon {
         }
         // Clients send nothing after the request, so a read only returns once they are gone.
         // Commands that block indefinitely stop then; the others run to completion.
-        let result = if matches!(env.request, Request::Wait { .. } | Request::Watch) {
+        let result = if matches!(
+            env.request,
+            Request::Wait { .. } | Request::Watch | Request::Models { .. }
+        ) {
             tokio::select! {
                 r = self.dispatch(env, &mut out) => Some(r),
                 _ = reader.read::<Value>() => None,
@@ -613,6 +616,19 @@ impl Daemon {
     ) -> Result<i32> {
         let caller = self.resolve_caller(&env.caller);
         match env.request {
+            Request::Models { agent, cwd } => {
+                let catalog = self
+                    .model_catalog(
+                        agent,
+                        &cwd,
+                        &env.env.unwrap_or_default(),
+                        Duration::from_secs(20),
+                    )
+                    .await?;
+                out.text(catalog.render(), serde_json::to_value(&catalog)?)
+                    .await?;
+                Ok(ipc::exit::OK)
+            }
             Request::Ping => {
                 let running = self.lock().running;
                 let text = format!(
@@ -762,6 +778,22 @@ impl Daemon {
             }
         }
         depth
+    }
+
+    async fn model_catalog(
+        &self,
+        agent: Agent,
+        cwd: &Path,
+        env: &[(String, String)],
+        timeout: Duration,
+    ) -> Result<agent::models::Catalog> {
+        let config = self.opts.agents.get(agent);
+        let exe = agent::resolve_exe(agent, config.path.as_deref(), env)?;
+        let mut query_env = agent_env(env, "", agent, &self.opts.home);
+        query_env.retain(|(k, _)| !k.eq_ignore_ascii_case(identity::TASK_VAR));
+        let mut catalog = agent::models::query(agent, &exe, cwd, &query_env, timeout).await?;
+        catalog.configured_model = config.model.clone();
+        Ok(catalog)
     }
 
     async fn spawn<W: AsyncWrite + Unpin>(

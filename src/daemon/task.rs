@@ -100,6 +100,25 @@ pub async fn run(d: Arc<Daemon>, id: String, mut rx: mpsc::UnboundedReceiver<Cmd
         Ok(exit) => exit,
         Err(e) => Exit::Failed(format!("{e:#}")),
     };
+    let exit = if let Exit::Failed(error) = exit {
+        let query = model_error(&d, &id, error);
+        tokio::pin!(query);
+        loop {
+            tokio::select! {
+                error = &mut query => break Exit::Failed(error),
+                cmd = rx.recv() => match cmd {
+                    Some(Cmd::Cancel(cause)) => break Exit::Cancelled(cause),
+                    Some(Cmd::Abort) | None => break Exit::Aborted,
+                    Some(Cmd::Input(m)) => {
+                        if let Some(entry) = d.lock().tasks.get_mut(&id) { entry.pending.push(m.queued()); }
+                    }
+                    Some(Cmd::Mail(m)) => keep_mail(&d, &id, m),
+                },
+            }
+        }
+    } else {
+        exit
+    };
     match exit {
         Exit::Released => {}
         Exit::Failed(error) => {
@@ -281,7 +300,23 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                         }
                     }
                     AgentEvent::Approval(a) => d.request_approval(id, a),
-                    AgentEvent::TurnEnded { ok, result, error, usage } => {
+                    AgentEvent::TurnEnded { ok, result, mut error, usage } => {
+                        if !ok && let Some(message) = error.take() {
+                            let hint = model_error(d, id, message);
+                            tokio::pin!(hint);
+                            loop {
+                                tokio::select! {
+                                    message = &mut hint => { error = Some(message); break; }
+                                    cmd = rx.recv() => match cmd {
+                                        Some(Cmd::Input(m)) => deferred.push(m.queued()),
+                                        Some(Cmd::Mail(m)) => keep_mail(d, id, m),
+                                        Some(Cmd::Cancel(cause)) => return Ok(cancel(&mut backend, cause).await),
+                                        Some(Cmd::Abort) | None => return Ok(Exit::Aborted),
+                                    },
+                                    _ = sleep_until(deadline) => return Ok(cancel(&mut backend, timed_out()).await),
+                                }
+                            }
+                        }
                         last_ok = ok;
                         turn_open = false;
                         let next = next_input(d, id, rx, &mut backend).await;
@@ -377,6 +412,38 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
         });
     }
     Ok(exit)
+}
+
+async fn model_error(d: &Daemon, id: &str, error: String) -> String {
+    if !agent::models::selection_error(&error) {
+        return error;
+    }
+    let context = d
+        .lock()
+        .tasks
+        .get(id)
+        .map(|entry| (entry.task.agent, entry.task.cwd.clone(), entry.env.clone()));
+    let Some((agent, cwd, env)) = context else {
+        return error;
+    };
+    let catalog = match env {
+        Some(env) => d
+            .model_catalog(agent, &cwd, &env, Duration::from_secs(5))
+            .await
+            .ok(),
+        None => None,
+    };
+    match catalog {
+        Some(catalog) if !catalog.models.is_empty() => format!(
+            "{error}\n\n{}:\n{}",
+            agent::models::command(agent),
+            catalog.render()
+        ),
+        _ => format!(
+            "{error}\nRun `{}` to query models and supported reasoning efforts.",
+            agent::models::command(agent)
+        ),
+    }
 }
 
 async fn sleep_until(deadline: Option<Instant>) {
@@ -514,6 +581,23 @@ async fn cancel(backend: &mut Backend, cause: Cancellation) -> Exit {
 mod tests {
     use super::super::tests::fixture;
     use super::*;
+
+    #[tokio::test]
+    async fn missing_query_context_keeps_the_error_and_adds_the_command() {
+        let f = fixture();
+        let error = "Unknown model 'missing'";
+        let message = model_error(&f.d, "test", error.into()).await;
+        assert!(message.starts_with(error));
+        assert!(message.contains("axiopera models codex"));
+        let auth = "model does not exist or you do not have access to it";
+        assert_eq!(model_error(&f.d, "test", auth.into()).await, auth);
+        f.d.lock().tasks.get_mut("test").unwrap().env = Some(Vec::new());
+        assert!(
+            model_error(&f.d, "test", error.into())
+                .await
+                .contains("axiopera models codex")
+        );
+    }
 
     #[test]
     fn cancellation_keeps_its_author_while_running_or_releasing() {

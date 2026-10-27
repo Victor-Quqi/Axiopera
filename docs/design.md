@@ -77,9 +77,9 @@ Windows 为每个 agent 建立 `KILL_ON_JOB_CLOSE` Job，禁止 breakaway。先�
 
 Windows 使用命名管道，DACL 放行当前用户 SID 和登录会话 SID，启用 `PIPE_REJECT_REMOTE_CLIENTS`；首个实例使用 `FILE_FLAG_FIRST_PIPE_INSTANCE`。Unix 使用数据目录下的 `daemon/sock`，目录权限为 0700，接入后核对对端 uid。
 
-一个连接处理一个请求。CLI 发送一行 JSON，带协议版本、调用方和 cwd；`spawn`、`send` 还带环境。daemon 输出若干行，最后一行携带退出码或错误。
+一个连接处理一个请求。CLI 发送一行 JSON，带协议版本、调用方和 cwd；`spawn`、`send`、`reply`、`models` 还带环境。daemon 输出若干行，最后一行携带退出码或错误。
 
-daemon 在受限客户端上拒绝 `spawn`、`gc` 和 `daemon stop`。Windows 客户端在启动 daemon 或派发前也检查自身令牌。
+daemon 在受限客户端上拒绝 `spawn`、`models`、`gc` 和 `daemon stop`。Windows 客户端在启动 daemon 或执行这些命令前也检查自身令牌。
 
 - Windows 在收到第一行数据后模拟客户端身份，用 `IsTokenRestricted` 检查令牌；读取失败也按受限处理。
 - Linux 比较对端与 daemon 的 `NoNewPrivs`、`Seccomp_filters`，任一项更高就按受限处理。已带 `NoNewPrivs` 的容器中，只叠加 Landlock 而不增加 seccomp 的限制无法这样识别。
@@ -92,6 +92,8 @@ socket 连接返回 EPERM 时，客户端提示到 sandbox 外重跑。各后端
 daemon 用调用方经 IPC 传来的环境启动子 agent。环境只留在内存；daemon 重启后的续接使用新一次 `send` 的环境。受限客户端传来的环境不用于启动进程。
 
 启动前清除 `identity::STRIP_VARS` 列出的宿主身份、inbox 凭据和 Codex 客户端标识，注入任务 ID 与数据目录，并把 daemon 所在目录加入 PATH。各 backend 的配置覆盖见[后端文档](backends.md#可执行文件与配置继承)。
+
+`models` 使用同样的路径定位和环境处理，查询进程不注入任务 ID。查询在连接处理协程中完成，不创建任务；调用方断开时取消查询。模型参数错误触发的自动查询使用原任务目录和环境，结果附在原错误后交付。
 
 ## 事件与交付
 

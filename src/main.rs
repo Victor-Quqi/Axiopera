@@ -35,6 +35,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List model IDs, names, defaults and supported reasoning efforts.
+    Models {
+        agent: Agent,
+        /// Working directory (default: the current one).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
     /// Start a sub-agent on a task. Returns at once with its task ID.
     Spawn {
         agent: Agent,
@@ -247,6 +254,13 @@ async fn run(cli: Cli) -> Result<i32> {
     let home = paths::default_home();
     let mut caller = None;
     let request = match cli.command {
+        Command::Models { agent, cwd } => Request::Models {
+            agent,
+            cwd: match cwd {
+                Some(c) => std::path::absolute(c)?,
+                None => std::env::current_dir()?,
+            },
+        },
         Command::Guide { host } => {
             print!("{}", guide(host, &client::detect_caller()));
             return Ok(0);

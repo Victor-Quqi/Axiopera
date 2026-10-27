@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 
 /// Bump on incompatible wire types or caller identity semantics.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// Longest accepted line; task descriptions and environments travel inline.
 const MAX_LINE: usize = 16 << 20;
@@ -61,6 +61,10 @@ pub struct Spawn {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
     Ping,
+    Models {
+        agent: Agent,
+        cwd: PathBuf,
+    },
     Stop {
         force: bool,
     },
@@ -130,7 +134,7 @@ impl Request {
     pub fn allowed_in_sandbox(&self) -> bool {
         !matches!(
             self,
-            Request::Spawn(_) | Request::Stop { .. } | Request::Gc { .. }
+            Request::Spawn(_) | Request::Models { .. } | Request::Stop { .. } | Request::Gc { .. }
         )
     }
 
@@ -138,7 +142,10 @@ impl Request {
     pub fn needs_env(&self) -> bool {
         matches!(
             self,
-            Request::Spawn(_) | Request::Send { .. } | Request::Reply { .. }
+            Request::Spawn(_)
+                | Request::Models { .. }
+                | Request::Send { .. }
+                | Request::Reply { .. }
         )
     }
 }
@@ -205,5 +212,29 @@ impl<R: AsyncRead + Unpin> Reader<R> {
         serde_json::from_str(&line)
             .map(Some)
             .map_err(std::io::Error::other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn model_queries_carry_environment_and_cannot_escape_a_sandbox() {
+        let request = Request::Models {
+            agent: Agent::Grok,
+            cwd: PathBuf::from("."),
+        };
+        assert!(request.needs_env());
+        assert!(!request.allowed_in_sandbox());
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["op"], "models");
+        assert!(matches!(
+            serde_json::from_value::<Request>(wire).unwrap(),
+            Request::Models {
+                agent: Agent::Grok,
+                ..
+            }
+        ));
     }
 }

@@ -366,7 +366,22 @@ async fn pump(
                 }
                 let ok = m["subtype"] == "success" && m["is_error"] != true;
                 let result = m["result"].as_str().unwrap_or("").to_string();
-                let error = (!ok).then(|| m["subtype"].as_str().unwrap_or("error").to_string());
+                let error = (!ok).then(|| {
+                    let errors = m["errors"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !errors.is_empty() {
+                        errors
+                    } else if m["is_error"] == true && !result.is_empty() {
+                        result.clone()
+                    } else {
+                        m["subtype"].as_str().unwrap_or("error").to_string()
+                    }
+                });
                 let mut s = state.lock().unwrap();
                 s.active = !s.inputs.0.is_empty();
                 let _ = events.send(AgentEvent::TurnEnded {
