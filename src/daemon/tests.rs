@@ -78,6 +78,196 @@ fn blocked_is_logged_without_waking_and_counted_once_per_turn() {
     }
 }
 
+#[tokio::test]
+async fn send_changes_tier_and_preserves_the_session_across_reload() {
+    for status in [
+        Status::Idle,
+        Status::Waiting,
+        Status::Failed,
+        Status::Interrupted,
+    ] {
+        let f = fixture();
+        // Hold scheduling so this test can inspect accepted input without a real CLI.
+        f.d.lock().stopping = true;
+        f.d.update("test", |t| {
+            t.session = Some("native-session".into());
+            t.turns = 3;
+            t.delivered = 2;
+            t.status = status;
+        });
+        for tier in [ipc::Tier::Full, ipc::Tier::Work, ipc::Tier::Read] {
+            let mut buf = Vec::new();
+            f.d.send(
+                "codex:host",
+                "test",
+                "continue".into(),
+                Some(tier),
+                None,
+                &mut Out::new(&mut buf),
+            )
+            .await
+            .unwrap();
+            assert!(replies(&buf).contains("queued for a new turn"));
+            let again = Daemon::load(options(&f.home), None);
+            let saved = again.lock().tasks["test"].task.clone();
+            assert_eq!(saved.tier, tier);
+            assert_eq!(saved.session.as_deref(), Some("native-session"));
+            assert_eq!((saved.turns, saved.delivered, saved.status), (3, 2, status));
+            let mut st = f.d.lock();
+            assert_eq!(st.tasks["test"].pending, ["continue"]);
+            st.tasks.get_mut("test").unwrap().pending.clear();
+        }
+    }
+}
+
+#[tokio::test]
+async fn tier_changes_reject_busy_and_closed_tasks_without_accepting_input() {
+    for case in ["running", "releasing", "pending", "cancelled", "detached"] {
+        let f = fixture();
+        f.d.lock().stopping = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        {
+            let mut st = f.d.lock();
+            let e = st.tasks.get_mut("test").unwrap();
+            match case {
+                "running" | "releasing" => {
+                    e.actor = Some(tx);
+                    e.releasing = case == "releasing";
+                }
+                "pending" => e.pending.push("previous".into()),
+                "cancelled" => e.task.status = Status::Cancelled,
+                "detached" => e.task.detached = true,
+                _ => unreachable!(),
+            }
+        }
+        let error =
+            f.d.input(
+                "user",
+                "test",
+                "new input".into(),
+                Some(ipc::Tier::Full),
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        let expected = match case {
+            "cancelled" => "was cancelled",
+            "detached" => "taken over",
+            _ => "still running or has queued input",
+        };
+        assert!(error.contains(expected), "{case}: {error}");
+        assert_eq!(f.d.lock().tasks["test"].task.tier, ipc::Tier::Read);
+        assert!(
+            !f.d.lock().tasks["test"]
+                .pending
+                .iter()
+                .any(|m| m == "new input")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
+async fn tier_changes_respect_task_ownership_and_parent_child_limits() {
+    let native = "task:test/grok:native";
+    let f = fixture_with(&[
+        json!({"id": "kid", "parent": native}),
+        json!({"id": "other", "parent": "task:test"}),
+    ]);
+    f.d.lock().stopping = true;
+    for (caller, id, expected) in [
+        (native, "test", "not your sub-task"),
+        ("task:kid", "other", "not your sub-task"),
+        ("task:test", "kid", "not your sub-task"),
+        (native, "kid", "exceeds its parent"),
+        ("user", "kid", "exceeds its parent"),
+    ] {
+        let error =
+            f.d.input(caller, id, "continue".into(), Some(ipc::Tier::Full), None)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains(expected), "{error}");
+        assert!(f.d.lock().tasks[id].pending.is_empty());
+    }
+    f.d.input(
+        "user",
+        "test",
+        "continue".into(),
+        Some(ipc::Tier::Full),
+        None,
+    )
+    .await
+    .unwrap();
+    f.d.lock().tasks.get_mut("test").unwrap().pending.clear();
+    f.d.input(
+        native,
+        "kid",
+        "continue".into(),
+        Some(ipc::Tier::Full),
+        None,
+    )
+    .await
+    .unwrap();
+    let error =
+        f.d.input(
+            "user",
+            "test",
+            "continue".into(),
+            Some(ipc::Tier::Read),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("sub-tasks above Read"), "{error}");
+    assert_eq!(f.d.lock().tasks["test"].task.tier, ipc::Tier::Full);
+    // Idle children can still resume at their saved tier and also prevent a downgrade.
+    f.d.lock().tasks.get_mut("kid").unwrap().pending.clear();
+    assert!(
+        f.d.input(
+            "user",
+            "test",
+            "continue".into(),
+            Some(ipc::Tier::Read),
+            None
+        )
+        .await
+        .is_err()
+    );
+    f.d.set_status("kid", Status::Cancelled);
+    f.d.input(
+        "user",
+        "test",
+        "continue".into(),
+        Some(ipc::Tier::Read),
+        None,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn send_without_a_tier_change_still_steers_a_running_turn() {
+    for tier in [None, Some(ipc::Tier::Read)] {
+        let f = fixture();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        f.d.lock().tasks.get_mut("test").unwrap().actor = Some(tx);
+        let receive = async {
+            let Some(Cmd::Input(input)) = rx.recv().await else {
+                panic!("expected input")
+            };
+            assert_eq!(input.text, "continue");
+            input.reply.send("sent to its running turn").unwrap();
+        };
+        let send =
+            f.d.input("codex:host", "test", "continue".into(), tier, None);
+        let (result, ()) = tokio::join!(send, receive);
+        assert_eq!(result.unwrap(), "sent to its running turn");
+    }
+}
+
 /// The text lines of a reply stream.
 fn replies(buf: &[u8]) -> String {
     buf.split(|b| *b == b'\n')
@@ -672,6 +862,7 @@ fn the_request_log_keeps_argument_names_and_ages_out_with_gc() {
     let request = Request::Send {
         task: "test".into(),
         message: "do the secret thing".into(),
+        tier: None,
     };
     let mut entry = f.d.request_entry("codex:host", &request);
     entry.as_mut().unwrap().insert("ts".into(), json!(2_000));

@@ -25,10 +25,11 @@ Get results
   Exit codes: 0 success, 1 command error, 3 nothing new yet (or wait timed out),
   4 nothing new and nothing running.
 
-Talk to a running sub-agent
+Continue a task
   axiopera send <task> "Also update the docs."    steers the running turn, or starts a new turn
                                                    in the same session if it already finished.
   Results note when they may predate your message; late messages are handled in the next turn.
+  Add --tier full to change permissions when idle.
 
 Answer questions
   Questions arrive like results; sub-agents can keep working until you answer.

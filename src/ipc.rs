@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 
 /// Bump on incompatible wire types or caller identity semantics.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
 /// Longest accepted line; task descriptions and environments travel inline.
 const MAX_LINE: usize = 16 << 20;
@@ -72,6 +72,8 @@ pub enum Request {
     Send {
         task: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tier: Option<Tier>,
     },
     /// Block until the caller's sub-tasks have news; takes nothing.
     Wait {
@@ -130,11 +132,15 @@ pub enum Request {
 
 impl Request {
     /// A sandboxed caller may talk to tasks it already has, including resuming one with `send`,
-    /// but may not create new ones outside its sandbox.
+    /// but may not create new ones or change their permissions outside its sandbox.
     pub fn allowed_in_sandbox(&self) -> bool {
         !matches!(
             self,
-            Request::Spawn(_) | Request::Models { .. } | Request::Stop { .. } | Request::Gc { .. }
+            Request::Spawn(_)
+                | Request::Models { .. }
+                | Request::Send { tier: Some(_), .. }
+                | Request::Stop { .. }
+                | Request::Gc { .. }
         )
     }
 
@@ -218,6 +224,23 @@ impl<R: AsyncRead + Unpin> Reader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_tier_requires_an_unrestricted_caller() {
+        let old: Request =
+            serde_json::from_str(r#"{"op":"send","task":"t1","message":"continue"}"#).unwrap();
+        assert!(old.allowed_in_sandbox());
+        assert!(old.needs_env());
+        for tier in ["read", "work", "full"] {
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "op": "send", "task": "t1", "message": "continue", "tier": tier,
+            }))
+            .unwrap();
+            assert!(!request.allowed_in_sandbox());
+            assert!(request.needs_env());
+            assert_eq!(serde_json::to_value(&request).unwrap()["tier"], tier);
+        }
+    }
 
     #[test]
     fn model_queries_carry_environment_and_cannot_escape_a_sandbox() {

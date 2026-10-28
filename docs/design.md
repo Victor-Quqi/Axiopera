@@ -10,6 +10,8 @@
 
 采用按需启动的 daemon，是为了让任务脱离宿主的进程树并持续运行。每个任务只在运行轮次时持有原生进程，空闲后释放，下次通过原生 resume 继续。会话的并发写入差异见[后端文档](backends.md#会话与消息)。
 
+`send --tier` 在同一把状态锁内检查调用方、父子档位和任务是否已释放进程且没有排队输入，持久化新档位后接收消息。下一次启动同时使用新档位和原生会话 ID。派发子任务在插入状态表前再次检查父任务档位，防止注册宿主期间父任务降档。已取消或脱管的子任务不参与降档检查。
+
 任务状态如下：
 
 | 状态 | 含义 |
@@ -79,7 +81,7 @@ Windows 使用命名管道，DACL 放行当前用户 SID 和登录会话 SID，�
 
 一个连接处理一个请求。CLI 发送一行 JSON，带协议版本、调用方和 cwd；`spawn`、`send`、`reply`、`models` 还带环境。daemon 输出若干行，最后一行携带退出码或错误。
 
-daemon 在受限客户端上拒绝 `spawn`、`models`、`gc` 和 `daemon stop`。Windows 客户端在启动 daemon 或执行这些命令前也检查自身令牌。
+daemon 在受限客户端上拒绝 `spawn`、`models`、带 `--tier` 的 `send`、`gc` 和 `daemon stop`。Windows 客户端在启动 daemon 或执行这些命令前也检查自身令牌。
 
 - Windows 在收到第一行数据后模拟客户端身份，用 `IsTokenRestricted` 检查令牌；读取失败也按受限处理。
 - Linux 比较对端与 daemon 的 `NoNewPrivs`、`Seccomp_filters`，任一项更高就按受限处理。已带 `NoNewPrivs` 的容器中，只叠加 Landlock 而不增加 seccomp 的限制无法这样识别。

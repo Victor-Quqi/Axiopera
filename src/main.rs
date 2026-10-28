@@ -70,6 +70,9 @@ enum Command {
     /// Message a task: steers its running turn, or starts a new turn in the same session.
     Send {
         task: String,
+        /// Change permissions when resuming an idle task in the same session.
+        #[arg(long, value_enum)]
+        tier: Option<Tier>,
         /// The message. Use `-f FILE`, or `-` to read it from stdin.
         message: Vec<String>,
         #[arg(short = 'f', long = "file")]
@@ -315,10 +318,12 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Command::Send {
             task,
+            tier,
             message,
             file,
         } => Request::Send {
             task,
+            tier,
             message: task_text(message, file)?,
         },
         Command::Wait { tasks, timeout } => Request::Wait {
@@ -438,6 +443,7 @@ mod tests {
                         task,
                         message,
                         file,
+                        ..
                     } => {
                         assert_eq!(task, id);
                         (message, file)

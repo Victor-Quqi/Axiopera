@@ -659,9 +659,11 @@ impl Daemon {
                 self.spawn(&caller, spawn, env.env.unwrap_or_default(), out)
                     .await
             }
-            Request::Send { task, message } => {
-                self.send(&caller, &task, message, env.env, out).await
-            }
+            Request::Send {
+                task,
+                message,
+                tier,
+            } => self.send(&caller, &task, message, tier, env.env, out).await,
             Request::Wait { tasks, timeout_ms } => {
                 self.wait(&caller, &tasks, timeout_ms, out).await
             }
@@ -885,6 +887,17 @@ impl Daemon {
                 let _ = self.store.remove(&id);
                 return refuse(ErrorCode::Invalid, why);
             }
+            // The parent may have changed tier while host registration was awaiting I/O.
+            if let Some(parent) = identity::task_of(caller)
+                && st.tasks.get(parent).is_none_or(|p| s.tier > p.task.tier)
+            {
+                drop(st);
+                let _ = self.store.remove(&id);
+                return refuse(
+                    ErrorCode::Invalid,
+                    "the requested tier exceeds the parent task's tier",
+                );
+            }
             let entry = Entry {
                 blocked: 0,
                 notices: Vec::new(),
@@ -1020,21 +1033,29 @@ impl Daemon {
         caller: &str,
         reference: &str,
         message: String,
+        tier: Option<ipc::Tier>,
         env: Option<Vec<(String, String)>>,
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
         let id = self.find(caller, reference)?;
-        let how = self.input(&id, message, env).await?;
-        out.text(format!("{id}: {how}"), json!({"task": id, "result": how}))
-            .await?;
+        let how = self.input(caller, &id, message, tier, env).await?;
+        let mut text = format!("{id}: {how}");
+        let mut data = json!({"task": id, "result": how});
+        if let Some(tier) = tier {
+            text.push_str(&format!("; tier {}", render::tier_name(tier)));
+            data["tier"] = json!(tier);
+        }
+        out.text(text, data).await?;
         Ok(ipc::exit::OK)
     }
 
     /// Hand a message to a task: into its running turn, or as the input of a new one.
     async fn input(
         self: &Arc<Self>,
+        caller: &str,
         id: &str,
         message: String,
+        tier: Option<ipc::Tier>,
         env: Option<Vec<(String, String)>>,
     ) -> Result<&'static str> {
         let (reply, receive) = oneshot::channel();
@@ -1044,7 +1065,7 @@ impl Daemon {
         };
         let handed = 'handoff: {
             let mut st = self.lock();
-            let Some(entry) = st.tasks.get_mut(id) else {
+            let Some(entry) = st.tasks.get(id) else {
                 return refuse(ErrorCode::NotFound, format!("no task {id}"));
             };
             if entry.task.status.is_final() {
@@ -1056,6 +1077,48 @@ impl Daemon {
                     format!("{id} was taken over outside axiopera"),
                 );
             }
+            if let Some(tier) = tier.filter(|tier| *tier != entry.task.tier) {
+                if identity::task_of(caller).is_some() && entry.task.parent != caller {
+                    return refuse(ErrorCode::Invalid, format!("{id} is not your sub-task"));
+                }
+                if entry.actor.is_some() || !entry.pending.is_empty() {
+                    return refuse(
+                        ErrorCode::Invalid,
+                        format!(
+                            "{id} is still running or has queued input; wait until it is idle before changing --tier"
+                        ),
+                    );
+                }
+                if let Some(parent) = identity::task_of(&entry.task.parent)
+                    && st.tasks.get(parent).is_none_or(|p| tier > p.task.tier)
+                {
+                    return refuse(
+                        ErrorCode::Invalid,
+                        format!("{id} cannot use {tier:?}: it exceeds its parent task's tier"),
+                    );
+                }
+                if st.tasks.values().any(|e| {
+                    identity::task_of(&e.task.parent) == Some(id)
+                        && !e.task.status.is_final()
+                        && !e.task.detached
+                        && e.task.tier > tier
+                }) {
+                    return refuse(
+                        ErrorCode::Invalid,
+                        format!(
+                            "{id} has sub-tasks above {tier:?}; lower their tiers or cancel them first"
+                        ),
+                    );
+                }
+                // Persist before accepting the input, under the same lock as scheduling and
+                // permission checks. A failed save leaves both tier and message unchanged.
+                let mut task = entry.task.clone();
+                task.tier = tier;
+                task.updated_ms = store::now_ms();
+                self.store.save(&task)?;
+                st.tasks.get_mut(id).unwrap().task = task;
+            }
+            let entry = st.tasks.get_mut(id).unwrap();
             if entry.env.is_none() {
                 entry.env = env;
             }
@@ -1173,7 +1236,7 @@ impl Daemon {
             "[axiopera] Answer to your question {qid} (\"{}\"):\n{answer}",
             agent::clip(&question, 300)
         );
-        let how = match self.input(&task, message, env).await {
+        let how = match self.input(caller, &task, message, None, env).await {
             Ok(how) => how,
             Err(e) => {
                 // Not delivered (the task was taken over or cancelled): leave it open.

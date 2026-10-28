@@ -656,7 +656,7 @@ mod tests {
             Next::Stop(Exit::Released)
         ));
         assert_eq!(
-            f.d.input("test", "during shutdown".into(), None)
+            f.d.input("codex:host", "test", "during shutdown".into(), None, None)
                 .await
                 .unwrap(),
             "queued for a new turn"
