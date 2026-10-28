@@ -6,7 +6,7 @@
 
 | 平台 | 已验证范围 | CLI 版本 |
 |---|---|---|
-| Windows 11 | 三家互相派发、中途消息、续接、取消；read 档 MCP、消息确认、Codex elevated sandbox、宿主通知和 Codex 插件另有补测；Codex 0.164.0 还补测了作为宿主的端到端流程和中途消息 | 基础端到端为 Claude Code 2.1.296、Codex 0.162.1、Grok 1.0.52；补测为 Claude Code 2.1.302 至 2.1.309 及其 VS Code 扩展 2.1.301、Codex 0.163.0 和 0.164.0（推送所连 daemon 为 0.160.0）、Codex 桌面端内置 0.162.0-alpha.17.2 和 0.163.0-alpha.10.2、Grok 1.0.62 和 1.0.67 |
+| Windows 11 | 三家互相派发、中途消息、续接、取消；read 档 MCP、消息确认、Codex elevated sandbox、宿主通知和 Codex 插件另有补测；Codex 0.164.0 还补测了作为宿主的端到端流程和中途消息 | 基础端到端为 Claude Code 2.1.296、Codex 0.162.1、Grok 1.0.52；补测为 Claude Code 2.1.302 至 2.1.312 及其 VS Code 扩展 2.1.301、Codex 0.163.0 和 0.164.0（推送所连 daemon 为 0.160.0）、Codex 桌面端内置 0.162.0-alpha.17.2 和 0.163.0-alpha.10.2、Grok 1.0.62 和 1.0.67 |
 | Linux，WSL2 Ubuntu 24.04 | 三家原生 Linux CLI 的端到端流程、sandbox 回连、进程组取消和 Codex 宿主推送 | Claude Code 2.1.296、Codex 0.162.1、Grok 1.0.52 |
 | macOS | 有平台实现，真实 agent、sandbox 检测及回连尚未实测 | 未验证 |
 
@@ -41,6 +41,7 @@
 | [会话与消息](backends.md#会话与消息)：Grok 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `grok_native_identity.py`，Windows、Grok 1.0.67，2026-10-26：直接启动使用 auto，经 Axiopera 启动使用 work，再各派一个原生子 agent；原生子 agent 实际派发只读 Axiopera 任务，主代理先 `inbox` 未取走结果，子 agent 随后成功收取；另用采集的身份与预置结果检查原任务及子会话的归属 |
 | [会话与消息](backends.md#会话与消息)：Codex 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `codex_native_identity.py`，Windows、Codex 0.164.0，2026-10-26：直接启动使用 `danger-full-access`，经 Axiopera 启动使用 full，再各派一个原生子 agent；原生子 agent 实际派发只读 Axiopera 任务，主代理先 `inbox` 未取走结果，子 agent 随后成功收取；另用采集的身份与预置结果检查原任务及子线程的归属 |
 | [宿主通知](backends.md#宿主通知)：Claude 和 Grok 在本轮进行中能否收到后台命令的完成通知 | `background.py busy` |
+| [宿主通知](backends.md#宿主通知)：Claude 内置子 agent 和 agent team teammate 空闲时能否被唤醒 | 手动实验，Windows、Claude Code 2.1.312，2026-10-29：内置子 agent 和 in-process teammate 各后台运行 30 秒命令后结束本轮，用标记文件判断唤醒；子 agent 被唤醒，teammate 直到收到消息并再调用一次工具才收到通知；teammate 的 Monitor 事件同样不唤醒它。端到端：子 agent 后台运行 `axiopera wait` 后被唤醒并取到结果；teammate 前台运行 `wait`，自行调长 Bash 超时，等待 2 分 45 秒后取到结果。只给 guide 的取结果说明时，按现写法 3 个普通子 agent 后台运行 `wait`、2 个 teammate 前台运行，全部带任务 ID；不点明 `team-lead` 时普通子 agent 会自认 teammate，任务 ID 一句不说明共享收件箱或不以子 agent 为主语时常被跳过。已知问题见 [claude-code#91503](https://github.com/anthropics/claude-code/issues/91503) |
 | [宿主通知](backends.md#宿主通知)：Codex 推送通道，以及 TUI 退出后会话的卸载时间 | `codex_host_push.py`；手动实验：TUI 退出后轮询 `thread/loaded/list`，daemon 0.160.0 和 `--remote` 连接的 0.164.0 app-server 各一次；源码 0.162.0 [config_toml.rs](https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/config/src/config_toml.rs#L346-L348)、0.164.0 [config_toml.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/config/src/config_toml.rs#L349-L352) |
 | [宿主通知](backends.md#宿主通知)：只开关 feature 的 `-c` 不让 TUI 离开共享 daemon | 源码 Codex 0.164.0 [daemon_startup.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/tui/src/daemon_startup.rs#L90-L126) |
 | [宿主通知](backends.md#宿主通知)：Codex 门铃，包括宿主自行 `inbox` 后撤回提醒；app-server 客户端会话的来源为 `vscode` | `codex_doorbell.py` |
