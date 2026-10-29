@@ -69,6 +69,8 @@ Codex decline 不能带拒绝理由，适配器另用 steer 送入理由。Grok 
 
 模型列表通过原生进程查询，保留可直接选用的 ID，包括别名和第三方模型。查询只握手和读取目录：Claude 取 stream-json `initialize` 响应的 `models`；Codex 取 app-server `model/list` 并遍历分页；Grok 取 ACP 扩展 `_x.ai/models/list`。旧版缺少接口时返回错误。
 
+Claude 的 `resolvedModel` 保留为 `resolved_model`，缺失时只显示原 ID。Claude 的 `default` 入口和 Codex 的 `isDefault` 记录为 `default_model`；Grok 的 `currentModelId` 记录为 `current_model`。
+
 Claude 查询使用 `--no-session-persistence`，通过单次参数关闭 hook 和 MCP 启动。Codex、Grok 查询不创建线程或会话。进程退出、查询结束或超时后回收进程树。目录来源和账号调用权限由各后端管理，Axiopera 不额外推断。
 
 ## 会话与消息

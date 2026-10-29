@@ -19,6 +19,8 @@ pub struct Catalog {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub configured_model: Option<String>,
 }
 
@@ -38,28 +40,47 @@ pub struct Model {
 }
 
 impl Catalog {
-    pub fn render(&self) -> String {
+    pub fn render(&self, agent: Agent) -> String {
         let mut lines = Vec::new();
+        let default_label = match agent {
+            Agent::Claude => "account default",
+            _ => "backend default",
+        };
         if let Some(model) = &self.configured_model {
             lines.push(format!("Configured model: {}", single_line(model)));
         }
         if self.models.is_empty() {
             lines.push("No models returned.".into());
         }
-        if let Some(default) = &self.default_model
-            && !self.models.iter().any(|m| &m.id == default)
-        {
-            lines.push(format!("Default model: {}", single_line(default)));
+        for (label, model) in [
+            (default_label, &self.default_model),
+            ("current", &self.current_model),
+        ] {
+            if let Some(model) = model
+                && !self.models.iter().any(|m| &m.id == model)
+            {
+                lines.push(format!("{}  ({label})", single_line(model)));
+            }
         }
         for model in &self.models {
             let mut row = single_line(&model.id);
+            if let Some(resolved) = &model.resolved_model
+                && !resolved.is_empty()
+                && resolved != &model.id
+            {
+                row.push_str(&format!(" → {}", single_line(resolved)));
+            }
             if let Some(name) = &model.name
-                && name != &model.id
+                && name_key(name) != name_key(&model.id)
+                && !(agent == Agent::Claude && model.id == "default")
             {
                 row.push_str(&format!("  {}", single_line(name)));
             }
             if self.default_model.as_deref() == Some(&model.id) {
-                row.push_str("  (default)");
+                row.push_str(&format!("  ({default_label})"));
+            }
+            if self.current_model.as_deref() == Some(&model.id) {
+                row.push_str("  (current)");
             }
             if model.disabled == Some(true) {
                 row.push_str("  (disabled)");
@@ -80,6 +101,13 @@ impl Catalog {
         }
         lines.join("\n")
     }
+}
+
+fn name_key(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn single_line(s: &str) -> String {
@@ -284,7 +312,7 @@ async fn discover(
             }
             let payload = response.get("result").unwrap_or(&response);
             catalog.models = parse_models(agent, &payload["availableModels"])?;
-            catalog.default_model = string(payload, "currentModelId");
+            catalog.current_model = string(payload, "currentModelId");
         }
     }
     Ok(catalog)
@@ -463,10 +491,27 @@ mod tests {
             ["first", "second"]
         );
         assert_eq!(codex.default_model.as_deref(), Some("second"));
+        assert!(
+            codex
+                .render(Agent::Codex)
+                .contains("second  (backend default)")
+        );
         let grok = fixture(Agent::Grok, "ok", timeout).await.unwrap();
-        assert_eq!(grok.default_model.as_deref(), Some("company-claude"));
+        assert_eq!(grok.current_model.as_deref(), Some("company-claude"));
+        assert!(grok.default_model.is_none());
+        assert_eq!(
+            grok.render(Agent::Grok),
+            "company-claude  Claude  (current)"
+        );
+        let json = serde_json::to_value(&grok).unwrap();
+        assert_eq!(json["current_model"], "company-claude");
+        assert!(json.get("default_model").is_none());
         let claude = fixture(Agent::Claude, "ok", timeout).await.unwrap();
         assert_eq!(claude.default_model.as_deref(), Some("default"));
+        assert_eq!(
+            claude.render(Agent::Claude),
+            "default  (account default)\nrestricted  (disabled)"
+        );
         assert_eq!(claude.models[1].disabled, Some(true));
         assert!(
             fixture(Agent::Codex, "repeat", timeout)
@@ -545,17 +590,43 @@ mod tests {
     #[test]
     fn text_is_compact_and_json_keeps_description() {
         let catalog = Catalog {
-            models: parse_models(Agent::Claude, &json!([{"value":"sonnet","displayName":"sonnet","description":"Daily work","supportedEffortLevels":["low","high"]}])).unwrap(),
-            default_model: Some("sonnet".into()),
+            models: parse_models(Agent::Claude, &json!([
+                {"value":"default","displayName":"Default (recommended)","resolvedModel":"claude-opus","description":"Account default","supportedEffortLevels":["low","high"]},
+                {"value":"opus","displayName":"Opus","resolvedModel":"claude-opus"},
+                {"value":"claude-sonnet","displayName":"Claude Sonnet","resolvedModel":"claude-sonnet"},
+                {"value":"custom","displayName":"Team model","resolvedModel":""}
+            ])).unwrap(),
+            default_model: Some("default".into()),
             configured_model: Some("custom".into()),
+            ..Catalog::default()
         };
         assert_eq!(
-            catalog.render(),
-            "Configured model: custom\nsonnet  (default)  effort: low, high"
+            catalog.render(Agent::Claude),
+            "Configured model: custom\ndefault → claude-opus  (account default)  effort: low, high\nopus → claude-opus\nclaude-sonnet\ncustom  Team model"
         );
+        let json = serde_json::to_value(&catalog).unwrap();
+        assert_eq!(json["models"][0]["description"], "Account default");
+        assert_eq!(json["models"][0]["name"], "Default (recommended)");
+        assert_eq!(json["models"][0]["resolved_model"], "claude-opus");
+    }
+
+    #[test]
+    fn selections_outside_the_catalog_are_visible() {
+        let catalog = Catalog {
+            current_model: Some("custom".into()),
+            ..Catalog::default()
+        };
         assert_eq!(
-            serde_json::to_value(&catalog).unwrap()["models"][0]["description"],
-            "Daily work"
+            catalog.render(Agent::Grok),
+            "No models returned.\ncustom  (current)"
+        );
+        let catalog = Catalog {
+            default_model: Some("custom".into()),
+            ..Catalog::default()
+        };
+        assert_eq!(
+            catalog.render(Agent::Codex),
+            "No models returned.\ncustom  (backend default)"
         );
     }
 }

@@ -437,7 +437,7 @@ async fn model_error(d: &Daemon, id: &str, error: String) -> String {
         Some(catalog) if !catalog.models.is_empty() => format!(
             "{error}\n\n{}:\n{}",
             agent::models::command(agent),
-            catalog.render()
+            catalog.render(agent)
         ),
         _ => format!(
             "{error}\nRun `{}` to query models and supported reasoning efforts.",

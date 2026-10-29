@@ -625,7 +625,7 @@ impl Daemon {
                         Duration::from_secs(20),
                     )
                     .await?;
-                out.text(catalog.render(), serde_json::to_value(&catalog)?)
+                out.text(catalog.render(agent), serde_json::to_value(&catalog)?)
                     .await?;
                 Ok(ipc::exit::OK)
             }
