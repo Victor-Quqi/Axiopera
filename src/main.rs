@@ -35,7 +35,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List model IDs, names, defaults and supported reasoning efforts.
+    /// List model IDs, resolved aliases and supported reasoning efforts.
     Models {
         agent: Agent,
         /// Working directory (default: the current one).

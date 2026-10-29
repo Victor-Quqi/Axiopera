@@ -9,7 +9,7 @@ Dispatch
   Tiers: read (look, don't change; MCP: read-only tools only, none on Grok),
          work (default: the agent's own auto mode), full (the agent's full-access mode).
   Options: --model, --effort, --name (use it instead of the ID), --cwd, --timeout 30m.
-  axiopera models <agent> lists model IDs, names, defaults and supported reasoning efforts.
+  axiopera models <agent> lists --model IDs and --effort values; --json includes descriptions.
 
 Get results
   axiopera inbox           takes what your sub-tasks have for you: results, questions, approval

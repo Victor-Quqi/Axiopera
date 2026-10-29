@@ -50,7 +50,7 @@ model = "haiku"
 
 同样支持 `[agents.codex]`、`[agents.grok]`。`--model` 覆盖默认模型。`path` 必须指向真实可执行文件；Windows 上应使用 `.exe`。省略时按[后端的路径查找规则](backends.md#可执行文件与配置继承)定位。
 
-`axiopera models <agent>` 查询模型 ID、名称、默认模型和支持的推理强度。`--cwd` 指定工作目录，默认当前目录。`--json` 还保留后端提供的说明、别名解析后的模型 ID 和禁用状态。与 ID 相同的名称在文本中省略；Axiopera 配置的模型覆盖值单独注明。
+`axiopera models <agent>` 查询模型 ID 和支持的推理强度。别名有解析结果时显示为 `别名 → 具体模型 ID`；重复名称省略，说明保留在 `--json`。`account default` 是 Claude 的账户默认入口，`backend default` 是 Codex 的后端默认，`current` 是 Grok 查询进程的当前选择。Axiopera 配置覆盖单列为 `Configured model`。`--cwd` 指定工作目录，默认当前目录。
 
 查询沿用后端的目录发现和缓存，最多等待 20 秒。模型 ID 可直接用于 `spawn --model`，列表中的推理强度可用于 `--effort`。参数仍按原样传给后端。后端明确报告模型或推理强度无效时，错误后附查询结果；自动查询最多等待 5 秒，失败或返回空列表时附查询命令。认证、权限、额度和网络错误保持原报错。
 
