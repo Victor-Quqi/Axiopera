@@ -104,7 +104,7 @@ Codex 和 Grok 内置子 agent 的终端命令分别带有独立的 `CODEX_THREA
 | Claude Code，含 VS Code 扩展 | 自动开启一轮 | 下一次工具调用前送达 | 后台运行 `wait`，退出后 `inbox` |
 | Grok | 自动开启一轮 | 用 monitor 时下一次工具调用后送达；后台命令等本轮结束 | 用 monitor 运行 `watch`，再 `inbox` |
 | Codex TUI | 自动开启一轮 | 送入当前轮 | 推送 |
-| Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 等本轮结束；桌面端装了[插件](usage.md#skill-与-codex-插件)时，下一次工具调用后提醒 | 门铃，插件 hook |
+| Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 默认等本轮结束；启用[插件](usage.md#skill-与-codex-插件) hook 后，下一次工具调用后提醒 | 门铃，插件 hook |
 | 其他 Codex 会话 | 不唤醒 | 不送达 | 轮询 `wait`，再 `inbox` |
 
 Claude 和 Grok 由宿主进程在后台命令退出时唤醒，与界面无关。Claude 的内置子 agent 同样会被唤醒；agent team 的 teammate 空闲时不会被后台命令或 Monitor 唤醒，完成通知要等消息让它开启下一轮、再调用一次工具后才送达，因此 teammate 在前台运行 `wait`。子 agent 都会收到同会话可寻址 agent 的名单，普通子 agent 会因此自认 teammate；只有 teammate 收到的消息标明来自 `team-lead`，guide 用它区分两者。分屏模式的 teammate 未验证。Grok 的 monitor 把命令的每行输出作为一个事件：宿主忙时在当前这次工具调用之后送入本轮，空闲时开启一轮。monitor 每行保留 500 字节，最多连发 10 个事件，之后每 2 秒补 1 个，超出的丢弃；命令自行退出时，最后几行可能丢失。monitor 启动的命令没有 `GROK_SESSION_ID`，因此 `watch` 用 `--caller grok:<会话>` 指明调用方；`guide` 直接给出填好调用方的命令：Grok 会话填会话 ID，Grok 子 agent 填任务 ID。无人值守的 `grok -p` 默认等所有后台任务结束才退出，而 persistent monitor 不会自行结束，因此这样运行 Grok 时加 `--no-wait-for-background`，该选项不在 `--help` 中列出。Axiopera 不向 Claude inbox socket 推送，因为 Linux 上脱离宿主进程树的 daemon 会触发入站批准，而且该接口没有送达回执。

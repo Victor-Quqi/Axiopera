@@ -73,7 +73,7 @@ Codex 插件包含同一个 skill，另带 hook，让宿主在一轮进行中也
 - 安装：`codex plugin marketplace add Victor-Quqi/Axiopera`，再 `codex plugin add axiopera@axiopera`。
 - 卸载：`codex plugin remove axiopera@axiopera`，再 `codex plugin marketplace remove axiopera`。
 
-hook 信任后才运行。桌面端在插件页信任；TUI 启动时发现新的或改动过的 hook 会弹出确认，也可以在 `/hooks` 中信任。hook 定义改动后需重新信任；Codex 0.164 起，插件中任何文件改动都需重新信任，包括升级插件。VS Code 扩展官方不支持插件。工具调用之后，如果有新的结果、提问或审批请求，hook 列出每条的一行摘要，提醒宿主运行 `inbox`；一轮结束时仍未取走的，由门铃在本轮结束后提醒。
+hook 信任后才运行。桌面端在插件页信任；TUI 启动时发现新的或改动过的 hook 会弹出确认，也可以在 `/hooks` 中信任。hook 定义改动后需重新信任；Codex 0.164 起，插件中任何文件改动都需重新信任，包括升级插件。工具调用之后，如果有新的结果、提问或审批请求，hook 列出每条的一行摘要，提醒宿主运行 `inbox`；一轮结束时仍未取走的，由门铃在本轮结束后提醒。
 
 装了插件后，Codex 每个会话都会启动一个 `axiopera mcp --codex-hooks` 进程。hook 只查询已在运行的 daemon，不会启动它；没有相关任务时立即返回。实测进程启动不到 0.1 秒，每次 hook 调用不到 1 毫秒。删除 `axiopera` 程序前先卸载插件，否则 Codex 无法启动这个进程。卸载不会结束已打开会话中的这个进程，需要时手动结束。
 

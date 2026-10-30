@@ -2,62 +2,68 @@
 
 [简体中文](README.zh-CN.md)
 
-Lightweight, minimally invasive collaboration for coding agents.
+**Lighter, more efficient, easier agent collaboration with minimal setup changes.**
 
-Bring Claude Code, Codex, and Grok Build together with a single executable. Keep your existing tools and sign-ins, and start delegating tasks with a few commands.
+Axiopera connects Claude Code, Codex, and Grok Build.
 
-Ask Codex to review Claude's changes, split a task across models, or leave a longer job running after your session ends.
+In Claude Code, ask:
 
-- Send new instructions while a task is running.
-- Let agents ask questions and exchange notes.
-- Give each task its own model and permissions.
-- Continue a task in its original agent CLI when you want to take over.
+> Have Codex and Grok review these changes, then fix the issues they find.
 
-Each agent starts with the task description you provide. Include the context it needs.
+Advantages:
+
+- One executable + one skill.
+- Uses your existing agent sign-ins and usage allowances.
+- Leaves agent configuration unchanged by default.
+- About one line for skill discovery; instructions load on demand.
+- All three sub-agents support Steer: add instructions and change direction while they run.
+- All three lead agents can [receive sub-task messages](docs/backends.md#宿主通知) while working and follow up.
 
 ## Install
 
-Install and sign in to the agent CLIs you want to use. Axiopera uses those existing accounts.
+Install and sign in to the agent CLIs you want to use.
 
-Download the archive for your system from [GitHub Releases](https://github.com/Victor-Quqi/Axiopera/releases), extract it, and put `axiopera` or `axiopera.exe` in a directory on your PATH.
+**1. Install the executable**
 
-Or install from [crates.io](https://crates.io/crates/axiopera) with Rust:
+Download and extract your platform's archive from [Releases](https://github.com/Victor-Quqi/Axiopera/releases). Put `axiopera` or `axiopera.exe` on your PATH.
 
-```sh
-cargo install axiopera --locked
-axiopera --version
-```
+With Rust: `cargo install axiopera --locked`.
 
-Windows and Linux have been tested; macOS still needs validation. See the [tested versions](docs/verification.md#已测版本).
+Windows and Linux tested; macOS awaits validation. [Test coverage](docs/verification.md#已测版本)
 
-## Get started
+**2. Install the skill (recommended)**
 
-Give your coding agent the Axiopera skill, so it knows how to delegate: copy the [`plugins/axiopera/skills/axiopera`](plugins/axiopera/skills/axiopera) folder into `~/.claude/skills/` for Claude Code, or into `~/.agents/skills/` for Codex. Grok reads both.
+Copy the [`axiopera` folder](plugins/axiopera/skills/axiopera) to your agent's location, then start a new session:
 
-In Codex you can install the plugin instead. Besides the skill, it lets a busy session know when its sub-tasks have news:
+| Agent | Skill location |
+|---|---|
+| Claude Code | `~/.claude/skills/axiopera/` |
+| Codex | `~/.agents/skills/axiopera/` |
+| Grok Build | `~/.grok/skills/axiopera/` |
+
+<details>
+<summary>Codex desktop / VS Code: plugin for mid-turn notifications</summary>
+
+**For Codex TUI, the skill is enough. Axiopera pushes messages into the active turn directly.**
+
+Desktop and VS Code normally receive notifications after the current turn ends. The plugin delivers them after the next tool call through a hook.
+
+The plugin includes the skill. Install through the CLI, trust its hooks, then start a new session:
 
 ```sh
 codex plugin marketplace add Victor-Quqi/Axiopera
 codex plugin add axiopera@axiopera
 ```
 
-The [usage guide](docs/usage.md#skill-与-codex-插件) covers the hooks and uninstalling.
+</details>
 
-Or add this to your agent's project instructions instead:
+## Documentation
 
-> When delegating tasks through Axiopera, first run `axiopera guide --host <your harness: claude, codex or grok>`.
+[Usage and configuration](docs/usage.md) · [Permissions and messaging](docs/backends.md) · [Development](docs/development.md). Currently in Chinese.
 
-Or try a task from your terminal:
+## Friends
 
-```sh
-axiopera spawn codex --tier read --name review "Review this repository and report the issues most worth fixing."
-axiopera wait review
-axiopera inbox review
-```
-
-The task starts in the background. `wait` blocks until it has news, `inbox` takes its answer, and `send` lets you follow up in the same conversation.
-
-See the [agent guide](src/guide.md) for more examples, or run `axiopera --help`. The [usage and configuration guide](docs/usage.md) is currently in Chinese.
+[linux.do](https://linux.do)
 
 ## License
 
