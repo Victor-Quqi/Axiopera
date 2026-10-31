@@ -117,6 +117,7 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
         }
         "input_read" => format!("{who} parent message included in the turn's model input"),
         "tool" => format!("{who} {}: {}", s("name"), s("detail")),
+        "said" => format!("{who} says: {}", clip(&s("text"), LINE)),
         "file_changed" => format!("{who} changed {}", s("path")),
         "blocked" => format!("{who} blocked: {}", s("detail")),
         "notice" => format!("{who} notice: {}", s("text")),

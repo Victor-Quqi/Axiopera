@@ -533,6 +533,7 @@ mod tests {
             "steered",
             "input_read",
             "tool",
+            "said",
             "file_changed",
             "message",
             "detached",

@@ -878,6 +878,7 @@ impl Daemon {
             created_ms: now,
             updated_ms: now,
         };
+        self.store.save_prompt(&id, &s.task)?;
         self.store.save(&task)?;
         {
             let mut st = self.lock();

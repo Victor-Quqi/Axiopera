@@ -83,6 +83,7 @@ Claude 查询使用 `--no-session-persistence`，通过单次参数关闭 hook �
 | 开始一轮 | stdin user 消息 | `turn/start` | `session/prompt` |
 | 中途消息 | stdin user 消息 | `turn/steer` | `_x.ai/interject` |
 | 中断 | interrupt control request | `turn/interrupt` | `session/cancel` |
+| agent 说的话 | assistant 消息的 text block | 完成的 `agentMessage` | `agent_message_chunk` 累积到下一次工具调用、`response_completed` 或轮末 |
 | 最终结果 | `result.result` | 最后一条 `agentMessage` | 最后一段答复中，最后一次工具调用之后的文字 |
 
 Claude read 档另加 `--permission-prompt-tool stdio`，只加 `host` 时收不到该档位的审批请求。

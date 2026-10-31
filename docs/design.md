@@ -44,6 +44,7 @@
     daemon.log
     requests.jsonl
   tasks/<id>/
+    prompt.md
     task.json
     events.jsonl
     turns/<n>.md
@@ -51,7 +52,7 @@
   ledger.json
 ```
 
-`task.json` 记录状态、工作目录和原生会话，写临时文件后原子替换。`events.jsonl` 只追加。`ledger.json` 保存游标、结果交付标记、Codex 推送目标、待确认批次和已排入的门铃。事件序号在整个 daemon 内单调递增，重启后继续；清理前先把当前序号记入 ledger，任务全被删除后也不会回退。
+`prompt.md` 是派发时的任务文本，先于 `task.json` 写入，读到任务的人都能读到它；之后 `send` 的消息不保存。`task.json` 记录状态、工作目录和原生会话，写临时文件后原子替换。`events.jsonl` 只追加。`ledger.json` 保存游标、结果交付标记、Codex 推送目标、待确认批次和已排入的门铃。事件序号在整个 daemon 内单调递增，重启后继续；清理前先把当前序号记入 ledger，任务全被删除后也不会回退。
 
 提问和答案随任务保存。审批应答通道、尚未送出的兄弟留言和消息消费跟踪 ID 只保存在内存中。
 
@@ -111,7 +112,7 @@ daemon 用调用方经 IPC 传来的环境启动子 agent。环境只留在内�
 
 其中兄弟留言抄送、交接通知和调用方自己发起的取消不算新消息：不让 `wait` 返回，不触发推送和提醒，随下一次 `inbox` 一起交出。超时或其他调用方的取消仍算新消息。
 
-spawned、turn_started、steered、input_read、tool、file_changed、answered、approved、denied、blocked、notice 只写事件日志。`blocked` 在轮末汇总次数，避免每次拒绝都提醒主 agent。`notice` 是适配器发现的后端设置问题，原文附在下一条轮末结果上。改动文件从工具事件提取，共享目录下的 Git diff 无法归属到某个任务。
+spawned、turn_started、steered、input_read、tool、said、file_changed、answered、approved、denied、blocked、notice 只写事件日志。`said` 是子 agent 写完的一段话，截到 500 个字符，换行记为 `↵`；每轮最后一段同时是结果，全文在 `turns/<n>.md`。`blocked` 在轮末汇总次数，避免每次拒绝都提醒主 agent。`notice` 是适配器发现的后端设置问题，原文附在下一条轮末结果上。改动文件从工具事件提取，共享目录下的 Git diff 无法归属到某个任务。
 
 `wait` 只等不取，`inbox` 只取不等。游标按调用方和任务保存，只有 `inbox` 和推送推进游标；指定任务时不会消费其他任务的事件。结果正文的交付标记独立于游标，正文实际写给客户端后才标记。再次取正文的规则见[使用文档](usage.md#结果与接管)。
 

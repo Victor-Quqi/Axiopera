@@ -87,6 +87,10 @@ impl InputTracking {
 // drain and background wake can race turn_completed, with no consumed notification.
 const GROK_GRACE: Duration = Duration::from_secs(1);
 
+/// Characters of an agent's message kept in its `said` event; the whole of the last one is the
+/// turn's result.
+const SAID: usize = 500;
+
 enum Exit {
     Released,
     Failed(String),
@@ -272,6 +276,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                         }
                     }
                     AgentEvent::Tool { name, detail } => d.emit(id, "tool", json!({"name": name, "detail": detail})),
+                    AgentEvent::Said(text) => d.emit(id, "said", json!({"text": agent::clip(&text, SAID)})),
                     AgentEvent::FileChanged(path) => {
                         d.update(id, |t| {
                             if !t.changed_files.contains(&path) {

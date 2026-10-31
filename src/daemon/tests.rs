@@ -62,6 +62,7 @@ fn blocked_is_logged_without_waking_and_counted_once_per_turn() {
         "steered",
         "input_read",
         "tool",
+        "said",
         "blocked",
     ] {
         assert!(!store::deliverable(kind));
@@ -676,6 +677,22 @@ fn progress_tells_the_turn_its_tool_calls_and_what_it_waits_for() {
     st.tasks.get_mut("test").unwrap().releasing = true;
     let done = f.d.progress(&st, &st.tasks["test"], "codex:host");
     assert!(!done.contains("turn"), "{done}");
+}
+
+#[test]
+fn what_an_agent_says_is_logged_on_one_line() {
+    let f = fixture();
+    f.d.emit(
+        "test",
+        "said",
+        json!({"text": "Running the tests.\nThen the docs."}),
+    );
+    let events = f.d.store.events("test");
+    assert!(f.d.lock().tasks["test"].deliverable.is_empty());
+    assert_eq!(
+        render::event_line(&events[0], Agent::Codex),
+        "[test codex] says: Running the tests. ↵ Then the docs."
+    );
 }
 
 #[test]

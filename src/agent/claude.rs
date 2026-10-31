@@ -236,6 +236,33 @@ fn tool_detail(input: &Value) -> String {
     .unwrap_or_else(|| clip(&input.to_string(), 200))
 }
 
+/// What the agent wrote and the tools it called, in order.
+fn on_assistant(content: &Value, events: &Events) {
+    for block in content.as_array().into_iter().flatten() {
+        if block["type"] == "text" {
+            let text = block["text"].as_str().unwrap_or("");
+            if !text.trim().is_empty() {
+                let _ = events.send(AgentEvent::Said(text.to_string()));
+            }
+            continue;
+        }
+        if block["type"] != "tool_use" {
+            continue;
+        }
+        let name = block["name"].as_str().unwrap_or("?").to_string();
+        let input = &block["input"];
+        let detail = tool_detail(input);
+        if EDIT_TOOLS.contains(&name.as_str()) {
+            for k in ["file_path", "notebook_path"] {
+                if let Some(p) = input[k].as_str() {
+                    let _ = events.send(AgentEvent::FileChanged(p.to_string()));
+                }
+            }
+        }
+        let _ = events.send(AgentEvent::Tool { name, detail });
+    }
+}
+
 fn replay_input(content: &Value, state: &Mutex<State>, events: &Events) {
     let mut s = state.lock().unwrap();
     if let Some(text) = content.as_str() {
@@ -324,24 +351,7 @@ async fn pump(
         };
         match m["type"].as_str().unwrap_or("") {
             "user" => replay_input(&m["message"]["content"], &state, &events),
-            "assistant" => {
-                for block in m["message"]["content"].as_array().into_iter().flatten() {
-                    if block["type"] != "tool_use" {
-                        continue;
-                    }
-                    let name = block["name"].as_str().unwrap_or("?").to_string();
-                    let input = &block["input"];
-                    let detail = tool_detail(input);
-                    if EDIT_TOOLS.contains(&name.as_str()) {
-                        for k in ["file_path", "notebook_path"] {
-                            if let Some(p) = input[k].as_str() {
-                                let _ = events.send(AgentEvent::FileChanged(p.to_string()));
-                            }
-                        }
-                    }
-                    let _ = events.send(AgentEvent::Tool { name, detail });
-                }
-            }
+            "assistant" => on_assistant(&m["message"]["content"], &events),
             "result" => {
                 let denied: Vec<String> = {
                     let s = state.lock().unwrap();
@@ -501,6 +511,23 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::InputRead(1))));
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::InputRead(2))));
         assert!(state.lock().unwrap().inputs.0.is_empty());
+    }
+
+    #[test]
+    fn text_blocks_are_said_in_order_with_tool_calls() {
+        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        on_assistant(
+            &json!([
+                {"type": "thinking", "thinking": "private"},
+                {"type": "text", "text": "Running the tests."},
+                {"type": "tool_use", "name": "Bash", "input": {"command": "cargo test"}},
+                {"type": "text", "text": "\n"}
+            ]),
+            &events,
+        );
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Said(t)) if t == "Running the tests."));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Tool { name, .. }) if name == "Bash"));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

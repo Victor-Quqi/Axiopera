@@ -33,6 +33,9 @@ pub enum AgentEvent {
         detail: String,
     },
     FileChanged(String),
+    /// A message the agent wrote, once it is complete. The last one of a turn is also its
+    /// result.
+    Said(String),
     /// A request we answered with a refusal without asking anyone.
     Blocked(String),
     /// A request that needs someone's decision.

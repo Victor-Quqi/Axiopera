@@ -333,8 +333,11 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                 }
             }
             Some("agentMessage") => {
-                state.lock().unwrap().last_message =
-                    item["text"].as_str().unwrap_or("").to_string();
+                let text = item["text"].as_str().unwrap_or("").to_string();
+                if !text.trim().is_empty() {
+                    let _ = events.send(AgentEvent::Said(text.clone()));
+                }
+                state.lock().unwrap().last_message = text;
             }
             Some("fileChange") => {
                 if let Some(id) = item["id"].as_str() {
@@ -577,6 +580,31 @@ mod tests {
         );
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::InputRead(1))));
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::InputRead(2))));
+    }
+
+    #[test]
+    fn each_agent_message_is_said_and_the_last_is_the_result() {
+        let state = Mutex::new(State::default());
+        let (events, mut rx) = mpsc::unbounded_channel();
+        for text in ["Looking at the tests.", "  ", "All pass."] {
+            on_notification(
+                "item/completed",
+                &json!({"item": {"type": "agentMessage", "text": text}}),
+                &state,
+                &events,
+            );
+        }
+        on_notification(
+            "turn/completed",
+            &json!({"turn": {"id": "one", "status": "completed"}}),
+            &state,
+            &events,
+        );
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Said(t)) if t == "Looking at the tests."));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Said(t)) if t == "All pass."));
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentEvent::TurnEnded { result, .. }) if result == "All pass.")
+        );
     }
 
     #[test]

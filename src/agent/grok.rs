@@ -47,6 +47,8 @@ struct State {
     text: String,
     /// Keep the completed answer until another response actually supplies text.
     response_complete: bool,
+    /// `text` has been reported as said.
+    said: bool,
     /// Background commands still running. When one finishes, Grok starts a turn by itself.
     background: HashSet<String>,
     /// `session/load` replays the history as ordinary updates; ignore them.
@@ -294,6 +296,7 @@ async fn pump(
                 let mut s = state.lock().unwrap();
                 s.outstanding = s.outstanding.saturating_sub(1);
                 s.active = s.outstanding > 0;
+                say(&mut s, &events);
                 let result = std::mem::take(&mut s.text);
                 let _ = events.send(AgentEvent::TurnEnded {
                     ok,
@@ -352,12 +355,18 @@ fn on_update(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
                 s.response_complete = false;
             }
             s.text.push_str(u["content"]["text"].as_str().unwrap_or(""));
+            s.said = false;
         }
         "response_completed" => {
-            state.lock().unwrap().response_complete = true;
+            let mut s = state.lock().unwrap();
+            s.response_complete = true;
+            say(&mut s, events);
         }
         "tool_call" => {
-            state.lock().unwrap().text.clear();
+            let mut s = state.lock().unwrap();
+            say(&mut s, events);
+            s.text.clear();
+            drop(s);
             if u["kind"] == "edit" {
                 for loc in u["locations"].as_array().into_iter().flatten() {
                     if let Some(path) = loc["path"].as_str() {
@@ -402,6 +411,7 @@ fn on_update(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
                 return;
             }
             s.active = false;
+            say(&mut s, events);
             let result = std::mem::take(&mut s.text);
             let stop = u["stop_reason"].as_str().unwrap_or("end_turn");
             let ok = stop == "end_turn";
@@ -415,6 +425,14 @@ fn on_update(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
         }
         _ => {}
     }
+}
+
+/// The message so far, unless it was already reported.
+fn say(s: &mut State, events: &Events) {
+    if !s.said && !s.text.trim().is_empty() {
+        let _ = events.send(AgentEvent::Said(s.text.clone()));
+    }
+    s.said = true;
 }
 
 #[cfg(test)]
@@ -474,6 +492,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::TurnStarted)));
         chunk(&state, &events, "background result");
         mark(&state, &events, "turn_completed");
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Said(t)) if t == "background result"));
         assert!(
             matches!(rx.try_recv(), Ok(AgentEvent::TurnEnded { result, .. }) if result == "background result")
         );
@@ -496,6 +515,9 @@ mod tests {
         chunk(&state, &events, "ANSWER");
         mark(&state, &events, "response_completed");
         mark(&state, &events, "turn_completed");
+        for said in ["FIRST-ANSWER", "SECOND-ANSWER"] {
+            assert!(matches!(rx.try_recv(), Ok(AgentEvent::Said(t)) if t == said));
+        }
         match rx.try_recv().unwrap() {
             AgentEvent::TurnEnded { ok, result, .. } => {
                 assert!(ok);
@@ -521,6 +543,9 @@ mod tests {
         mark(&state, &events, "response_completed");
         mark(&state, &events, "turn_completed");
 
+        for said in ["old answer", "final answer"] {
+            assert!(matches!(rx.try_recv(), Ok(AgentEvent::Said(t)) if t == said));
+        }
         assert!(rx.try_recv().is_err());
         assert_eq!(state.lock().unwrap().text, "final answer");
     }
@@ -528,13 +553,20 @@ mod tests {
     #[test]
     fn tool_preamble_is_not_part_of_final_answer() {
         let state = Mutex::new(State::default());
-        let (events, _rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = mpsc::unbounded_channel();
         chunk(&state, &events, "Checking files.");
         mark(&state, &events, "tool_call");
         mark(&state, &events, "response_completed");
         chunk(&state, &events, "Final ");
         chunk(&state, &events, "answer.");
         mark(&state, &events, "response_completed");
+
+        // Each message is said once, the preamble before its tool call.
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::TurnStarted)));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Said(t)) if t == "Checking files."));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Tool { .. })));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Said(t)) if t == "Final answer."));
+        assert!(rx.try_recv().is_err());
 
         assert_eq!(state.lock().unwrap().text, "Final answer.");
     }

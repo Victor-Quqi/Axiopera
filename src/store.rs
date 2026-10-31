@@ -155,6 +155,19 @@ impl Store {
         Ok(())
     }
 
+    /// What the task was spawned with. Written before `task.json`, so that anyone who sees the
+    /// task can read it.
+    pub fn save_prompt(&self, id: &str, text: &str) -> Result<()> {
+        let dir = self.dir(id);
+        fs::create_dir_all(&dir)?;
+        fs::write(self.prompt_path(id), text)?;
+        Ok(())
+    }
+
+    pub fn prompt_path(&self, id: &str) -> PathBuf {
+        self.dir(id).join("prompt.md")
+    }
+
     pub fn save(&self, task: &Task) -> Result<()> {
         let dir = self.dir(&task.id);
         fs::create_dir_all(dir.join("turns"))?;
