@@ -390,7 +390,7 @@ impl View {
                 up = self.parent(p);
             }
             let details = details(t, tail);
-            let at = tail.recent.back().map_or(0, |e| e.ts).max(t.updated_ms);
+            let at = last_change(t, tail);
             let task_rank = rank(t, &details);
             firsts.insert(&t.id, rows.len());
             rows.push(Row {
@@ -446,8 +446,7 @@ impl View {
         if let Some(effort) = &t.effort {
             about.push_str(&format!(", effort {effort}"));
         }
-        // The task text and the result take what the window has left; the rest are short.
-        let mut fixed = vec![
+        let mut lines = vec![
             title,
             vec![(about, DIM)],
             vec![],
@@ -458,93 +457,133 @@ impl View {
             Some(text) => text.wrapped(width, self.store.prompt_path(id)),
             None => Wrapped::note("  not recorded: spawned before axiopera kept it"),
         };
-        let mut middle = Vec::new();
-        // Its result has a section of its own.
+        // Its task text and result have sections of their own.
         let mut now_rows = details(t, tail);
         now_rows.retain(|d| !matches!(d.label, "task" | "result"));
-        if !now_rows.is_empty() {
-            middle.push(vec![]);
-            middle.push(vec![("Now".into(), BOLD)]);
-            middle.extend(now_rows.iter().map(|d| d.row("  ", now)));
-        }
         let mut kids: Vec<&Task> = self
             .tasks
             .values()
             .filter(|k| identity::task_of(&k.parent) == Some(id))
             .collect();
         kids.sort_by_key(|k| (k.created_ms, k.id.as_str()));
-        if !kids.is_empty() {
-            middle.push(vec![]);
-            middle.push(vec![("Sub-tasks".into(), BOLD)]);
-            let mut rows = Vec::new();
-            for k in kids {
-                let (status, color) = status_cell(k);
-                let mut row = vec![
-                    (
-                        format!("  {}  {}  {}  ", k.id, name_cell(k), agent_cell(k)),
-                        "",
-                    ),
-                    (status.into(), color),
-                    (format!("  {}", meta(k, self.tail(&k.id), now)), ""),
-                ];
-                // Its task text only when nothing else is told of it.
-                let kid = details(k, self.tail(&k.id));
-                let told = kid.iter().filter(|d| d.label != "task");
-                if let Some(d) = told.min_by_key(|d| d.rank()).or(kid.first()) {
-                    row.push((format!("  {}: {}", d.label, d.text), DIM));
-                }
-                rows.push(row);
-            }
-            // Each sub-task has a view of its own: a few leave room for the result and events.
-            if let Some((_, height)) = size {
-                let room = (height / 4).max(2);
-                if rows.len() > room {
-                    let more = rows.len() - (room - 1);
-                    rows.truncate(room - 1);
-                    rows.push(vec![(format!("  …and {more} more sub-task(s)"), DIM)]);
-                }
-            }
-            middle.extend(rows);
-        }
+        let kids: Vec<Row> = kids.into_iter().map(|k| self.kid_row(k, now)).collect();
         let result = tail
             .result
             .as_ref()
             .map(|(turn, r)| (turn, r.wrapped(width, self.store.turn_path(id, *turn))));
         let mut events: Vec<Vec<Seg>> = tail.recent.iter().map(|e| event_row(e, t, now)).collect();
-        // Two lines before the events, and two before a result.
-        let around = fixed.len() + middle.len() + 2 + if result.is_some() { 2 } else { 0 };
-        let (task_room, result_room, events_room) = match size {
-            None => (usize::MAX, PLAIN_RESULT, PLAIN_FEED),
+
+        let (task_room, kids_room, result_room, events_room) = match size {
+            None => (usize::MAX, usize::MAX, PLAIN_RESULT, PLAIN_FEED),
             Some((_, height)) => {
-                let events_room = events.len().min(MIN_EVENTS);
-                let text_room = height.saturating_sub(around + events_room).max(1);
+                // A blank line and a title before each section after the task text.
+                let titles = |n: usize| if n > 0 { 2 } else { 0 };
+                let fixed = lines.len()
+                    + titles(now_rows.len())
+                    + now_rows.len()
+                    + titles(kids.len())
+                    + titles(usize::from(result.is_some()))
+                    + 2;
+                let room = height.saturating_sub(fixed);
+                let events_min = events.len().min(MIN_EVENTS);
                 let result_len = result.as_ref().map_or(0, |(_, r)| r.len());
-                // Each gets half of the room, or more when the other needs less.
-                let task_room = task_text
-                    .len()
-                    .min((text_room / 2).max(text_room.saturating_sub(result_len)))
-                    .max(1);
-                let result_room = result_len.min(text_room.saturating_sub(task_room));
-                let used = around + task_room.min(task_text.len()) + result_room;
-                (task_room, result_room, height.saturating_sub(used))
+                // Enough for a text to say where all of it is, and for one sub-task or the
+                // count of them.
+                let mins = [
+                    task_text.len().min(task_text.rest_len().max(1)),
+                    kids.len().min(1),
+                    result
+                        .as_ref()
+                        .map_or(0, |(_, r)| r.len().min(r.rest_len().max(1))),
+                ];
+                let wants = [task_text.len(), kids.len(), result_len];
+                let got = share(&wants, &mins, room.saturating_sub(events_min));
+                let used: usize = got.iter().sum();
+                (
+                    got[0],
+                    got[1],
+                    got[2],
+                    room.saturating_sub(used).max(events_min),
+                )
             }
         };
-        fixed.extend(task_text.cut(task_room));
-        fixed.extend(middle);
+        lines.extend(task_text.cut(task_room));
+        if !now_rows.is_empty() {
+            lines.push(vec![]);
+            lines.push(vec![("Now".into(), BOLD)]);
+            lines.extend(now_rows.iter().map(|d| d.row("  ", now)));
+        }
+        if !kids.is_empty() {
+            lines.push(vec![]);
+            lines.push(vec![("Sub-tasks".into(), BOLD)]);
+            lines.extend(choose(kids, kids_room));
+        }
         if let Some((turn, r)) = result {
-            fixed.push(vec![]);
-            fixed.push(vec![(format!("Result of turn {turn}"), BOLD)]);
-            fixed.extend(r.cut(result_room.max(1)));
+            lines.push(vec![]);
+            lines.push(vec![(format!("Result of turn {turn}"), BOLD)]);
+            lines.extend(r.cut(result_room));
         }
-        fixed.push(vec![]);
-        fixed.push(vec![("Events".into(), BOLD)]);
-        events.drain(..events.len().saturating_sub(events_room.max(MIN_EVENTS)));
+        lines.push(vec![]);
+        lines.push(vec![("Events".into(), BOLD)]);
+        events.drain(..events.len().saturating_sub(events_room));
+        // Only a window too short for the least of each section has more lines than it holds.
         if let Some((_, height)) = size {
-            cut(&mut fixed, height.saturating_sub(events.len()));
+            cut(&mut lines, height.saturating_sub(events.len()));
         }
-        fixed.extend(events);
-        finish(&fixed, size)
+        lines.extend(events);
+        finish(&lines, size)
     }
+
+    /// A sub-task on one line, ranked as in the list.
+    fn kid_row(&self, k: &Task, now: u64) -> Row {
+        let tail = self.tail(&k.id);
+        let (status, color) = status_cell(k);
+        let mut segs = vec![
+            (
+                format!("  {}  {}  {}  ", k.id, name_cell(k), agent_cell(k)),
+                "",
+            ),
+            (status.into(), color),
+            (format!("  {}", meta(k, tail, now)), ""),
+        ];
+        // Its task text only when nothing else is told of it.
+        let details = details(k, tail);
+        let told = details.iter().filter(|d| d.label != "task");
+        if let Some(d) = told.min_by_key(|d| d.rank()).or(details.first()) {
+            segs.push((format!("  {}: {}", d.label, d.text), DIM));
+        }
+        Row {
+            segs,
+            rank: rank(k, &details),
+            at: last_change(k, tail),
+            with: Vec::new(),
+            task: true,
+        }
+    }
+}
+
+/// Lines for sections that want `wants` lines, out of `room`: first their `mins`, then an
+/// equal share each of what is left, up to what they want.
+fn share(wants: &[usize], mins: &[usize], room: usize) -> Vec<usize> {
+    let mut got = mins.to_vec();
+    let mut left = room.saturating_sub(mins.iter().sum());
+    loop {
+        let open: Vec<usize> = (0..wants.len()).filter(|&i| got[i] < wants[i]).collect();
+        if open.is_empty() || left == 0 {
+            return got;
+        }
+        let each = (left / open.len()).max(1);
+        for i in open {
+            let give = each.min(wants[i] - got[i]).min(left);
+            got[i] += give;
+            left -= give;
+        }
+    }
+}
+
+/// When a task last changed, by its own account or by its latest event.
+fn last_change(t: &Task, tail: &Tail) -> u64 {
+    tail.recent.back().map_or(0, |e| e.ts).max(t.updated_ms)
 }
 
 /// The lines painted, and no more than the window holds.
@@ -909,6 +948,11 @@ impl Wrapped {
             file: None,
             width: None,
         }
+    }
+
+    /// The lines that say where all of it is.
+    fn rest_len(&self) -> usize {
+        self.rest(0).len()
     }
 
     /// Lines to show it all, or as much as was read and where the rest is.
@@ -2023,7 +2067,7 @@ mod tests {
     }
 
     #[test]
-    fn many_sub_tasks_leave_room_for_the_result() {
+    fn sub_tasks_that_matter_take_the_room_the_texts_leave() {
         let h = home();
         let store = Store::new(&h.0);
         store.save_prompt("tp", "Fix the parser.").unwrap();
@@ -2034,9 +2078,18 @@ mod tests {
         for i in 0..13 {
             let id = format!("k{i:02}");
             store.save_prompt(&id, &format!("Part {i}.")).unwrap();
-            let status = if i == 0 { "failed" } else { "idle" };
+            let (status, more) = match i {
+                0 => ("failed", json!({})),
+                12 => (
+                    "waiting",
+                    json!({"questions": [
+                        {"id": "q1", "text": "Which port?", "answer": null, "asked_ms": NOW}
+                    ]}),
+                ),
+                _ => ("idle", json!({})),
+            };
             store
-                .save(&task(&id, "task:tp", status, NOW - 50_000 + i, json!({})))
+                .save(&task(&id, "task:tp", status, NOW - 50_000 + i, more))
                 .unwrap();
         }
         store
@@ -2050,20 +2103,76 @@ mod tests {
         let mut view = View::new(&h.0, false);
         view.refresh();
         let frame: Vec<String> = view
-            .task_frame("tp", NOW, Some((80, 24)))
+            .task_frame("tp", NOW, Some((100, 24)))
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
         let text = frame.join("\n");
-        assert!(frame.len() <= 24, "{text}");
+        assert_eq!(frame.len(), 24, "{text}");
         assert!(text.contains("\nResult of turn 1\n  Fixed.\n"), "{text}");
-        assert!(text.contains("\n  …and 8 more sub-task(s)\n"), "{text}");
-        // A sub-task's task text gives way to what else is told of it.
-        assert!(line_of(&frame, "k00 ").ends_with("  error: 429"), "{text}");
+        // One-line texts leave 9 lines: 8 sub-tasks, what waits for someone and what went
+        // wrong first, then the latest.
+        assert!(text.contains("\n  …and 5 more task(s)\n"), "{text}");
         assert!(
-            line_of(&frame, "k01 ").ends_with("  task: Part 1."),
+            line_of(&frame, "k12 ").ends_with("  asks: q1: Which port?"),
             "{text}"
         );
+        // A sub-task's task text gives way to what else is told of it.
+        assert!(line_of(&frame, "k00 ").ends_with("  error: 429"), "{text}");
+        assert!(line_of(&frame, "k11 ").ends_with("  task: Part 11."));
+        assert!(!text.contains("k05 "), "{text}");
+        assert!(text.ends_with("[tp codex] Read"), "{text}");
+
+        // A running task with long texts and many sub-tasks still says where its texts are.
+        let long: Vec<String> = (1..=20).map(|i| format!("line {i}")).collect();
+        let long = long.join("\n");
+        store.save_prompt("tr", &long).unwrap();
+        store
+            .save(&task("tr", "user", "running", NOW, json!({})))
+            .unwrap();
+        store.save_turn("tr", 1, &long).unwrap();
+        for i in 0..7 {
+            store
+                .save(&task(&format!("c{i}"), "task:tr", "idle", NOW, json!({})))
+                .unwrap();
+        }
+        for e in [
+            event(20, 9_000, "tr", "turn_started", json!({"turn": 2})),
+            event(21, 8_000, "tr", "said", json!({"text": "Checking."})),
+            event(
+                22,
+                7_000,
+                "tr",
+                "tool",
+                json!({"name": "Read", "detail": "a"}),
+            ),
+            event(
+                23,
+                6_000,
+                "tr",
+                "tool",
+                json!({"name": "Read", "detail": "b"}),
+            ),
+        ] {
+            store.append(&e).unwrap();
+        }
+        view.refresh();
+        let frame: Vec<String> = view
+            .task_frame("tr", NOW, Some((80, 24)))
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect();
+        let text = frame.join("\n");
+        assert_eq!(frame.len(), 24, "{text}");
+        let turn = store.turn_path("tr", 1).display().to_string();
+        let result = &text[text.find("\nResult of turn 1\n").unwrap()..];
+        assert!(
+            result.contains("more line(s); all of it is in:\n"),
+            "{text}"
+        );
+        assert!(result.replace("\n  ", "").contains(&turn), "{text}");
+        assert!(text.contains("\n  …and 7 more task(s)\n"), "{text}");
+        assert!(text.ends_with("[tr codex] Read: b"), "{text}");
     }
 
     #[test]
