@@ -1,7 +1,7 @@
 //! The per-user daemon: owns every sub-agent process and all task state.
 
 mod push;
-mod render;
+pub mod render;
 mod task;
 #[cfg(test)]
 mod tests;

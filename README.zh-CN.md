@@ -18,6 +18,7 @@ Axiopera 为 Claude Code、Codex 和 Grok Build 提供跨工具协作。
 - 平时约一行 Skill 简介，操作说明按需加载。
 - 三家子 agent 都支持 Steer，运行中追加要求、调整方向。
 - 三家主 agent 都能边工作边[接收子任务消息](docs/backends.md#宿主通知)，及时跟进。
+- 另开终端运行 `axiopera top`，实时查看全部子任务，不影响主 agent。
 
 ## 安装
 

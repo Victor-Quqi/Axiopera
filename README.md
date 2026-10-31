@@ -18,6 +18,7 @@ Advantages:
 - About one line for skill discovery; instructions load on demand.
 - All three sub-agents support Steer: add instructions and change direction while they run.
 - All three lead agents can [receive sub-task messages](docs/backends.md#宿主通知) while working and follow up.
+- Run `axiopera top` in another terminal to watch every sub-task live without affecting the lead agent.
 
 ## Install
 

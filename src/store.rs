@@ -168,7 +168,7 @@ impl Store {
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.dir(&event.task).join("events.jsonl"))?;
+            .open(self.events_path(&event.task))?;
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
         f.write_all(&line)?;
@@ -191,8 +191,12 @@ impl Store {
         Ok(path)
     }
 
+    pub fn events_path(&self, id: &str) -> PathBuf {
+        self.dir(id).join("events.jsonl")
+    }
+
     pub fn events(&self, id: &str) -> Vec<Event> {
-        let Ok(f) = fs::File::open(self.dir(id).join("events.jsonl")) else {
+        let Ok(f) = fs::File::open(self.events_path(id)) else {
             return Vec::new();
         };
         BufReader::new(f)

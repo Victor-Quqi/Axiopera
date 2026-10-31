@@ -15,6 +15,7 @@ use tokio::net::windows::named_pipe::{
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Authorization::*;
 use windows_sys::Win32::Security::*;
+use windows_sys::Win32::System::Console::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Pipes::*;
@@ -473,6 +474,45 @@ fn resume_threads(pid: u32) -> io::Result<()> {
     }
     unsafe { CloseHandle(snap) };
     Ok(())
+}
+
+// ---- terminal ----
+
+/// Columns and rows of the console window that shows stdout, if stdout is a console.
+pub fn terminal_size() -> Option<(usize, usize)> {
+    let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { mem::zeroed() };
+    if unsafe { GetConsoleScreenBufferInfo(io::stdout().as_raw_handle(), &mut info) } == 0 {
+        return None;
+    }
+    let w = info.srWindow;
+    Some((
+        (w.Right - w.Left + 1).max(0) as usize,
+        (w.Bottom - w.Top + 1).max(0) as usize,
+    ))
+}
+
+/// Escape sequences turned on for a stdout console, which older consoles do not do by
+/// default. The previous mode comes back on drop.
+pub struct Ansi(Option<CONSOLE_MODE>);
+
+impl Ansi {
+    pub fn enable() -> Ansi {
+        let handle = io::stdout().as_raw_handle();
+        let mut mode = 0;
+        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+            return Ansi(None);
+        }
+        let on = mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+        Ansi((unsafe { SetConsoleMode(handle, on) } != 0).then_some(mode))
+    }
+}
+
+impl Drop for Ansi {
+    fn drop(&mut self) {
+        if let Some(mode) = self.0 {
+            unsafe { SetConsoleMode(io::stdout().as_raw_handle(), mode) };
+        }
+    }
 }
 
 #[cfg(test)]

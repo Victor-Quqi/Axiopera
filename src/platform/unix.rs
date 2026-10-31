@@ -179,3 +179,23 @@ impl Drop for Job {
         self.kill();
     }
 }
+
+// ---- terminal ----
+
+/// Columns and rows of the terminal that shows stdout, if stdout is one.
+pub fn terminal_size() -> Option<(usize, usize)> {
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } != 0 {
+        return None;
+    }
+    (size.ws_col > 0 && size.ws_row > 0).then_some((size.ws_col as usize, size.ws_row as usize))
+}
+
+/// Terminals take escape sequences as they are.
+pub struct Ansi;
+
+impl Ansi {
+    pub fn enable() -> Ansi {
+        Ansi
+    }
+}

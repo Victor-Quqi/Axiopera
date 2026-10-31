@@ -6,7 +6,7 @@
 
 ## 进程与任务
 
-一个二进制包含 CLI、daemon 和供 Codex 子 agent 使用的 MCP server。CLI 每次请求连接 daemon，daemon 持有 agent 进程并独占写入任务状态。子 agent 通过 CLI 或 MCP 回话。
+一个二进制包含 CLI、daemon 和供 Codex 子 agent 使用的 MCP server。CLI 每次请求连接 daemon，daemon 持有 agent 进程并独占写入任务状态。子 agent 通过 CLI 或 MCP 回话。`top` 例外，直接读取 `task.json` 和 `events.jsonl`，不连接 daemon；它按字节偏移增量读取事件，只解析到最后一个换行，写到一半的行留到下一次。
 
 采用按需启动的 daemon，是为了让任务脱离宿主的进程树并持续运行。每个任务只在运行轮次时持有原生进程，空闲后释放，下次通过原生 resume 继续。会话的并发写入差异见[后端文档](backends.md#会话与消息)。
 
@@ -71,7 +71,7 @@ Windows 为每个 agent 建立 `KILL_ON_JOB_CLOSE` Job，禁止 breakaway。先�
 
 ## 身份与 IPC
 
-调用方没有 `AXIOPERA_TASK_ID` 时，使用宿主会话身份 `<host>:<session>`，没有宿主身份则回落到终端用户 `user`。带有任务 ID 时，同时传递原生身份 `task:<id>/<host>:<session>`；daemon 核对任务记录中的后端和原生会话，将任务自身会话归一为 `task:<id>`，其他原生会话保留完整身份，各自收件。只有任务 ID 的调用（如注入的 MCP server）仍使用 `task:<id>`。原生子 agent 共享宿主会话 ID 时仍共用收件箱，使用约定见[后端文档](backends.md#会话与消息)。
+调用方没有 `AXIOPERA_TASK_ID` 时，使用宿主会话身份 `<host>:<session>`，没有宿主身份则回落到终端用户 `user`；`identity::HOST_VARS` 之外的 agent 没有可识别的会话变量，也归入 `user`，彼此之间和与终端共用收件箱。带有任务 ID 时，同时传递原生身份 `task:<id>/<host>:<session>`；daemon 核对任务记录中的后端和原生会话，将任务自身会话归一为 `task:<id>`，其他原生会话保留完整身份，各自收件。只有任务 ID 的调用（如注入的 MCP server）仍使用 `task:<id>`。原生子 agent 共享宿主会话 ID 时仍共用收件箱，使用约定见[后端文档](backends.md#会话与消息)。
 
 完整调用方身份决定任务别名、收件游标和消息归属；其中的任务 ID 决定深度、权限上限、审批向上路由、整树取消和清理依赖。原生子 agent 属于所在的 Axiopera 任务，其派发的 Axiopera 任务继续计入原任务树。
 
