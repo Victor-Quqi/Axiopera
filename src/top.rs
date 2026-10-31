@@ -476,6 +476,7 @@ impl View {
         if !kids.is_empty() {
             middle.push(vec![]);
             middle.push(vec![("Sub-tasks".into(), BOLD)]);
+            let mut rows = Vec::new();
             for k in kids {
                 let (status, color) = status_cell(k);
                 let mut row = vec![
@@ -486,12 +487,24 @@ impl View {
                     (status.into(), color),
                     (format!("  {}", meta(k, self.tail(&k.id), now)), ""),
                 ];
+                // Its task text only when nothing else is told of it.
                 let kid = details(k, self.tail(&k.id));
-                if let Some(d) = kid.iter().min_by_key(|d| d.rank()) {
+                let told = kid.iter().filter(|d| d.label != "task");
+                if let Some(d) = told.min_by_key(|d| d.rank()).or(kid.first()) {
                     row.push((format!("  {}: {}", d.label, d.text), DIM));
                 }
-                middle.push(row);
+                rows.push(row);
             }
+            // Each sub-task has a view of its own: a few leave room for the result and events.
+            if let Some((_, height)) = size {
+                let room = (height / 4).max(2);
+                if rows.len() > room {
+                    let more = rows.len() - (room - 1);
+                    rows.truncate(room - 1);
+                    rows.push(vec![(format!("  …and {more} more sub-task(s)"), DIM)]);
+                }
+            }
+            middle.extend(rows);
         }
         let result = tail
             .result
@@ -876,6 +889,7 @@ impl Text {
         Wrapped {
             lines,
             file: Some((path, self.whole)),
+            width,
         }
     }
 }
@@ -884,6 +898,8 @@ impl Text {
 struct Wrapped {
     lines: Vec<Vec<Seg>>,
     file: Option<(PathBuf, bool)>,
+    /// The window's, for the file's path.
+    width: Option<usize>,
 }
 
 impl Wrapped {
@@ -891,34 +907,77 @@ impl Wrapped {
         Wrapped {
             lines: vec![vec![(text.into(), DIM)]],
             file: None,
+            width: None,
         }
     }
 
     /// Lines to show it all, or as much as was read and where the rest is.
     fn len(&self) -> usize {
-        self.lines.len() + usize::from(matches!(self.file, Some((_, false))))
+        let rest = match self.file {
+            Some((_, false)) => self.rest(0).len(),
+            _ => 0,
+        };
+        self.lines.len() + rest
     }
 
-    /// No more than `room` lines. When some are left out, the last says where all of it is.
+    /// No more than `room` lines. When some are left out, the last say where all of it is.
     fn cut(self, room: usize) -> Vec<Vec<Seg>> {
-        let Wrapped { mut lines, file } = self;
-        let Some((path, whole)) = file else {
-            lines.truncate(room);
-            return lines;
+        let whole = match &self.file {
+            Some((_, whole)) => *whole,
+            None => true,
         };
-        if whole && lines.len() <= room {
-            return lines;
+        if whole && self.lines.len() <= room || self.file.is_none() {
+            return self.lines.into_iter().take(room).collect();
         }
-        let kept = lines.len().min(room.saturating_sub(1));
-        let more = lines.len() - kept;
+        let kept = self
+            .lines
+            .len()
+            .min(room.saturating_sub(self.rest(0).len()));
+        let rest = self.rest(self.lines.len() - kept);
+        let mut lines = self.lines;
         lines.truncate(kept);
-        let note = match (whole, more) {
-            (false, 0) => format!("  …the rest is in {}", path.display()),
-            _ => format!("  …{more} more line(s); all of it is in {}", path.display()),
-        };
-        lines.push(vec![(note, DIM)]);
+        lines.extend(rest);
         lines
     }
+
+    /// Where to read what `more` lines leave out: the file's path on lines of its own, whole
+    /// however narrow the window.
+    fn rest(&self, more: usize) -> Vec<Vec<Seg>> {
+        let Some((path, whole)) = &self.file else {
+            return Vec::new();
+        };
+        let head = match (whole, more) {
+            (false, 0) => "  …the rest is in:".to_string(),
+            _ => format!("  …{more} more line(s); all of it is in:"),
+        };
+        let path = path.display().to_string();
+        let pieces = match self.width {
+            // Two columns of indent, and the last column stays empty.
+            Some(w) => chop(&path, w.saturating_sub(3)),
+            None => vec![path],
+        };
+        std::iter::once(head)
+            .chain(pieces.into_iter().map(|p| format!("  {p}")))
+            .map(|l| vec![(l, DIM)])
+            .collect()
+    }
+}
+
+/// Text in pieces of up to `room` columns, broken anywhere: a path must keep its spaces.
+fn chop(text: &str, room: usize) -> Vec<String> {
+    let room = room.max(2);
+    let mut out = vec![String::new()];
+    let mut used = 0;
+    for c in text.chars() {
+        let w = char_columns(c);
+        if used + w > room {
+            out.push(String::new());
+            used = 0;
+        }
+        out.last_mut().unwrap().push(c);
+        used += w;
+    }
+    out
 }
 
 /// A line broken into pieces of up to `room` columns, after a space where there is one.
@@ -1905,28 +1964,105 @@ mod tests {
         assert!(task[1].starts_with("  word "), "{text}");
         let note = frame
             .iter()
-            .find(|l| l.starts_with("  …"))
+            .position(|l| l.starts_with("  …"))
             .unwrap_or_else(|| panic!("{text}"));
-        assert!(note.contains("more line(s); all of it is in "), "{note}");
+        assert!(
+            frame[note].ends_with(" more line(s); all of it is in:"),
+            "{text}"
+        );
+        // The path is whole, on lines of its own.
+        let path = store.prompt_path("t1").display().to_string();
+        let shown: String = frame[note + 1..]
+            .iter()
+            .take_while(|l| !l.is_empty())
+            .map(|l| l.strip_prefix("  ").unwrap())
+            .collect();
+        assert_eq!(shown, path, "{text}");
         assert!(text.contains("\nEvents"), "{text}");
 
-        let path = store.prompt_path("t1");
+        let lines = |n| vec![vec![("  a".to_string(), "")]; n];
+        let shown = |w: Wrapped, room| -> Vec<String> {
+            w.cut(room).into_iter().map(|l| l[0].0.clone()).collect()
+        };
+        let file = Some((PathBuf::from("dir/x.md"), true));
         let full = Wrapped {
-            lines: vec![vec![("  a".into(), "")]; 5],
-            file: Some((path.clone(), true)),
+            lines: lines(5),
+            file: file.clone(),
+            width: None,
         };
         assert_eq!(
-            full.cut(3).last().unwrap()[0].0,
-            format!("  …3 more line(s); all of it is in {}", path.display())
+            shown(full, 4),
+            [
+                "  a",
+                "  a",
+                "  …3 more line(s); all of it is in:",
+                "  dir/x.md"
+            ]
+        );
+        let narrow = Wrapped {
+            lines: lines(5),
+            file,
+            width: Some(7),
+        };
+        assert_eq!(
+            shown(narrow, 4),
+            [
+                "  a",
+                "  …4 more line(s); all of it is in:",
+                "  dir/",
+                "  x.md"
+            ]
         );
         let partial = Wrapped {
-            lines: vec![vec![("  a".into(), "")]],
-            file: Some((path.clone(), false)),
+            lines: lines(1),
+            file: Some((PathBuf::from("x.md"), false)),
+            width: None,
         };
-        assert_eq!(partial.len(), 2);
-        assert_eq!(
-            partial.cut(5).last().unwrap()[0].0,
-            format!("  …the rest is in {}", path.display())
+        assert_eq!(partial.len(), 3);
+        assert_eq!(shown(partial, 5), ["  a", "  …the rest is in:", "  x.md"]);
+    }
+
+    #[test]
+    fn many_sub_tasks_leave_room_for_the_result() {
+        let h = home();
+        let store = Store::new(&h.0);
+        store.save_prompt("tp", "Fix the parser.").unwrap();
+        store
+            .save(&task("tp", "user", "idle", NOW - 60_000, json!({})))
+            .unwrap();
+        store.save_turn("tp", 1, "Fixed.").unwrap();
+        for i in 0..13 {
+            let id = format!("k{i:02}");
+            store.save_prompt(&id, &format!("Part {i}.")).unwrap();
+            let status = if i == 0 { "failed" } else { "idle" };
+            store
+                .save(&task(&id, "task:tp", status, NOW - 50_000 + i, json!({})))
+                .unwrap();
+        }
+        store
+            .append(&event(1, 1_000, "k00", "failed", json!({"error": "429"})))
+            .unwrap();
+        for i in 0..5 {
+            store
+                .append(&event(2 + i, 1_000, "tp", "tool", json!({"name": "Read"})))
+                .unwrap();
+        }
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let frame: Vec<String> = view
+            .task_frame("tp", NOW, Some((80, 24)))
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect();
+        let text = frame.join("\n");
+        assert!(frame.len() <= 24, "{text}");
+        assert!(text.contains("\nResult of turn 1\n  Fixed.\n"), "{text}");
+        assert!(text.contains("\n  …and 8 more sub-task(s)\n"), "{text}");
+        // A sub-task's task text gives way to what else is told of it.
+        assert!(line_of(&frame, "k00 ").ends_with("  error: 429"), "{text}");
+        assert!(
+            line_of(&frame, "k01 ").ends_with("  task: Part 1."),
+            "{text}"
         );
     }
 
