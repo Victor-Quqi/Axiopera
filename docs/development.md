@@ -11,6 +11,7 @@
 | `src/agent/` | 原生 CLI 协议适配 |
 | `src/mcp.rs` | 子 agent 的 ask、tell、answers 工具，Codex 插件的 hook |
 | `src/plugin.rs` | Codex 插件卸载后的清理 |
+| `src/skill.rs` | 内置 skill 的安装 |
 | `plugins/axiopera/`、`.agents/plugins/` | skill、Codex 插件和 marketplace |
 | `src/platform/` | 进程树、IPC 和 sandbox 检测 |
 | `src/store.rs` | 任务存储 |

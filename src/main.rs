@@ -8,6 +8,7 @@ mod mcp;
 mod paths;
 mod platform;
 mod plugin;
+mod skill;
 mod store;
 
 use std::io::Read;
@@ -179,6 +180,23 @@ enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    /// Install the skill for a host agent.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Install the bundled skill for one host or all supported hosts.
+    Install {
+        #[arg(value_enum)]
+        host: skill::Host,
+        /// Replace an existing skill with different contents.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -271,6 +289,9 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::Plugin {
             command: PluginCommand::Cleanup,
         } => return plugin::cleanup(&home).await,
+        Command::Skill {
+            command: SkillCommand::Install { host, force },
+        } => return Ok(skill::install(host, force, cli.json)),
         Command::Mcp { codex_hooks } => {
             return mcp::serve(client::Client { home, json: false }, codex_hooks).await;
         }
@@ -421,6 +442,40 @@ mod tests {
         fn drop(&mut self) {
             std::fs::remove_file(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn skill_install_arguments() {
+        for (name, expected) in [
+            ("claude", skill::Host::Claude),
+            ("codex", skill::Host::Codex),
+            ("grok", skill::Host::Grok),
+            ("all", skill::Host::All),
+        ] {
+            for force in [false, true] {
+                let mut args = vec!["axiopera", "--json", "skill", "install", name];
+                if force {
+                    args.push("--force");
+                }
+                let cli = Cli::try_parse_from(args).unwrap();
+                assert!(cli.json);
+                match cli.command {
+                    Command::Skill {
+                        command:
+                            SkillCommand::Install {
+                                host,
+                                force: actual,
+                            },
+                    } => {
+                        assert_eq!(host, expected);
+                        assert_eq!(actual, force);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        assert!(Cli::try_parse_from(["axiopera", "skill", "install"]).is_err());
+        assert!(Cli::try_parse_from(["axiopera", "skill", "install", "other"]).is_err());
     }
 
     #[test]

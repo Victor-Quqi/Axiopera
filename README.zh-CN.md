@@ -33,13 +33,17 @@ Windows、Linux 已实测，macOS 待验证。[验证范围](docs/verification.m
 
 **2. 安装 Skill（推荐）**
 
-复制 [`axiopera` 目录](plugins/axiopera/skills/axiopera) 到对应位置，新开会话即可使用：
+按主 agent 执行对应命令，新开会话即可使用：
 
-| Agent | Skill 位置 |
+| Agent | 命令 |
 |---|---|
-| Claude Code | `~/.claude/skills/axiopera/` |
-| Codex | `~/.agents/skills/axiopera/` |
-| Grok Build | `~/.grok/skills/axiopera/` |
+| Claude Code | `axiopera skill install claude` |
+| Codex | `axiopera skill install codex` |
+| Grok Build | `axiopera skill install grok` |
+
+为所有支持的 Harness 安装：`axiopera skill install all`。
+
+Skill 内置于程序，可离线安装。[安装位置、覆盖与卸载](docs/usage.md#skill-与-codex-插件)。
 
 <details>
 <summary>Codex 桌面端 / VS Code：中途提醒插件</summary>

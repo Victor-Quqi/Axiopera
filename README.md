@@ -33,13 +33,17 @@ Windows and Linux tested; macOS awaits validation. [Test coverage](docs/verifica
 
 **2. Install the skill (recommended)**
 
-Copy the [`axiopera` folder](plugins/axiopera/skills/axiopera) to your agent's location, then start a new session:
+Run the command for your host agent, then start a new session:
 
-| Agent | Skill location |
+| Agent | Command |
 |---|---|
-| Claude Code | `~/.claude/skills/axiopera/` |
-| Codex | `~/.agents/skills/axiopera/` |
-| Grok Build | `~/.grok/skills/axiopera/` |
+| Claude Code | `axiopera skill install claude` |
+| Codex | `axiopera skill install codex` |
+| Grok Build | `axiopera skill install grok` |
+
+For all supported harnesses: `axiopera skill install all`.
+
+The skill is bundled with the executable and installs offline. [Locations, replacement, and removal](docs/usage.md#skill-与-codex-插件).
 
 <details>
 <summary>Codex desktop / VS Code: plugin for mid-turn notifications</summary>

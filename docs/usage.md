@@ -58,13 +58,21 @@ daemon 启动时读取配置。修改后运行 `axiopera daemon stop`，下一�
 
 ## Skill 与 Codex 插件
 
-skill 让 agent 在派发任务前先运行 `axiopera guide --host <宿主>`，效果与在项目说明中写明这一点相同。`--host` 只输出该宿主取结果的方式，不带时输出全部宿主的。skill 就是仓库中的 [`plugins/axiopera/skills/axiopera/`](../plugins/axiopera/skills/axiopera) 目录，复制到 agent 的 skills 目录即可，删除该目录即卸载：
+skill 让 agent 在派发任务前先运行 `axiopera guide --host <宿主>`，效果与在项目说明中写明这一点相同。`--host` 只输出该宿主取结果的方式，不带时输出全部宿主的。
 
-| agent | 位置 |
-|---|---|
-| Claude Code | `~/.claude/skills/axiopera/` |
-| Codex | `~/.agents/skills/axiopera/` |
-| Grok | 默认也读取上面两个位置；只用 Grok 时放到 `~/.grok/skills/axiopera/` |
+运行 `axiopera skill install <宿主>`，将程序内置的 [`SKILL.md`](../plugins/axiopera/skills/axiopera/SKILL.md) 离线写入下表目录，新开会话即可使用：
+
+| agent | 宿主参数 | 安装位置 |
+|---|---|---|
+| Claude Code | `claude` | `~/.claude/skills/axiopera/` |
+| Codex | `codex` | `~/.agents/skills/axiopera/` |
+| Grok | `grok` | `~/.grok/skills/axiopera/` |
+
+`~` 取 Windows 的 `USERPROFILE`，其他平台取 `HOME`。命令使用表中的固定位置；自定义 skill 目录可手动复制文件。Grok 默认也读取 Claude Code 和 Codex 的上述位置，已有一份时可直接使用。
+
+`axiopera skill install all` 依次安装到全部三个目录，逐项输出结果；某一项失败后继续处理其余项，最终返回非零退出码。
+
+重复安装时，内容相同则跳过；内容不同则提示加 `--force` 确认覆盖，也适用于 `all`。命令只写 `SKILL.md`，输出文件路径。`--json` 在单宿主时输出对象，`all` 时输出数组；每项包含 `host`，成功时带 `path` 和 `changed`，失败时带 `error`。删除安装目录即卸载。
 
 每个会话的上下文都会列出 skill 的名称和描述，约占一行。
 
