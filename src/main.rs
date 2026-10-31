@@ -112,7 +112,7 @@ enum Command {
     /// For people: every task, what it was given and what it is doing, redrawn each second
     /// until Ctrl-C. Reads the data directory only, so it changes nothing for the agents.
     Top {
-        /// Show only this task, in full: its ID, or its name if no other task has it.
+        /// Show only this task, in detail: its ID, or its name if no other task has it.
         task: Option<String>,
         /// Also tasks stopped more than an hour ago.
         #[arg(long)]
