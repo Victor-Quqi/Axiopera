@@ -109,9 +109,11 @@ enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// For people: every task and its latest events, redrawn each second until Ctrl-C. Reads
-    /// the data directory only, so it changes nothing for the agents.
+    /// For people: every task, what it was given and what it is doing, redrawn each second
+    /// until Ctrl-C. Reads the data directory only, so it changes nothing for the agents.
     Top {
+        /// Show only this task, in full: its ID, or its name if no other task has it.
+        task: Option<String>,
         /// Also tasks stopped more than an hour ago.
         #[arg(long)]
         all: bool,
@@ -300,11 +302,11 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::Skill {
             command: SkillCommand::Install { host, force },
         } => return Ok(skill::install(host, force, cli.json)),
-        Command::Top { all } => {
+        Command::Top { task, all } => {
             if cli.json {
                 bail!("top has no JSON output; use `axiopera status --all --json`");
             }
-            return top::run(&home, all).await;
+            return top::run(&home, task.as_deref(), all).await;
         }
         Command::Mcp { codex_hooks } => {
             return mcp::serve(client::Client { home, json: false }, codex_hooks).await;

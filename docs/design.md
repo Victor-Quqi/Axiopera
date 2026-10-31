@@ -6,7 +6,7 @@
 
 ## 进程与任务
 
-一个二进制包含 CLI、daemon 和供 Codex 子 agent 使用的 MCP server。CLI 每次请求连接 daemon，daemon 持有 agent 进程并独占写入任务状态。子 agent 通过 CLI 或 MCP 回话。`top` 例外，直接读取 `task.json` 和 `events.jsonl`，不连接 daemon；它按字节偏移增量读取事件，只解析到最后一个换行，写到一半的行留到下一次。
+一个二进制包含 CLI、daemon 和供 Codex 子 agent 使用的 MCP server。CLI 每次请求连接 daemon，daemon 持有 agent 进程并独占写入任务状态。子 agent 通过 CLI 或 MCP 回话。`top` 例外，直接读取任务目录下的文件，不连接 daemon；它按字节偏移增量读取事件，只解析到最后一个换行，写到一半的行留到下一次。
 
 采用按需启动的 daemon，是为了让任务脱离宿主的进程树并持续运行。每个任务只在运行轮次时持有原生进程，空闲后释放，下次通过原生 resume 继续。会话的并发写入差异见[后端文档](backends.md#会话与消息)。
 

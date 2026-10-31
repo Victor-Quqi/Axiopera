@@ -6,7 +6,8 @@
 Writes the tasks to a new temporary data directory and runs `axiopera top` on it in this
 terminal, while a thread keeps writing the way the daemon does: events appended, some a half
 line at a time, `task.json` replaced whole, tasks added and removed. No daemon or agent runs.
-Ctrl-C quits; the directory is then deleted unless --keep.
+Ctrl-C quits; the directory is then deleted unless --keep. Arguments after `--` go to top,
+e.g. `-- trun` for the view of one task.
 """
 
 import argparse
@@ -24,6 +25,13 @@ ROOT = Path(__file__).resolve().parent.parent
 MIN = 60_000
 CLAUDE = "claude:7c1e2d34-0d4b-4a8e-9a51-3f6b2c9d8e10"
 CODEX = "codex:019a2b3c-4d5e-7f60-8a9b-0c1d2e3f4a5b"
+SAYS = [
+    "Reading the frame code first to see where rows are cut.",
+    "The feed mixes every task's events; I will group them per task instead.",
+    "Running the top tests now.",
+    "两个测试失败了，先看宽字符的截断。",
+    "Tests pass. Checking the narrow window case before reporting.",
+]
 TOOLS = [
     ("Read", "src/top.rs"),
     ("Grep", "fn frame"),
@@ -48,8 +56,12 @@ class Home:
         self.tasks = {}
         self.errors = []
 
-    def task(self, id, parent, agent, tier, status, ago, name=None, **more):
+    def task(self, id, parent, agent, tier, status, ago, name=None, prompt=None, **more):
         at = now_ms() - ago
+        if prompt:
+            # As the daemon does: before task.json.
+            (self.root / id).mkdir(parents=True, exist_ok=True)
+            (self.root / id / "prompt.md").write_text(prompt, encoding="utf-8")
         self.tasks[id] = {
             "id": id, "name": name, "parent": parent, "agent": agent, "tier": tier,
             "cwd": str(ROOT), "model": None, "effort": None, "timeout_secs": None,
@@ -88,6 +100,9 @@ class Home:
         except OSError as e:
             self.errors.append(f"appending to {task}: {e}")
 
+    def result(self, id, turn, text):
+        (self.root / id / "turns" / f"{turn}.md").write_text(text, encoding="utf-8")
+
     def remove(self, id):
         self.tasks.pop(id, None)
         try:
@@ -98,17 +113,22 @@ class Home:
 
 def build(h):
     """The tasks, then their past events in time order."""
-    question = lambda id: [{"id": id, "text": "?", "answer": None, "asked_ms": now_ms() - MIN}]
+    question = lambda id: [{"id": id, "text": "Which port should the dev server use?", "answer": None, "asked_ms": now_ms() - MIN}]
     # Under a Claude Code session: a running task with a sub-task that has ended its turn but
     # still runs background work, and one queued from inside it by a native sub-agent.
-    h.task("trun", CLAUDE, "codex", "read", "running", 3 * MIN, name="review")
-    h.task("tbg", "task:trun", "claude", "read", "running", 2 * MIN, name="sub-tests", turns=0)
-    h.task("tnat", "task:trun/claude:native-1", "grok", "work", "queued", 5_000, name="native-child")
+    h.task("trun", CLAUDE, "codex", "read", "running", 3 * MIN, name="review",
+           prompt="Review the uncommitted changes to src/top.rs for correctness bugs.\n\n"
+                  "Focus on terminal handling and the event reader.\nReport file:line findings.")
+    h.task("tbg", "task:trun", "claude", "read", "running", 2 * MIN, name="sub-tests", turns=0,
+           prompt="Run the test suite in the background and report failures.")
+    h.task("tnat", "task:trun/claude:native-1", "grok", "work", "queued", 5_000, name="native-child",
+           prompt="Check the Grok adapter for the same issue.")
     h.task("twait", CLAUDE, "claude", "work", "waiting", 4 * MIN, name="问题澄清",
-           questions=question("q7k2"))
-    h.task("tappr", CLAUDE, "codex", "full", "running", 5 * MIN, name="deploy-check", turns=0)
+           prompt="把开发服务器的端口改成可配置，先确认用哪个端口。", questions=question("q7k2"))
+    h.task("tappr", CLAUDE, "codex", "full", "running", 5 * MIN, name="deploy-check", turns=0,
+           prompt="Dry-run the deploy, then push if it passes.")
     h.task("tstall", CLAUDE, "grok", "work", "running", 30 * MIN, name="long-build", turns=0,
-           stalled=True)
+           stalled=True, prompt="Build everything with make and report warnings.")
     # Under a Codex session: stopped in every way.
     h.task("tfail", CODEX, "claude", "work", "failed", 10 * MIN, name="flaky")
     h.task("tint", CODEX, "codex", "work", "interrupted", 20 * MIN, name="interrupted")
@@ -119,7 +139,10 @@ def build(h):
     # From a terminal or an agent axiopera cannot tell apart. `ancient` shows only with --all;
     # `old-parent` shows because of its running sub-task.
     h.task("tidle", "user", "codex", "work", "idle", 5 * MIN, name="docs", turns=3,
-           changed_files=["README.md", "docs/usage.md", "docs/design.md"])
+           changed_files=["README.md", "docs/usage.md", "docs/design.md"],
+           prompt="Update the usage docs for the new top command.")
+    h.result("tidle", 3, "\nUpdated docs/usage.md and the two READMEs; design.md notes the reader.\n\n"
+             "- usage: new section\n- README: one line each\n")
     h.task("told", "user", "codex", "read", "idle", 3 * 24 * 60 * MIN, name="ancient")
     h.task("tparent", "user", "claude", "work", "idle", 2 * 60 * MIN, name="old-parent")
     h.task("tchild", "task:tparent", "codex", "read", "running", MIN, name="still-running", turns=0)
@@ -134,8 +157,10 @@ def build(h):
         (12 * MIN, "tstall", "tool", {"name": "run_terminal_cmd", "detail": "make -j8 all"}),
         (10 * MIN, "tfail", "failed", {"error": "API Error: 429 rate limited"}),
         (6 * MIN, "tidle", "file_changed", {"path": "docs/usage.md"}),
+        (5 * MIN + 1_000, "tidle", "said", {"text": "Updated docs/usage.md and the two READMEs."}),
         (5 * MIN, "tidle", "turn_ended", {"turn": 3, "ok": True}),
         (4 * MIN, "tappr", "turn_started", {"turn": 1}),
+        (3 * MIN + 5_000, "tappr", "said", {"text": "Dry run first; pushing needs approval."}),
         (3 * MIN, "tappr", "tool", {"name": "shell", "detail": "🚀 ./deploy.sh --dry-run"}),
         (2 * MIN, "trun", "turn_started", {"turn": 2}),
         (2 * MIN, "tstall", "stalled", {"quiet_secs": 600}),
@@ -162,10 +187,14 @@ def live(h, stop):
     while not stop.wait(0.7):
         tick += 1
         if not idle:
+            if tick % 3 == 1:
+                h.event("trun", "said", text=SAYS[tick // 3 % len(SAYS)])
             name, detail = TOOLS[tick % len(TOOLS)]
             h.event("trun", "tool", partial=tick % 5 == 0, name=name, detail=detail)
         if tick % 20 == 10:
             turns += 1
+            h.result("trun", 1 + turns, f"Turn {1 + turns}: no bugs found in the reader.\nDetails follow.\n")
+            h.event("trun", "said", text=f"Turn {1 + turns}: no bugs found in the reader.")
             h.event("trun", "turn_ended", turn=turns + 1, ok=True)
             h.update("trun", status="idle", turns=1 + turns)
             idle = True
@@ -207,6 +236,7 @@ def main():
     ap.add_argument("--bin", default=str(ROOT / "target" / "debug" / exe))
     ap.add_argument("--all", action="store_true", help="pass --all to top")
     ap.add_argument("--keep", action="store_true", help="keep the data directory")
+    ap.add_argument("top_args", nargs="*", help="after --: more arguments for top")
     args = ap.parse_args()
     home = Path(tempfile.mkdtemp(prefix="axiopera-top-demo-"))
     h = Home(home)
@@ -216,7 +246,8 @@ def main():
     writer.start()
     env = dict(os.environ, AXIOPERA_HOME=str(home))
     try:
-        child = subprocess.Popen([args.bin, "top", *(["--all"] if args.all else [])], env=env)
+        argv = [args.bin, "top", *(["--all"] if args.all else []), *args.top_args]
+        child = subprocess.Popen(argv, env=env)
         # Ctrl-C reaches top as well; it restores the terminal and exits.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         code = child.wait()
