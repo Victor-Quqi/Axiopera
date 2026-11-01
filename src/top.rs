@@ -1,7 +1,7 @@
-//! `axiopera top`: every task, what it was given and what it is doing, redrawn each second, for
-//! a person watching sub-agents work; `top <task>` shows one task in detail. It only reads the
-//! data directory and never connects to the daemon, so it starts nothing, takes no messages
-//! and marks no result delivered.
+//! `axiopera top`: every task on one line, with what matters most of it now, redrawn each
+//! second for a person watching sub-agents work; `top <task>` shows one task in detail. It only
+//! reads the data directory and never connects to the daemon, so it starts nothing, takes no
+//! messages and marks no result delivered.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -21,11 +21,9 @@ use crate::store::{self, Event, Status, Store, Task};
 const REFRESH: Duration = Duration::from_secs(1);
 /// How long a stopped task stays in view after its last change, without `--all`.
 const RECENT_MS: u64 = 60 * 60 * 1000;
-/// Changes kept for the list at the bottom.
-const FEED: usize = 200;
 /// Events of each task kept for its own view.
 const TASK_EVENTS: usize = 200;
-/// Lines of a list shown when the output is not a terminal.
+/// Events shown in a task's view when the output is not a terminal.
 const PLAIN_FEED: usize = 20;
 /// Lines of a result shown in a task's view when the output is not a terminal; its task text
 /// is shown whole.
@@ -40,6 +38,13 @@ const WITH_TASKS: u8 = u8::MAX;
 const FALLBACK_SIZE: (usize, usize) = (100, 30);
 /// Characters of a task name shown.
 const NAME: usize = 24;
+/// Characters of a host session's ID shown: enough to tell sessions apart.
+const SESSION: usize = 8;
+/// Columns of the agent cell of a task's line.
+const AGENT: usize = 6;
+/// Least columns of the state cell: all states fit but `cancelled` and `interrupted`, so that
+/// one that comes and goes, such as `approval`, does not move the cells after it.
+const STATE: usize = 8;
 
 const BOLD: &str = "1";
 const DIM: &str = "2";
@@ -128,8 +133,6 @@ struct View {
     all: bool,
     tasks: HashMap<String, Task>,
     tails: HashMap<String, Tail>,
-    /// The latest changes of all tasks, oldest first.
-    feed: Vec<Event>,
 }
 
 impl View {
@@ -139,25 +142,27 @@ impl View {
             all,
             tasks: HashMap::new(),
             tails: HashMap::new(),
-            feed: Vec::new(),
         }
     }
 
     /// Read every task again, and what was added since the last refresh.
     fn refresh(&mut self) {
-        self.tasks = self
+        let mut tasks: HashMap<String, Task> = self
             .store
             .load_all()
             .into_iter()
             .map(|t| (t.id.clone(), t))
             .collect();
-        // Only a removed task is forgotten: its events would be read again from the start if
-        // a `task.json` that could not be read for a moment dropped them.
+        // Only a removed task is forgotten. One whose `task.json` cannot be read for a moment,
+        // as while the daemon replaces it, stays as last read instead of leaving the screen.
+        for (id, t) in std::mem::take(&mut self.tasks) {
+            if !tasks.contains_key(&id) && self.store.exists(&id) {
+                tasks.insert(id, t);
+            }
+        }
+        self.tasks = tasks;
         let store = &self.store;
         self.tails.retain(|id, _| store.exists(id));
-        let tails = &self.tails;
-        self.feed.retain(|e| tails.contains_key(&e.task));
-        let before = self.feed.len();
         for (id, t) in &self.tasks {
             // `prompt.md` is written before `task.json`, so it is whole once the task is there.
             let tail = self.tails.entry(id.clone()).or_insert_with(|| Tail {
@@ -175,17 +180,9 @@ impl View {
                     tail.result = read_text(&path).map(|r| (t.turns, r));
                 }
             }
-            let events = tail.read(&self.store.events_path(id));
-            for e in &events {
-                tail.absorb(e);
+            for e in tail.read(&self.store.events_path(id)) {
+                tail.absorb(&e);
             }
-            self.feed
-                .extend(events.into_iter().filter(|e| is_change(&e.kind)));
-        }
-        if self.feed.len() > before {
-            self.feed.sort_by_key(|e| e.seq);
-            let excess = self.feed.len().saturating_sub(FEED);
-            self.feed.drain(..excess);
         }
     }
 
@@ -221,72 +218,54 @@ impl View {
         self.tails.get(id).unwrap_or(&NONE)
     }
 
-    /// Every task's block, then the latest changes: fitted to `size` with colors, or whole
-    /// and plain without it.
+    /// A line for each task: fitted to `size` with colors, or whole and plain without it.
     fn frame(&self, now: u64, size: Option<(usize, usize)>) -> Vec<String> {
-        let (table, hidden) = self.table(now);
+        let (header, rows, hidden) = self.table(now);
         let count = |s: Status| self.tasks.values().filter(|t| t.status == s).count();
-        let mut title: Vec<Seg> = vec![
-            ("axiopera top".into(), BOLD),
-            (
-                format!(
-                    "  running {}, waiting for answers {}, queued {}",
-                    count(Status::Running),
-                    count(Status::Waiting),
-                    count(Status::Queued)
-                ),
-                "",
-            ),
-        ];
         let approvals: usize = self
             .tasks
             .values()
             .filter(|t| t.status == Status::Running)
             .map(|t| self.tail(&t.id).approvals.len())
             .sum();
-        if approvals > 0 {
-            title.push((format!(", approvals pending {approvals}"), YELLOW));
-        }
-        if hidden > 0 {
-            title.push((
-                format!("  ({hidden} stopped over an hour ago; --all shows them)"),
-                DIM,
-            ));
-        }
-        if size.is_some() {
-            title.push(("  Ctrl-C to quit".into(), DIM));
-        }
-        let mut feed: Vec<Vec<Seg>> = self
-            .feed
-            .iter()
-            .filter_map(|e| Some(event_row(e, self.tasks.get(&e.task)?, now)))
-            .collect();
-        let rows = match size {
-            None => {
-                feed.drain(..feed.len().saturating_sub(PLAIN_FEED));
-                table.into_iter().map(|r| r.segs).collect()
-            }
-            Some((_, height)) => {
-                // Besides the rows and the feed: the title, the feed's title and a blank line
-                // after each title. Tasks come first, but the feed keeps a few lines.
-                let room = height.saturating_sub(4);
-                let rows = choose(table, room - room.min(3).min(feed.len()));
-                let feed_room = room.saturating_sub(rows.len());
-                feed.drain(..feed.len().saturating_sub(feed_room));
-                rows
-            }
+        let counts: Vec<String> = [
+            (count(Status::Running), "running"),
+            (count(Status::Waiting), "waiting"),
+            (count(Status::Queued), "queued"),
+            (approvals, "approval(s)"),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(n, what)| format!("{n} {what}"))
+        .collect();
+        let counts = match counts.is_empty() {
+            true => "nothing running".to_string(),
+            false => counts.join(", "),
         };
+        let mut title: Vec<Seg> = vec![("axiopera top".into(), BOLD), (format!("  {counts}"), "")];
+        if hidden > 0 {
+            title.push((format!("  {hidden} older hidden (--all)"), DIM));
+        }
         let mut lines = vec![title, vec![]];
-        lines.extend(rows);
-        lines.push(vec![]);
-        lines.push(vec![("Recent changes".into(), BOLD)]);
-        lines.extend(feed);
+        if rows.is_empty() {
+            lines.push(vec![("no tasks".into(), DIM)]);
+            return finish(&lines, size);
+        }
+        lines.push(header);
+        match size {
+            None => lines.extend(rows.into_iter().map(|r| r.segs)),
+            Some((_, height)) => {
+                let room = height.saturating_sub(lines.len());
+                lines.extend(choose(rows, room));
+            }
+        }
         finish(&lines, size)
     }
 
-    /// A block for each task under a line for each session that spawned them, sub-tasks
-    /// under their parent. Also returns how many stopped tasks are left out.
-    fn table(&self, now: u64) -> (Vec<Row>, usize) {
+    /// A line for each task, sub-tasks under their parent, and with several sessions a line
+    /// for each above the tasks it spawned; with the columns' titles. Also returns how many
+    /// stopped tasks are left out.
+    fn table(&self, now: u64) -> (Vec<Seg>, Vec<Row>, usize) {
         let mut shown: HashSet<&str> = self
             .tasks
             .values()
@@ -317,102 +296,98 @@ impl View {
                 },
             }
         }
-        // Rows in order: `None` for a group's line, else the task and its depth.
-        let mut order: Vec<(&str, Option<(usize, &Task)>)> = Vec::new();
+        // Lines in order: `None` for a session's, else the task with its ID cell, indented
+        // by its depth.
+        let mut order: Vec<(&str, Option<(String, &Task)>)> = Vec::new();
         for (caller, roots) in &groups {
             order.push((*caller, None));
             let mut stack: Vec<(usize, &Task)> = roots.iter().rev().map(|t| (1, *t)).collect();
             while let Some((depth, t)) = stack.pop() {
-                order.push((*caller, Some((depth, t))));
+                order.push((
+                    *caller,
+                    Some((format!("{}{}", "  ".repeat(depth), t.id), t)),
+                ));
                 if let Some(kids) = children.get(t.id.as_str()) {
                     stack.extend(kids.iter().rev().map(|k| (depth + 1, *k)));
                 }
             }
         }
-        if order.is_empty() {
-            return (vec![Row::new(vec![("no tasks".into(), DIM)])], hidden);
-        }
-        let id_cell = |depth: usize, t: &Task| format!("{}{}", "  ".repeat(depth), t.id);
-        let tasks = order.iter().filter_map(|(_, row)| *row);
-        let id_width = tasks
-            .clone()
-            .map(|(d, t)| columns(&id_cell(d, t)))
-            .max()
-            .unwrap_or(0)
-            .max(6);
-        let name_width = tasks
-            .map(|(_, t)| columns(&name_cell(t)).min(NAME))
-            .max()
-            .unwrap_or(0)
-            .max(4);
-        let mut rows = vec![Row::new(vec![(
-            format!(
-                "{}  {}  {}  {}  PROGRESS",
-                pad("  TASK", id_width),
-                pad("NAME", name_width),
-                pad("AGENT", 11),
-                pad("STATUS", 11)
-            ),
-            DIM,
-        )])];
-        // The line of each task's block that the lines under it go with.
-        let mut firsts: HashMap<&str, usize> = HashMap::new();
-        let mut group = 0;
+        let widths = self.widths(order.iter().filter_map(|(_, row)| row.as_ref()));
+        let several = groups.len() > 1;
+        let mut rows = Vec::new();
+        let mut lines: HashMap<&str, usize> = HashMap::new();
+        let mut group = None;
         for (caller, row) in order {
-            let Some((depth, t)) = row else {
-                group = rows.len();
-                rows.push(Row {
-                    rank: WITH_TASKS,
-                    ..Row::new(vec![(caller_label(caller), BOLD)])
-                });
+            let Some((cell, t)) = row else {
+                if several {
+                    group = Some(rows.len());
+                    rows.push(Row {
+                        rank: WITH_TASKS,
+                        ..Row::new(vec![(caller_label(caller), DIM)])
+                    });
+                }
                 continue;
             };
-            let tail = self.tail(&t.id);
-            let (status, color) = status_cell(t);
-            let header = vec![
-                (
-                    format!(
-                        "{}  {}  {}  ",
-                        pad(&id_cell(depth, t), id_width),
-                        pad(&name_cell(t), name_width),
-                        pad(&agent_cell(t), 11)
-                    ),
-                    "",
-                ),
-                (pad(status, 11), color),
-                (format!("  {}", meta(t, tail, now)), ""),
-            ];
             // A task is shown with its session and its ancestors, so it is seen where it is.
-            let mut with = vec![group];
+            let mut with: Vec<usize> = group.into_iter().collect();
             let mut up = self.parent(t);
             while let Some(p) = up {
-                with.extend(firsts.get(p.id.as_str()));
+                with.extend(lines.get(p.id.as_str()));
                 up = self.parent(p);
             }
-            let details = details(t, tail);
-            let at = last_change(t, tail);
-            let task_rank = rank(t, &details);
-            firsts.insert(&t.id, rows.len());
+            lines.insert(&t.id, rows.len());
             rows.push(Row {
-                segs: header,
-                rank: task_rank,
-                at,
-                with: with.clone(),
-                task: true,
+                with,
+                ..self.task_row(&cell, t, widths, now)
             });
-            with.push(rows.len() - 1);
-            let indent = " ".repeat(id_width + 2);
-            for d in &details {
-                rows.push(Row {
-                    segs: d.row(&indent, now),
-                    rank: d.rank().max(task_rank),
-                    at,
-                    with: with.clone(),
-                    task: false,
-                });
-            }
         }
-        (rows, hidden)
+        (widths.header(), rows, hidden)
+    }
+
+    /// Widths for these task lines, given with their ID cells.
+    fn widths<'a>(&self, lines: impl Iterator<Item = &'a (String, &'a Task)>) -> Widths {
+        let least = Widths {
+            id: columns("  TASK"),
+            name: columns("NAME"),
+            state: STATE,
+        };
+        lines.fold(least, |w, (cell, t)| Widths {
+            id: w.id.max(columns(cell)),
+            name: w.name.max(columns(&name_cell(t)).min(NAME)),
+            state: w.state.max(columns(state(t, self.tail(&t.id)).0)),
+        })
+    }
+
+    /// A task on one line: its ID cell, name, agent and state, the time since it last
+    /// changed, and what matters most of it now.
+    fn task_row(&self, cell: &str, t: &Task, widths: Widths, now: u64) -> Row {
+        let tail = self.tail(&t.id);
+        let (state, color) = state(t, tail);
+        let (text, text_color) = latest(t, tail);
+        let segs = vec![
+            (
+                format!(
+                    "{}  {}  {}  ",
+                    pad(cell, widths.id),
+                    pad(&name_cell(t), widths.name),
+                    pad(render::agent_name(t.agent), AGENT)
+                ),
+                "",
+            ),
+            (pad(state, widths.state), color),
+            (
+                format!(
+                    "  {:>4}  ",
+                    short_age(now.saturating_sub(last_change(t, tail)))
+                ),
+                DIM,
+            ),
+            (text, text_color),
+        ];
+        Row {
+            rank: rank(t, tail),
+            ..Row::new(segs)
+        }
     }
 
     /// One task in detail: what it was given, what it waits for and is doing, its sub-tasks,
@@ -424,16 +399,13 @@ impl View {
         };
         let tail = self.tail(id);
         let ago = |ms: u64| age(now.saturating_sub(ms));
-        let (status, color) = status_cell(t);
-        let mut title: Vec<Seg> = vec![
+        let (state, color) = state(t, tail);
+        let title: Vec<Seg> = vec![
             (format!("axiopera top {id}"), BOLD),
             (format!("  {}  {}  ", name_cell(t), agent_cell(t)), ""),
-            (status.into(), color),
+            (state.into(), color),
             (format!("  {}", meta(t, tail, now)), ""),
         ];
-        if size.is_some() {
-            title.push(("  Ctrl-C to quit".into(), DIM));
-        }
         let mut about = format!(
             "spawned {} ago by {} in {}",
             ago(t.created_ms),
@@ -457,16 +429,22 @@ impl View {
             Some(text) => text.wrapped(width, self.store.prompt_path(id)),
             None => Wrapped::note("  not recorded: spawned before axiopera kept it"),
         };
-        // Its task text and result have sections of their own.
-        let mut now_rows = details(t, tail);
-        now_rows.retain(|d| !matches!(d.label, "task" | "result"));
+        let now_rows = details(t, tail);
         let mut kids: Vec<&Task> = self
             .tasks
             .values()
             .filter(|k| identity::task_of(&k.parent) == Some(id))
             .collect();
         kids.sort_by_key(|k| (k.created_ms, k.id.as_str()));
-        let kids: Vec<Row> = kids.into_iter().map(|k| self.kid_row(k, now)).collect();
+        let kids: Vec<(String, &Task)> = kids
+            .into_iter()
+            .map(|k| (format!("  {}", k.id), k))
+            .collect();
+        let kid_widths = self.widths(kids.iter());
+        let kids: Vec<Row> = kids
+            .iter()
+            .map(|(cell, k)| self.task_row(cell, k, kid_widths, now))
+            .collect();
         let result = tail
             .result
             .as_ref()
@@ -533,32 +511,31 @@ impl View {
         lines.extend(events);
         finish(&lines, size)
     }
+}
 
-    /// A sub-task on one line, ranked as in the list.
-    fn kid_row(&self, k: &Task, now: u64) -> Row {
-        let tail = self.tail(&k.id);
-        let (status, color) = status_cell(k);
-        let mut segs = vec![
-            (
-                format!("  {}  {}  {}  ", k.id, name_cell(k), agent_cell(k)),
-                "",
+/// Widths of the columns of task lines that change with the tasks: those of their widest
+/// cells, so that what matters most of each task has the rest.
+#[derive(Clone, Copy)]
+struct Widths {
+    id: usize,
+    name: usize,
+    state: usize,
+}
+
+impl Widths {
+    /// The columns' titles.
+    fn header(self) -> Vec<Seg> {
+        vec![(
+            format!(
+                "{}  {}  {}  {}  {:>4}  LATEST",
+                pad("  TASK", self.id),
+                pad("NAME", self.name),
+                pad("AGENT", AGENT),
+                pad("STATE", self.state),
+                "AGO"
             ),
-            (status.into(), color),
-            (format!("  {}", meta(k, tail, now)), ""),
-        ];
-        // Its task text only when nothing else is told of it.
-        let details = details(k, tail);
-        let told = details.iter().filter(|d| d.label != "task");
-        if let Some(d) = told.min_by_key(|d| d.rank()).or(details.first()) {
-            segs.push((format!("  {}: {}", d.label, d.text), DIM));
-        }
-        Row {
-            segs,
-            rank: rank(k, &details),
-            at: last_change(k, tail),
-            with: Vec::new(),
-            task: true,
-        }
+            DIM,
+        )]
     }
 }
 
@@ -609,17 +586,13 @@ fn cut(rows: &mut Vec<Vec<Seg>>, room: usize) {
     }
 }
 
-/// A line of the list, with what decides whether it is shown when the window is too short.
+/// A line of a list, with what decides whether it is shown when the window is too short.
 struct Row {
     segs: Vec<Seg>,
-    /// Lines of lower rank are shown first: see `rank` and `Detail::rank`.
+    /// Lines of lower rank are shown first: see `rank`.
     rank: u8,
-    /// When its task last changed: of lines with the same rank, the latest are shown first.
-    at: u64,
-    /// The lines it is shown with: its session's, its ancestors' and its task's first.
+    /// The lines it is shown with: its session's and its ancestors'.
     with: Vec<usize>,
-    /// Whether it is a task's first line.
-    task: bool,
 }
 
 impl Row {
@@ -627,17 +600,15 @@ impl Row {
         Row {
             segs,
             rank: 0,
-            at: u64::MAX,
             with: Vec::new(),
-            task: false,
         }
     }
 }
 
 /// How much a task matters to someone watching: what waits for them, then what is at work,
 /// then what went wrong, then the rest.
-fn rank(t: &Task, details: &[Detail]) -> u8 {
-    if t.status == Status::Waiting || details.iter().any(|d| d.rank() == 0) {
+fn rank(t: &Task, tail: &Tail) -> u8 {
+    if waits(t, tail) {
         0
     } else if matches!(t.status, Status::Running | Status::Queued) {
         1
@@ -649,7 +620,8 @@ fn rank(t: &Task, details: &[Detail]) -> u8 {
 }
 
 /// As many rows as fit in `room`, in their order. When not all fit, the lowest ranks are
-/// chosen, and the last line says what is left out.
+/// chosen, the later of the same rank first, and the last line says how many are left out.
+/// Rows are not chosen by when they last changed: those shown would change every second.
 fn choose(rows: Vec<Row>, room: usize) -> Vec<Vec<Seg>> {
     if rows.len() <= room {
         return rows.into_iter().map(|r| r.segs).collect();
@@ -658,7 +630,7 @@ fn choose(rows: Vec<Row>, room: usize) -> Vec<Vec<Seg>> {
     let mut order: Vec<usize> = (0..rows.len())
         .filter(|&i| rows[i].rank != WITH_TASKS)
         .collect();
-    order.sort_by_key(|&i| (rows[i].rank, Reverse(rows[i].at), i));
+    order.sort_by_key(|&i| (rows[i].rank, Reverse(i)));
     let mut kept = vec![false; rows.len()];
     let mut used = 0;
     for i in order {
@@ -672,29 +644,19 @@ fn choose(rows: Vec<Row>, room: usize) -> Vec<Vec<Seg>> {
             kept[w] = true;
         }
     }
-    let left = |task: bool| {
-        rows.iter()
-            .zip(&kept)
-            .filter(|(r, k)| !**k && r.task == task && r.rank != WITH_TASKS)
-            .count()
-    };
-    let mut parts = Vec::new();
-    match left(true) {
-        0 => {}
-        n => parts.push(format!("{n} more task(s)")),
-    }
-    match left(false) {
-        0 => {}
-        n => parts.push(format!("{n} more line(s) under tasks")),
-    }
+    let left = rows
+        .iter()
+        .zip(&kept)
+        .filter(|(r, k)| !**k && r.rank != WITH_TASKS)
+        .count();
     let mut out: Vec<Vec<Seg>> = rows
         .into_iter()
         .zip(kept)
         .filter(|(_, k)| *k)
         .map(|(r, _)| r.segs)
         .collect();
-    if room > 0 && !parts.is_empty() {
-        out.push(vec![(format!("  …and {}", parts.join(", ")), DIM)]);
+    if room > 0 && left > 0 {
+        out.push(vec![(format!("  …and {left} more task(s)"), DIM)]);
     }
     out
 }
@@ -728,14 +690,7 @@ fn agent_cell(t: &Task) -> String {
 /// Where a task's turn stands, in a few words.
 fn meta(t: &Task, tail: &Tail, now: u64) -> String {
     let ago = |ms: u64| age(now.saturating_sub(ms));
-    let mut parts = Vec::new();
-    if t.stalled {
-        parts.push("STALLED".to_string());
-    }
-    if t.detached {
-        parts.push("DETACHED".to_string());
-    }
-    parts.push(match t.status {
+    match t.status {
         Status::Running if tail.in_turn => format!(
             "turn {}, {}, {} tool call(s)",
             t.turns + 1,
@@ -756,11 +711,10 @@ fn meta(t: &Task, tail: &Tail, now: u64) -> String {
             }
             done
         }
-    });
-    parts.join("; ")
+    }
 }
 
-/// A line under a task: what it waits for, says or does, or how it ended.
+/// A line under Now in a task's view: what it waits for, says or does, or how it ended badly.
 struct Detail {
     label: &'static str,
     at: Option<u64>,
@@ -779,20 +733,9 @@ impl Detail {
             (self.text.clone(), self.color),
         ]
     }
-
-    /// Like a task's rank, for the line under it.
-    fn rank(&self) -> u8 {
-        match self.label {
-            "needs" | "asks" => 0,
-            "says" => 1,
-            "result" => 4,
-            _ => 2,
-        }
-    }
 }
 
-/// The lines under a task: the first line of its task text, what waits for someone, what it
-/// says and does, or how it ended.
+/// What a task waits for, what it says and does, or how it ended badly.
 fn details(t: &Task, tail: &Tail) -> Vec<Detail> {
     let mut out = Vec::new();
     let line = |label, at, text: String, color| Detail {
@@ -801,9 +744,6 @@ fn details(t: &Task, tail: &Tail) -> Vec<Detail> {
         text,
         color,
     };
-    if let Some(first) = tail.prompt.as_ref().and_then(|p| p.lines.first()) {
-        out.push(line("task", None, first.clone(), ""));
-    }
     if t.status == Status::Running {
         for (id, summary) in &tail.approvals {
             out.push(line(
@@ -833,17 +773,76 @@ fn details(t: &Task, tail: &Tail) -> Vec<Detail> {
                 out.push(line("doing", Some(*at), call.clone(), ""));
             }
         }
-        _ => match (&tail.stop, &tail.result) {
-            (Some((label, text, at)), _) if t.status != Status::Idle || t.detached => {
-                out.push(line(*label, Some(*at), text.clone(), RED));
+        _ => {
+            if let Some((label, text, at)) = stop(t, tail) {
+                out.push(line(label, Some(at), text.into(), RED));
             }
-            (_, Some((_, r))) if !r.lines.is_empty() => {
-                out.push(line("result", None, r.lines[0].clone(), ""));
-            }
-            _ => {}
-        },
+        }
     }
     out
+}
+
+/// How a stopped task ended badly, if it did: a label, the text and when.
+fn stop<'a>(t: &Task, tail: &'a Tail) -> Option<(&'static str, &'a str, u64)> {
+    let (label, text, at) = tail.stop.as_ref()?;
+    (t.status != Status::Idle || t.detached).then_some((*label, text.as_str(), *at))
+}
+
+/// Whether a task waits for someone: for an answer, or for an approval.
+fn waits(t: &Task, tail: &Tail) -> bool {
+    t.status == Status::Waiting
+        || t.status == Status::Running && !tail.approvals.is_empty()
+        || !t.status.is_final() && t.open_questions().next().is_some()
+}
+
+/// What matters most of a task now, for its line: what it waits for, what it last said or
+/// else is doing, how it ended, or else what it was given. A tool call or a task text is dim,
+/// so that what the agent says stands out among them.
+fn latest(t: &Task, tail: &Tail) -> (String, &'static str) {
+    let more = |n: usize| match n {
+        0 | 1 => String::new(),
+        n => format!(" (and {} more)", n - 1),
+    };
+    if t.status == Status::Running
+        && let Some((id, summary)) = tail.approvals.first()
+    {
+        return (
+            one_line(&format!("{id}: {summary}{}", more(tail.approvals.len()))),
+            "",
+        );
+    }
+    if !t.status.is_final() {
+        let open: Vec<_> = t.open_questions().collect();
+        if let Some(q) = open.first() {
+            return (
+                one_line(&format!("{}: {}{}", q.id, q.text, more(open.len()))),
+                "",
+            );
+        }
+    }
+    let first = |text: Option<&Text>| text?.lines.first().cloned();
+    let found = match t.status {
+        Status::Running | Status::Queued => tail
+            .said
+            .as_ref()
+            .map(|(text, _)| (text.clone(), ""))
+            .or_else(|| {
+                let (call, _) = tail.last_tool.as_ref().filter(|_| tail.in_turn)?;
+                Some((call.clone(), DIM))
+            }),
+        _ => stop(t, tail)
+            .map(|(_, text, _)| (text.to_string(), ""))
+            .or_else(|| Some((first(tail.result.as_ref().map(|(_, r)| r))?, ""))),
+    };
+    let (text, color) = found
+        .or_else(|| Some((first(tail.prompt.as_ref())?, DIM)))
+        .unwrap_or_default();
+    (one_line(&text), color)
+}
+
+/// Text on one line: its lines and runs of spaces joined by single spaces.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Like the daemon's durations, with days for tasks left for long.
@@ -855,29 +854,46 @@ fn age(ms: u64) -> String {
     format!("{}d{:02}h", ms / DAY_MS, ms % DAY_MS / (60 * 60 * 1000))
 }
 
+/// A duration in its largest unit, for a task's line: it changes once a minute past the first.
+fn short_age(ms: u64) -> String {
+    match ms / 1000 {
+        s @ 0..60 => format!("{s}s"),
+        s @ 60..3600 => format!("{}m", s / 60),
+        s @ 3600..172_800 => format!("{}h", s / 3600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
 fn active(t: &Task) -> bool {
     matches!(t.status, Status::Queued | Status::Running | Status::Waiting)
 }
 
-fn status_cell(t: &Task) -> (&'static str, &'static str) {
-    let (word, color) = match t.status {
-        Status::Queued => ("queued", YELLOW),
+/// A task's state in a word and its color: the color goes to what waits for someone and what
+/// went wrong, and what is at work, so that the rest can be passed over.
+fn state(t: &Task, tail: &Tail) -> (&'static str, &'static str) {
+    match t.status {
+        _ if t.detached => ("detached", RED),
+        Status::Running if !tail.approvals.is_empty() => ("approval", YELLOW),
+        _ if t.stalled => ("stalled", RED),
+        Status::Queued => ("queued", DIM),
         Status::Running => ("running", GREEN),
-        Status::Idle => ("idle", ""),
+        Status::Idle => ("idle", DIM),
         Status::Waiting => ("waiting", YELLOW),
         Status::Failed => ("failed", RED),
         Status::Interrupted => ("interrupted", RED),
         Status::Cancelled => ("cancelled", DIM),
-    };
-    (word, if t.stalled || t.detached { RED } else { color })
+    }
 }
 
-/// Who spawned a group of tasks: a host session, `user`, or a task already removed. Agents
+// Who spawned a group of tasks: a host session, `user`, or a task already removed. Agents
 /// other than the known hosts call as `user` too, like a person at a terminal.
 fn caller_label(caller: &str) -> String {
     match caller.split_once(':') {
         _ if caller == "user" => "user: terminals and unrecognized agents".into(),
-        Some((host, session)) if host != "task" => format!("{host} session {session}"),
+        Some((host, session)) if host != "task" => {
+            let session: String = session.chars().take(SESSION).collect();
+            format!("{host} session {session}")
+        }
         _ => caller.into(),
     }
 }
@@ -1315,17 +1331,12 @@ mod tests {
             .unwrap_or_else(|| panic!("no line starting {start:?} in {frame:#?}"))
     }
 
-    /// The detail lines under a task's header, trimmed.
-    fn block<'a>(frame: &'a [String], id: &str) -> Vec<&'a str> {
-        let header = line_of(frame, &format!("{id} "));
-        let start = frame.iter().position(|l| l == header).unwrap();
-        let labels = [
-            "task ", "needs ", "asks ", "says ", "doing ", "result ", "error ", "why ",
-        ];
-        frame[start + 1..]
-            .iter()
-            .map(|l| l.trim())
-            .take_while(|l| labels.iter().any(|label| l.starts_with(label)))
+    /// A task's line split into its cells: ID, name, agent, state, age and what matters most.
+    fn cells<'a>(frame: &'a [String], id: &str) -> Vec<&'a str> {
+        line_of(frame, &format!("{id} "))
+            .split("  ")
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
             .collect()
     }
 
@@ -1334,14 +1345,14 @@ mod tests {
     }
 
     #[test]
-    fn each_task_shows_what_it_was_given_says_does_and_waits_for() {
+    fn each_task_is_one_line_of_what_matters_most_now() {
         let h = home();
         let store = Store::new(&h.0);
         for (t, prompt) in [
             (
                 task(
                     "t1",
-                    "claude:s1",
+                    "claude:s1234567890",
                     "running",
                     NOW - 600_000,
                     json!({"name": "审查"}),
@@ -1350,7 +1361,7 @@ mod tests {
             ),
             (
                 task("t2", "task:t1", "idle", NOW - 500_000, json!({})),
-                None,
+                Some("Run the tests."),
             ),
             // Spawned by a native sub-agent inside t1: still under t1.
             (
@@ -1360,17 +1371,17 @@ mod tests {
                     "waiting",
                     NOW - 400_000,
                     json!({"questions": [
-                        {"id": "q1", "text": "Which port?", "answer": null, "asked_ms": NOW - 9_000}
+                        {"id": "q1", "text": "Which\nport?", "answer": null, "asked_ms": NOW - 9_000}
                     ]}),
                 ),
                 None,
             ),
             (task("t4", "user", "idle", NOW - 2 * HOUR, json!({})), None),
-            // Old, but its sub-task runs.
+            // Old, but its sub-task is queued.
             (task("t5", "user", "idle", NOW - 3 * HOUR, json!({})), None),
             (
                 task("t6", "task:t5", "queued", NOW - 1_000, json!({})),
-                None,
+                Some("Check the adapter.\nThen report."),
             ),
             (task("t7", "user", "failed", NOW - 1_000, json!({})), None),
         ] {
@@ -1389,7 +1400,7 @@ mod tests {
                 61_000,
                 "t1",
                 "said",
-                json!({"text": "Running the tests."}),
+                json!({"text": "Running\n\nthe  tests."}),
             ),
             event(
                 3,
@@ -1427,56 +1438,51 @@ mod tests {
         let frame = view.frame(NOW, None);
         let text = frame.join("\n");
         assert!(
-            text.contains("running 1, waiting for answers 1, queued 1, approvals pending 1"),
+            frame[0].starts_with(
+                "axiopera top  1 running, 1 waiting, 1 queued, 1 approval(s)  1 older hidden (--all)"
+            ),
             "{text}"
         );
-        assert!(text.contains("(1 stopped over an hour ago; --all shows them)"));
-        assert!(text.contains("\nclaude session s1\n"), "{text}");
+        assert!(
+            frame[2].trim_start().starts_with("TASK") && frame[2].ends_with("AGO  LATEST"),
+            "{text}"
+        );
+        // With tasks of two sessions, a line for each, its ID cut to tell them apart.
+        assert!(text.contains("\nclaude session s1234567\n"), "{text}");
         assert!(
             text.contains("\nuser: terminals and unrecognized agents\n"),
             "{text}"
         );
         assert!(!text.contains("t4 "), "{text}");
 
-        let t1 = line_of(&frame, "t1 ");
-        assert!(t1.contains("审查"), "{t1}");
-        assert!(t1.ends_with("turn 2, 2m00s, 2 tool call(s)"), "{t1}");
-        // What waits for someone first, then what it says and does.
+        // What waits for someone comes before what the agent says or does.
         assert_eq!(
-            block(&frame, "t1"),
-            [
-                "task           Review the parser.",
-                "needs          approval r1: push",
-                "says    1m01s  Running the tests.",
-                "doing      5s  Read: src/x.rs",
-            ],
+            cells(&frame, "t1")[1..],
+            ["审查", "codex", "approval", "5s", "r1: push"],
             "{text}"
         );
         for child in ["t2", "t3"] {
             assert_eq!(
                 indent(line_of(&frame, &format!("{child} "))),
-                indent(t1) + 2,
+                indent(line_of(&frame, "t1 ")) + 2,
                 "{text}"
             );
         }
-        assert_eq!(block(&frame, "t2"), ["result         All tests pass."]);
-        assert_eq!(block(&frame, "t3"), ["asks       9s  q1: Which port?"]);
-        assert_eq!(block(&frame, "t7"), ["error      2s  429 rate limited"]);
+        assert_eq!(cells(&frame, "t2")[3..], ["idle", "8m", "All tests pass."]);
+        assert_eq!(
+            cells(&frame, "t3")[3..],
+            ["waiting", "6m", "q1: Which port?"]
+        );
+        assert_eq!(cells(&frame, "t5")[3..], ["idle", "3h"]);
         assert!(indent(line_of(&frame, "t6 ")) > indent(line_of(&frame, "t5 ")));
-
-        // The changes at the bottom leave out tool calls and what agents say.
-        let changes = &text[text.find("Recent changes").unwrap()..];
-        assert!(
-            changes.contains("[t1 codex] needs approval r1: push"),
-            "{changes}"
+        // Before it says anything, what it was given.
+        assert_eq!(
+            cells(&frame, "t6")[3..],
+            ["queued", "1s", "Check the adapter."]
         );
-        assert!(
-            changes.contains("[t7 codex] failed: 429 rate limited"),
-            "{changes}"
-        );
-        assert!(
-            !changes.contains("Read:") && !changes.contains("says"),
-            "{changes}"
+        assert_eq!(
+            cells(&frame, "t7")[3..],
+            ["failed", "1s", "429 rate limited"]
         );
 
         // A line still being written is left for the next refresh.
@@ -1495,7 +1501,7 @@ mod tests {
             .unwrap();
         f.write_all(head.as_bytes()).unwrap();
         view.refresh();
-        assert!(line_of(&view.frame(NOW, None), "t1 ").contains("2 tool call(s)"));
+        assert_eq!(cells(&view.frame(NOW, None), "t1")[4], "5s");
         f.write_all(format!("{rest}\n").as_bytes()).unwrap();
         drop(f);
         store
@@ -1508,9 +1514,11 @@ mod tests {
             ))
             .unwrap();
         view.refresh();
-        let frame = view.frame(NOW, None);
-        assert!(line_of(&frame, "t1 ").contains("3 tool call(s)"));
-        assert_eq!(block(&frame, "t1")[1], "says    1m01s  Running the tests.");
+        // What it said stays over the tool calls after it, on one line.
+        assert_eq!(
+            cells(&view.frame(NOW, None), "t1")[3..],
+            ["running", "0s", "Running the tests."]
+        );
 
         // Nothing the daemon delivers was changed.
         for t in store.load_all() {
@@ -1611,11 +1619,12 @@ mod tests {
         );
         // The result is not repeated under Now.
         assert!(!text.contains("\nNow\n"), "{text}");
-        assert!(
-            text.contains("\nSub-tasks\n  t2  tests  codex/work  running  "),
-            "{text}"
+        // Sub-tasks on lines like the list's.
+        assert!(text.contains("\nSub-tasks\n  t2  "), "{text}");
+        assert_eq!(
+            cells(&frame, "t2")[1..],
+            ["tests", "codex", "running", "10s", "Running them."]
         );
-        assert!(text.contains("says: Running them."), "{text}");
         assert!(
             text.contains("\nResult of turn 2\n  No bugs.\n  - checked the reader\n"),
             "{text}"
@@ -1672,22 +1681,26 @@ mod tests {
                 .iter()
                 .map(|d| format!("{} {}", d.label, d.text))
                 .collect();
-            (meta(t, tail, NOW), lines)
+            (meta(t, tail, NOW), lines, latest(t, tail).0)
         };
         assert_eq!(
             state(event(1, 9_000, "t1", "turn_started", json!({"turn": 1}))),
-            ("turn 1, 9s, 0 tool call(s)".to_string(), vec![])
+            (
+                "turn 1, 9s, 0 tool call(s)".to_string(),
+                vec![],
+                String::new()
+            )
         );
+        let waits = state(event(
+            2,
+            8_000,
+            "t1",
+            "approval_request",
+            json!({"id": "r9", "summary": "push"}),
+        ));
         assert_eq!(
-            state(event(
-                2,
-                8_000,
-                "t1",
-                "approval_request",
-                json!({"id": "r9", "summary": "push"})
-            ))
-            .1,
-            ["needs approval r9: push"]
+            (&waits.1[..], &waits.2[..]),
+            (&["needs approval r9: push".to_string()][..], "r9: push")
         );
         state(event(3, 7_000, "t1", "denied", json!({"id": "r9"})));
         assert_eq!(
@@ -1728,12 +1741,22 @@ mod tests {
                 vec![
                     "says The build finished.".to_string(),
                     "doing monitor".to_string()
-                ]
+                ],
+                "The build finished.".to_string()
             )
         );
+        // What it said stays over the tool calls after it.
+        let next = state(event(
+            8,
+            1_500,
+            "t1",
+            "tool",
+            json!({"name": "Read", "detail": "x"}),
+        ));
+        assert_eq!(next.2, "The build finished.");
         assert_eq!(
             state(event(
-                8,
+                9,
                 1_000,
                 "t1",
                 "turn_ended",
@@ -1742,12 +1765,32 @@ mod tests {
             .1,
             ["says The build finished."]
         );
+        // A new turn forgets what was said in the last: its tool calls show until it speaks.
+        state(event(10, 900, "t1", "turn_started", json!({"turn": 3})));
+        let (_, _, text) = state(event(
+            11,
+            800,
+            "t1",
+            "tool",
+            json!({"name": "Read", "detail": "y"}),
+        ));
+        assert_eq!(text, "Read: y");
         store
-            .save(&task("t1", "codex:s", "failed", NOW, json!({"turns": 2})))
+            .save(&task("t1", "codex:s", "failed", NOW, json!({"turns": 3})))
+            .unwrap();
+        store
+            .append(&event(
+                12,
+                700,
+                "t1",
+                "turn_ended",
+                json!({"turn": 3, "ok": false, "error": "boom"}),
+            ))
             .unwrap();
         view.refresh();
         let t = &view.tasks["t1"];
         assert_eq!(details(t, view.tail("t1"))[0].text, "boom");
+        assert_eq!(latest(t, view.tail("t1")).0, "boom");
     }
 
     #[test]
@@ -1757,7 +1800,7 @@ mod tests {
         for i in 0..30 {
             store
                 .save(&task(
-                    &format!("t{i}"),
+                    &format!("t{i:02}"),
                     "codex:s",
                     "running",
                     NOW,
@@ -1768,27 +1811,16 @@ mod tests {
         // Agent text that would move the cursor and clear the screen.
         let detail = "printf '\x1b[2J\x1b[H'\r\nrm -rf build";
         store
-            .append(&event(0, 2_000, "t0", "turn_started", json!({"turn": 1})))
+            .append(&event(0, 2_000, "t00", "turn_started", json!({"turn": 1})))
             .unwrap();
         for i in 1..10 {
             store
                 .append(&event(
                     i,
                     1_000,
-                    "t0",
+                    "t00",
                     "tool",
                     json!({"name": "Bash", "detail": detail}),
-                ))
-                .unwrap();
-        }
-        for i in 1..6 {
-            store
-                .append(&event(
-                    10 + i,
-                    1_000,
-                    &format!("t{i}"),
-                    "turn_started",
-                    json!({"turn": 1}),
                 ))
                 .unwrap();
         }
@@ -1797,27 +1829,27 @@ mod tests {
         let frame = view.frame(NOW, Some((40, 12)));
         assert_eq!(frame.len(), 12, "{frame:#?}");
         let plain: Vec<String> = frame.iter().map(|l| strip_sgr(l)).collect();
-        assert!(
-            plain
-                .iter()
-                .any(|l| l.starts_with("  …and 28 more task(s)")),
-            "{plain:#?}"
-        );
-        assert!(plain.contains(&"Recent changes".to_string()), "{plain:#?}");
+        // One session: no line for it. The latest tasks fill the window.
+        assert!(plain[3].starts_with("  t22 "), "{plain:#?}");
+        assert_eq!(plain[11], "  …and 22 more task(s)", "{plain:#?}");
         for (line, plain) in frame.iter().zip(&plain) {
             assert!(!plain.contains('\x1b'), "{line:?}");
             assert!(columns(plain) <= 39, "{plain:?}");
         }
-        // The last three changes fill the feed.
+        // The tool call shows on one line, dim, without its control characters.
+        let all = view.frame(NOW, Some((100, 40)));
+        let t00 = line_of(&all, "t00 ");
         assert!(
-            plain[11].contains("[t5 codex] turn 1 started"),
-            "{plain:#?}"
+            t00.ends_with("\x1b[2mBash: printf ' [2J [H' rm -rf build\x1b[0m"),
+            "{t00:?}"
         );
-        // The tool call shows on one line under its task, without its control characters.
-        assert_eq!(
-            block(&view.frame(NOW, None), "t0"),
-            ["doing      1s  Bash: printf ' [2J [H' ↵rm -rf build"]
-        );
+
+        // A task's work does not change which tasks are shown.
+        store
+            .append(&event(10, 0, "t00", "said", json!({"text": "Building."})))
+            .unwrap();
+        view.refresh();
+        assert_eq!(view.frame(NOW, Some((40, 12))), frame);
     }
 
     fn strip_sgr(line: &str) -> String {
@@ -1851,6 +1883,12 @@ mod tests {
     fn ages_past_two_days_count_days() {
         assert_eq!(age(47 * HOUR + 60_000), "47h01m");
         assert_eq!(age(435 * HOUR + 54 * 60_000), "18d03h");
+        // A task's line has room for the largest unit only.
+        let short: Vec<String> = [59_999, 60_000, HOUR - 1, HOUR, 48 * HOUR - 1, 48 * HOUR]
+            .into_iter()
+            .map(short_age)
+            .collect();
+        assert_eq!(short, ["59s", "1m", "59m", "1h", "47h", "2d"]);
     }
 
     #[test]
@@ -1874,10 +1912,32 @@ mod tests {
     }
 
     #[test]
+    fn a_task_that_cannot_be_read_for_a_moment_keeps_its_line() {
+        let h = home();
+        let store = Store::new(&h.0);
+        store
+            .save(&task("t1", "user", "running", NOW, json!({})))
+            .unwrap();
+        store
+            .save(&task("t2", "user", "idle", NOW, json!({})))
+            .unwrap();
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let before = view.frame(NOW, None);
+        std::fs::write(h.0.join("tasks").join("t1").join("task.json"), "{").unwrap();
+        view.refresh();
+        assert_eq!(view.frame(NOW, None), before);
+        store.remove("t1").unwrap();
+        view.refresh();
+        let after = view.frame(NOW, None).join("\n");
+        assert!(!after.contains("t1 ") && after.contains("t2 "), "{after}");
+    }
+
+    #[test]
     fn a_short_window_keeps_what_waits_for_someone_and_what_works() {
         let h = home();
         let store = Store::new(&h.0);
-        // Older idle tasks come first in the list, each with its result under it.
+        // Older idle tasks come first in the list.
         for i in 0..8 {
             let id = format!("t{i}");
             store
@@ -1917,39 +1977,40 @@ mod tests {
         }
         let mut view = View::new(&h.0, false);
         view.refresh();
-        // 12 lines for the table, of the 25 it has.
-        let frame: Vec<String> = view
-            .frame(NOW, Some((100, 18)))
-            .iter()
-            .map(|l| strip_sgr(l))
-            .collect();
-        let text = frame.join("\n");
-        assert_eq!(frame.len(), 18, "{text}");
-        assert_eq!(block(&frame, "tw"), ["asks       9s  q1: Which port?"]);
+        // 7 lines for the 13 of the table.
+        let frame = view.frame(NOW, Some((100, 10)));
+        let plain: Vec<String> = frame.iter().map(|l| strip_sgr(l)).collect();
+        let text = plain.join("\n");
+        assert_eq!(plain.len(), 10, "{text}");
         assert_eq!(
-            block(&frame, "tr"),
-            [
-                "needs          approval r1: push",
-                "says       8s  Pushing."
-            ]
+            cells(&plain, "tw")[3..],
+            ["waiting", "20s", "q1: Which port?"]
         );
+        assert_eq!(cells(&plain, "tr")[3..], ["approval", "7s", "r1: push"]);
         // A sub-task is shown under its parent, and its session's line with them.
         assert!(text.contains("\n  tp "), "{text}");
         assert!(text.contains("\ncodex session s\n"), "{text}");
-        // The latest of the rest fill what is left, without their results.
+        // The latest of the rest fill what is left.
         assert!(
-            text.contains("\n  t7 ") && !text.contains("\n  t0 "),
+            text.contains("\n  t7 ") && !text.contains("\n  t6 "),
             "{text}"
         );
-        assert!(!text.contains("result "), "{text}");
-        assert!(
-            text.contains("\n  …and 6 more task(s), 8 more line(s) under tasks\n"),
-            "{text}"
-        );
+        assert_eq!(plain[9], "  …and 7 more task(s)", "{text}");
         // Order is kept: sessions in the order they first spawned, sub-tasks under parents.
         let at = |s: &str| text.find(s).unwrap();
         assert!(at("\n  t7 ") < at("\n  tp ") && at("\n  tp ") < at("\n    tr "));
         assert!(at("\n    tr ") < at("codex session s"), "{text}");
+        // Only the color tells what waits for someone and what works.
+        assert!(line_of(&frame, "tw ").contains("\x1b[33mwaiting"));
+        assert!(line_of(&frame, "tr ").contains("\x1b[33mapproval"));
+        assert!(line_of(&frame, "t7 ").contains("\x1b[2midle"));
+
+        // A hidden task that changes is not brought in for it.
+        store
+            .append(&event(4, 0, "t0", "said", json!({"text": "Late words."})))
+            .unwrap();
+        view.refresh();
+        assert_eq!(view.frame(NOW, Some((100, 10))), frame);
     }
 
     #[test]
@@ -1963,13 +2024,10 @@ mod tests {
         store.save_turn("t1", 1, "").unwrap();
         let mut view = View::new(&h.0, false);
         view.refresh();
-        assert!(block(&view.frame(NOW, None), "t1").is_empty());
+        assert_eq!(cells(&view.frame(NOW, None), "t1").len(), 5);
         store.save_turn("t1", 1, "All tests pass.").unwrap();
         view.refresh();
-        assert_eq!(
-            block(&view.frame(NOW, None), "t1"),
-            ["result         All tests pass."]
-        );
+        assert_eq!(cells(&view.frame(NOW, None), "t1")[5], "All tests pass.");
     }
 
     #[test]
@@ -2113,13 +2171,18 @@ mod tests {
         // One-line texts leave 9 lines: 8 sub-tasks, what waits for someone and what went
         // wrong first, then the latest.
         assert!(text.contains("\n  …and 5 more task(s)\n"), "{text}");
-        assert!(
-            line_of(&frame, "k12 ").ends_with("  asks: q1: Which port?"),
+        assert_eq!(
+            cells(&frame, "k12")[3..],
+            ["waiting", "49s", "q1: Which port?"],
             "{text}"
         );
         // A sub-task's task text gives way to what else is told of it.
-        assert!(line_of(&frame, "k00 ").ends_with("  error: 429"), "{text}");
-        assert!(line_of(&frame, "k11 ").ends_with("  task: Part 11."));
+        assert_eq!(cells(&frame, "k00")[3..], ["failed", "1s", "429"], "{text}");
+        assert_eq!(
+            cells(&frame, "k11")[3..],
+            ["idle", "49s", "Part 11."],
+            "{text}"
+        );
         assert!(!text.contains("k05 "), "{text}");
         assert!(text.ends_with("[tp codex] Read"), "{text}");
 
