@@ -749,7 +749,7 @@ impl View {
             None => {
                 lines.push(vec![]);
                 for m in said {
-                    let text: Vec<String> = m.lines.iter().map(|l| unbold(&clean(l))).collect();
+                    let text: Vec<String> = m.plain().iter().map(|l| clean(l)).collect();
                     lines.extend(m.rows(text, false));
                 }
             }
@@ -767,10 +767,10 @@ impl View {
     }
 }
 
-/// How many lines of a message are left out, and the file with all of it: its path whole,
-/// after the count when it fits a window `width` wide, else on lines of its own.
-fn left_out(more: usize, file: Option<&Path>, width: usize) -> Vec<Vec<Seg>> {
-    let count = format!("{:LABEL$}…{more} more line(s)", "");
+/// How many lines of a message are left out, as `count` tells, and the file with all of it:
+/// its path whole, after the count when it fits a window `width` wide, else on lines of its own.
+fn left_out(count: &str, file: Option<&Path>, width: usize) -> Vec<Vec<Seg>> {
+    let count = count.to_string();
     let Some(file) = file else {
         return vec![vec![(count, DIM)]];
     };
@@ -822,9 +822,18 @@ impl Message {
     fn wrapped(&self, width: usize) -> Vec<String> {
         // The label's columns, and the last column stays empty.
         let room = width.saturating_sub(LABEL + 1);
-        self.lines
+        self.plain()
             .iter()
-            .flat_map(|l| wrap(&unbold(&clean(l)), room))
+            .flat_map(|l| wrap(&clean(l), room))
+            .collect()
+    }
+
+    /// Its lines without markdown's bold marks, taken out of all of them at once: code may
+    /// run over several lines.
+    fn plain(&self) -> Vec<String> {
+        unbold(&self.lines.join("\n"))
+            .split('\n')
+            .map(String::from)
             .collect()
     }
 
@@ -859,12 +868,17 @@ fn transcript(said: Vec<Message>, width: usize, room: usize) -> Vec<Vec<Seg>> {
             continue;
         }
         if k == 0 {
-            let room = |more| left.saturating_sub(left_out(more, m.file.as_deref(), width).len());
-            // A line of it at least, when there are two, before the count.
-            let keep = room(text.len()).max(usize::from(left >= 2));
-            let more = text.len() - keep;
-            let mut rows = m.rows(text.into_iter().take(keep).collect(), false);
-            rows.extend(left_out(more, m.file.as_deref(), width));
+            // How much is left out, and where all of it is, before any of it: with none of it
+            // shown, the count also tells when it was said.
+            let lead = |keep: usize| match keep {
+                0 => format!("{:>w$}  {} line(s)", m.label, text.len(), w = LABEL - 2),
+                _ => format!("{:LABEL$}…{} more line(s)", "", text.len() - keep),
+            };
+            let file = m.file.as_deref();
+            let keep = left.saturating_sub(left_out(&lead(1), file, width).len());
+            let note = left_out(&lead(keep), file, width);
+            let mut rows = m.rows(text[..keep].to_vec(), false);
+            rows.extend(note);
             rows.truncate(left);
             shown.push(rows);
         } else if left > 0 {
@@ -1240,8 +1254,9 @@ fn break_at(piece: &str, next: char) -> Option<usize> {
     None
 }
 
-/// A line without markdown's bold marks: `**` pairs around text, outside code spans, and not
-/// part of a path, a glob or an expression such as `src/**/*.rs` or `2**10`.
+/// Text without markdown's bold marks: `**` pairs around text, outside code, and not part of
+/// a path, a glob or an expression such as `src/**/*.rs` or `2**10`. Code is between runs of
+/// as many backticks, a fenced block's as well as a span's.
 fn unbold(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
     // Outside the marks: not a letter, digit or what joins a path or expression.
@@ -1251,12 +1266,20 @@ fn unbold(line: &str) -> String {
     let inside = |c: Option<&char>| c.is_some_and(|c| !c.is_whitespace() && !"*/".contains(*c));
     let mut marks = Vec::new();
     let mut open = None;
-    let mut code = false;
+    // The backticks that opened the code it is in, none outside.
+    let mut code = 0;
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '`' {
-            code = !code;
-        } else if !code && chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
+            let run = chars[i..].iter().take_while(|c| **c == '`').count();
+            code = match code {
+                0 => run,
+                n if n == run => 0,
+                n => n,
+            };
+            i += run;
+            continue;
+        } else if code == 0 && chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
             let (before, after) = (i.checked_sub(1).map(|j| &chars[j]), chars.get(i + 2));
             match open {
                 Some(at) if inside(before) && outside(after) => {
@@ -1879,11 +1902,10 @@ mod tests {
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
-        assert_eq!(short[1], "   20s  No bugs.", "{short:#?}");
-        assert!(
-            short[2].starts_with("        …2 more line(s); all in"),
-            "{short:#?}"
-        );
+        // With no room for both, where all of it is before any of it, with when it was said.
+        let path = store.turn_path("t1", 2).display().to_string();
+        assert_eq!(short[1], "   20s  3 line(s); all in:", "{short:#?}");
+        assert!(path.starts_with(short[2].trim_start()), "{short:#?}");
         assert!(short.iter().all(|l| columns(l) <= 59), "{short:#?}");
 
         std::fs::remove_dir_all(h.0.join("tasks").join("t1")).unwrap();
@@ -2527,6 +2549,11 @@ mod tests {
             ("2**10 and 3**2", "2**10 and 3**2"),
             ("a ** b ** c", "a ** b ** c"),
             ("`**x**` stays", "`**x**` stays"),
+            ("``a **b** c`` and **d**", "``a **b** c`` and d"),
+            (
+                "```\nprint(\"**hi**\")\n```\n**done**",
+                "```\nprint(\"**hi**\")\n```\ndone",
+            ),
         ] {
             assert_eq!(unbold(line), plain);
         }
