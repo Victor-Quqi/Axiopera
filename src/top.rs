@@ -911,11 +911,31 @@ fn tool_call(name: &str, detail: &str, cwd: &str) -> (String, String) {
         "webfetch" | "fetch" => "Fetch",
         _ => name,
     };
-    let mut detail = one_line(&unshelled(detail));
-    for sep in ['\\', '/'] {
-        detail = detail.replace(&format!("{cwd}{sep}"), "");
-    }
+    let detail = from_dir(&one_line(&unshelled(detail)), cwd);
     (verb.to_string(), detail)
+}
+
+/// Text with the paths in it that start at `cwd` written from there. Only where a path starts:
+/// with `cwd` at `/work`, `/backup/work/a` stays.
+fn from_dir(text: &str, cwd: &str) -> String {
+    if cwd.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut kept = 0;
+    for (i, _) in text.match_indices(cwd) {
+        let end = i + cwd.len();
+        let starts = text[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && !"/\\._-~:".contains(c));
+        if i >= kept && starts && text[end..].starts_with(['/', '\\']) {
+            out.push_str(&text[kept..i]);
+            kept = end + 1;
+        }
+    }
+    out.push_str(&text[kept..]);
+    out
 }
 
 /// Blocks in `room` lines of a window `width` wide, the latest last: whole while they fit, then
@@ -2904,6 +2924,27 @@ mod tests {
             ("bash", "bash"),
         ] {
             assert_eq!(unshelled(command), shown, "{command}");
+        }
+    }
+
+    #[test]
+    fn paths_are_written_from_the_task_directory_only_where_they_start() {
+        for (text, shown) in [
+            ("/work/a.rs", "a.rs"),
+            (r"D:\work\src\a.rs", r"src\a.rs"),
+            (
+                "cat /work/a /backup/work/b '/work/c'",
+                "cat a /backup/work/b 'c'",
+            ),
+            ("--file=/work/x", "--file=x"),
+            ("/workshop/a /work", "/workshop/a /work"),
+        ] {
+            let cwd = if text.starts_with('D') {
+                r"D:\work"
+            } else {
+                "/work"
+            };
+            assert_eq!(from_dir(text, cwd), shown, "{text}");
         }
     }
 

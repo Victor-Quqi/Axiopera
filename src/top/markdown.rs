@@ -44,12 +44,11 @@ impl Style {
 }
 
 /// A line of markdown to show: what goes before its first row and before the rows it wraps
-/// to, and its text. Code is not wrapped but cut, as it is laid out by its own lines.
+/// to, and its text. Code wraps too: a view that does not scroll would hide what is cut.
 struct Line {
     lead: Vec<Seg>,
     hang: Vec<Seg>,
     body: Vec<Seg>,
-    wrap: bool,
 }
 
 impl Line {
@@ -58,7 +57,6 @@ impl Line {
             lead: Vec::new(),
             hang: Vec::new(),
             body,
-            wrap: true,
         }
     }
 
@@ -68,15 +66,12 @@ impl Line {
 
     /// Its rows, broken to `room` columns, or one row without it.
     fn rows(self, room: Option<usize>) -> Vec<Vec<Seg>> {
-        let room = match room {
-            Some(room) if self.wrap => room.saturating_sub(segs_columns(&self.lead)),
-            _ => {
-                let mut row = self.lead;
-                row.extend(self.body);
-                return vec![row];
-            }
+        let Some(room) = room else {
+            let mut row = self.lead;
+            row.extend(self.body);
+            return vec![row];
         };
-        wrap_segs(&self.body, room)
+        wrap_segs(&self.body, room.saturating_sub(segs_columns(&self.lead)))
             .into_iter()
             .enumerate()
             .map(|(i, piece)| {
@@ -118,10 +113,7 @@ pub(super) fn render(lines: &[String], room: Option<usize>, cwd: &str) -> Vec<Ve
                 Some((m, k)) if m == c && k >= n && t.trim_end().chars().all(|x| x == c) => {
                     fence = None
                 }
-                _ => out.push(Line {
-                    wrap: false,
-                    ..Line::plain(vec![(line.clone(), CODE)])
-                }),
+                _ => out.push(Line::plain(vec![(line.clone(), CODE)])),
             }
             continue;
         }
@@ -180,7 +172,12 @@ fn block(line: &str, cwd: &str) -> Option<Line> {
     let t = line.trim_start();
     let indent = " ".repeat(columns(line) - columns(t));
     if let Some(level) = heading(t) {
-        let text = t[level..].trim().trim_end_matches('#').trim_end();
+        // `#`s at its end close it only after a space, unlike the one of `C#`.
+        let text = t[level..].trim();
+        let text = match text.trim_end_matches('#') {
+            closed if closed.is_empty() || closed.ends_with(' ') => closed.trim_end(),
+            _ => text,
+        };
         let style = Style {
             bold: true,
             ..Style::default()
@@ -245,15 +242,15 @@ fn item(t: &str) -> Option<(String, &str)> {
 /// as Codex shows one; or as written when that is wider than `room`.
 fn lined_up(rows: &[String], room: Option<usize>, cwd: &str) -> Vec<Line> {
     let rows: Vec<Vec<String>> = rows.iter().map(|r| cells(r)).collect();
-    let is_rule = |r: &Vec<String>| {
-        r.iter()
-            .all(|c| c.contains('-') && c.chars().all(|x| "-: ".contains(x)))
-    };
-    let header = rows.len() > 1 && is_rule(&rows[1]);
+    // Only the row under the header rules it: a row of dashes below is data.
+    let header = rows.len() > 1
+        && rows[1]
+            .iter()
+            .all(|c| c.contains('-') && c.chars().all(|x| "-: ".contains(x)));
     let styled: Vec<Vec<Vec<Seg>>> = rows
         .iter()
         .enumerate()
-        .filter(|(_, r)| !is_rule(r))
+        .filter(|(i, _)| !header || *i != 1)
         .map(|(i, r)| {
             let style = Style {
                 bold: header && i == 0,
@@ -506,7 +503,7 @@ fn on_the_web(target: &str) -> bool {
 }
 
 /// Where a link goes, to show after its text: a web address whole, and a file's path from
-/// `cwd`. Nothing when the text already says it, as in `[src/a.rs:12](/D:/p/src/a.rs:12)`.
+/// `cwd`. Nothing when the text is all of it, as in `[src/a.rs:12](/D:/p/src/a.rs:12)`.
 fn target_shown(text: &str, target: &str, cwd: &str) -> Option<String> {
     if on_the_web(target) {
         return (target != text).then(|| target.to_string());
@@ -527,7 +524,7 @@ fn target_shown(text: &str, target: &str, cwd: &str) -> Option<String> {
         path = inside.to_string();
     }
     let text = text.replace('\\', "/");
-    (path != text && !path.ends_with(&format!("/{text}"))).then_some(path)
+    (path != text).then_some(path)
 }
 
 /// `chars` styled, starting from `style`, into `out`. Links to files in `cwd` show their paths
@@ -677,7 +674,7 @@ mod tests {
             ("snake_case_name", "snake_case_name"),
             ("an `open code span", "an `open code span"),
             ("\\*not italic\\*", "*not italic*"),
-            // A link shows its text, and where it goes when the text does not say: a file's
+            // A link shows its text, and where it goes unless the text is all of it: a file's
             // path from the task's directory.
             (
                 "see [src/top.rs:1184](/D:/vc-proj/Axiopera/src/top.rs:1184) now",
@@ -685,7 +682,7 @@ mod tests {
             ),
             (
                 "[top.rs](D:\\vc-proj\\Axiopera\\src\\top.rs)",
-                "[36;4|top.rs]",
+                "[36;4|top.rs][2| (src/top.rs)]",
             ),
             (
                 "[the parser](/D:/vc-proj/Axiopera/src/parser.rs#L4)",
@@ -704,12 +701,13 @@ mod tests {
 
     #[test]
     fn blocks_have_their_own_rows() {
-        let text = "\n## Findings\n\n\n1. The reader **drops** a line.\n   - nested\n> quoted\n---\n\
+        let text = "\n## Findings ##\n## C#\n\n\n1. The reader **drops** a line.\n   - nested\n> quoted\n---\n\
                     ```rust\nlet s = \"```\";\n**not bold**\n```\nText `that spans\ntwo` lines.\n";
         assert_eq!(
             shown(&render(&lines(text), None, CWD)),
             [
                 "[1|Findings]",
+                "[1|C#]",
                 "",
                 "[2|1. ]The reader [1|drops] a line.",
                 "[2|   • ]nested",
@@ -733,7 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn rows_wrap_under_their_text_and_code_is_cut() {
+    fn rows_wrap_under_their_text() {
         let text = "- one **two** three four\n> a quote that wraps\n```\nlet code = 1;\n```";
         assert_eq!(
             shown(&render(&lines(text), Some(12), CWD)),
@@ -742,15 +740,16 @@ mod tests {
                 "  three four",
                 "[2|│ ][3|a quote]",
                 "[2|│ ][3|that wraps]",
-                "[36|let code = 1;]",
+                "[36|let code =]",
+                "[36|1;]",
             ]
         );
     }
 
     #[test]
     fn tables_line_up_their_columns_when_they_fit() {
-        let text =
-            "| File | What |\n|---|:--|\n| `a|b.rs` | **fixed** |\n| 审查.md | kept \\| too |";
+        let text = "| File | What |\n|---|:--|\n| `a|b.rs` | **fixed** |\n| 审查.md | kept \\| too |\n\
+                    | - | - |";
         let table = render(&lines(text), Some(40), CWD);
         assert_eq!(
             shown(&table),
@@ -759,6 +758,7 @@ mod tests {
                 "[2|━━━━━━━━━━━━━━━━━━━]",
                 "[36|a|b.rs]   [1|fixed]",
                 "审查.md  kept | too",
+                "-        -",
             ]
         );
         // Too wide, as written.
