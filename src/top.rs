@@ -5,7 +5,7 @@
 //! result delivered.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -441,22 +441,23 @@ impl View {
             if t.turns > 0 {
                 wanted.push(t.turns);
             }
-            // Each once: a second look in the same refresh would find a result just read whole.
             wanted.sort_unstable();
             wanted.dedup();
             tail.results.retain(|n, _| wanted.contains(n));
-            // The daemon counts a turn before writing its result, so a result may be missing
-            // or still being written, even once a later turn has begun: it is read again until
-            // its size stays.
+            // The daemon counts a turn before writing its result, and says the turn ended after:
+            // till then the result may be missing or being written, even once a later turn has
+            // begun, and it is read again when its size changes. Without the turn's end in the
+            // events, as of a task from before they told it, it is never known whole.
             for n in wanted {
                 let path = self.store.turn_path(id, n);
+                let ended = tail.ended_turns.contains(&n);
                 match tail.results.get_mut(&n) {
                     Some((_, true)) => {}
                     Some((r, whole)) if fs::metadata(&path).is_ok_and(|m| m.len() == r.len) => {
-                        *whole = true
+                        *whole = ended
                     }
                     _ => match read_text(&path) {
-                        Some(r) => drop(tail.results.insert(n, (r, false))),
+                        Some(r) => drop(tail.results.insert(n, (r, ended))),
                         None => drop(tail.results.remove(&n)),
                     },
                 }
@@ -1492,8 +1493,10 @@ struct Tail {
     /// `prompt.md`, read once.
     prompt: Option<Text>,
     /// Results by turn: the latest, and those of the turns whose last messages are kept; and
-    /// whether each is whole, its size the same when read again.
+    /// whether each is whole, read after its turn ended.
     results: BTreeMap<u32, (Text, bool)>,
+    /// The turns the events tell ended.
+    ended_turns: BTreeSet<u32>,
 }
 
 impl Tail {
@@ -1510,6 +1513,7 @@ impl Tail {
             stop: None,
             prompt: None,
             results: BTreeMap::new(),
+            ended_turns: BTreeSet::new(),
         }
     }
 
@@ -1548,6 +1552,7 @@ impl Tail {
             "turn_ended" => {
                 self.in_turn = false;
                 self.ended_ms = e.ts;
+                self.ended_turns.extend(turn());
                 // Its last message, if said in it, is its result.
                 let since = self.started_ms;
                 let last = self.log.iter_mut().rev().take_while(|l| l.at >= since);
@@ -2631,7 +2636,8 @@ mod tests {
             ["t1", "idle", "All tests pass."]
         );
 
-        // Read half written, and the next turn over before the next refresh: it is read again.
+        // Read half written, for longer than a refresh, and the next turn over before it is
+        // whole: it is read again.
         let said = |seq, turn| {
             store
                 .append(&event(seq, 1_000, "t1", "said", json!({"text": "Part"})))
@@ -2641,9 +2647,10 @@ mod tests {
                 .append(&event(seq + 1, 1_000, "t1", "turn_ended", ended))
                 .unwrap();
         };
-        said(1, 1);
         store.save_turn("t1", 1, "Part").unwrap();
         view.refresh();
+        view.refresh();
+        said(1, 1);
         said(3, 2);
         store
             .save(&task("t1", "user", "idle", NOW, json!({"turns": 2})))
