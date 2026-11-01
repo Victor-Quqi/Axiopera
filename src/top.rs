@@ -133,8 +133,9 @@ struct View {
     all: bool,
     tasks: HashMap<String, Task>,
     tails: HashMap<String, Tail>,
-    /// The widest cells seen since top started: columns widen for a new task, and do not
-    /// narrow when one leaves, which would move every line.
+    /// The widest cells of the list seen since top started: columns widen once for a new
+    /// task, when its line moves the others anyway, and do not narrow when one leaves, which
+    /// would move every line.
     widths: Widths,
     /// When each session first spawned, by its caller, as seen since top started: sessions
     /// keep their order when their oldest tasks are hidden or removed.
@@ -148,10 +149,7 @@ impl View {
             all,
             tasks: HashMap::new(),
             tails: HashMap::new(),
-            widths: Widths {
-                id: columns("  TASK"),
-                name: columns("NAME"),
-            },
+            widths: Widths::LEAST,
             first_spawned: HashMap::new(),
         }
     }
@@ -187,10 +185,8 @@ impl View {
                     .or_insert(u64::MAX);
                 *at = (*at).min(t.created_ms);
             }
-            self.widths = Widths {
-                id: self.widths.id.max(2 * depth + columns(&t.id)),
-                name: self.widths.name.max(columns(&name_cell(t)).min(NAME)),
-            };
+            let cell = format!("{}{}", "  ".repeat(depth), t.id);
+            self.widths = self.widths.with(&cell, t);
         }
         let store = &self.store;
         self.tails.retain(|id, _| store.exists(id));
@@ -474,7 +470,11 @@ impl View {
             .into_iter()
             .map(|k| (format!("  {}", k.id), k))
             .collect();
-        let kid_widths = self.widths;
+        // Its own sub-tasks' widths: a task elsewhere does not move these lines. All of them
+        // are shown, so only one spawned or removed changes them.
+        let kid_widths = kids
+            .iter()
+            .fold(Widths::LEAST, |w, (cell, k)| w.with(cell, k));
         let kids: Vec<Row> = kids
             .iter()
             .map(|(cell, k)| self.task_row(cell, k, kid_widths, now))
@@ -556,6 +556,16 @@ struct Widths {
 }
 
 impl Widths {
+    const LEAST: Widths = Widths { id: 6, name: 4 };
+
+    /// Wide enough for a task's line too, given with its ID cell.
+    fn with(self, cell: &str, t: &Task) -> Widths {
+        Widths {
+            id: self.id.max(columns(cell)),
+            name: self.name.max(columns(&name_cell(t)).min(NAME)),
+        }
+    }
+
     /// The columns' titles.
     fn header(self) -> Vec<Seg> {
         vec![(
@@ -1684,6 +1694,22 @@ mod tests {
             "{fitted:#?}"
         );
         assert!(fitted.iter().all(|l| columns(&strip_sgr(l)) <= 59));
+
+        // A task elsewhere does not move its sub-tasks' lines.
+        store
+            .save(&task(
+                "t9",
+                "user",
+                "idle",
+                NOW,
+                json!({"name": "a long name elsewhere"}),
+            ))
+            .unwrap();
+        view.refresh();
+        assert_eq!(
+            line_of(&view.task_frame("t1", NOW, None), "t2 "),
+            line_of(&frame, "t2 ")
+        );
 
         std::fs::remove_dir_all(h.0.join("tasks").join("t1")).unwrap();
         view.refresh();
