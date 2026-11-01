@@ -430,7 +430,7 @@ impl View {
                 tail.absorb(&e);
             }
             // The results of the turns whose last messages are kept, and the latest.
-            let ended: Vec<u32> = tail
+            let mut wanted: Vec<u32> = tail
                 .log
                 .iter()
                 .filter_map(|l| match l.what {
@@ -438,29 +438,27 @@ impl View {
                     _ => None,
                 })
                 .collect();
-            tail.results
-                .retain(|n, _| *n == t.turns || ended.contains(n));
-            // The daemon counts a turn before writing its result, so the latest may be missing
-            // or still being written: it is read again until its size stays. One before it is
-            // read once.
             if t.turns > 0 {
-                let path = self.store.turn_path(id, t.turns);
-                let read = tail
-                    .results
-                    .get(&t.turns)
-                    .is_some_and(|r| fs::metadata(&path).is_ok_and(|m| m.len() == r.len));
-                if !read {
-                    match read_text(&path) {
-                        Some(r) => tail.results.insert(t.turns, r),
-                        None => tail.results.remove(&t.turns),
-                    };
-                }
+                wanted.push(t.turns);
             }
-            for n in ended {
-                if !tail.results.contains_key(&n)
-                    && let Some(r) = read_text(&self.store.turn_path(id, n))
-                {
-                    tail.results.insert(n, r);
+            // Each once: a second look in the same refresh would find a result just read whole.
+            wanted.sort_unstable();
+            wanted.dedup();
+            tail.results.retain(|n, _| wanted.contains(n));
+            // The daemon counts a turn before writing its result, so a result may be missing
+            // or still being written, even once a later turn has begun: it is read again until
+            // its size stays.
+            for n in wanted {
+                let path = self.store.turn_path(id, n);
+                match tail.results.get_mut(&n) {
+                    Some((_, true)) => {}
+                    Some((r, whole)) if fs::metadata(&path).is_ok_and(|m| m.len() == r.len) => {
+                        *whole = true
+                    }
+                    _ => match read_text(&path) {
+                        Some(r) => drop(tail.results.insert(n, (r, false))),
+                        None => drop(tail.results.remove(&n)),
+                    },
                 }
             }
         }
@@ -746,7 +744,10 @@ impl View {
         // A turn's last message is its result, whole in its file. The latest result whose
         // message is not among them, as of a task from before messages were kept, comes on its
         // own.
-        let result = |turn: u32| tail.results.get(&turn).filter(|r| !r.lines.is_empty());
+        let result = |turn: u32| {
+            let (r, _) = tail.results.get(&turn)?;
+            Some(r).filter(|r| !r.lines.is_empty())
+        };
         let as_result =
             |turn: u32, r: &Text| Block::said(r.shown(), Some(self.store.turn_path(id, turn)));
         let mut result_shown = false;
@@ -1255,7 +1256,7 @@ fn words(t: &Task, tail: &Tail) -> Option<String> {
         (Some((said, at)), Some(q)) if *at > q.asked_ms => said.clone(),
         (_, Some(q)) => q.text.clone(),
         (Some((said, _)), None) => said.clone(),
-        (None, None) => tail.results.get(&t.turns)?.lines.first()?.clone(),
+        (None, None) => tail.results.get(&t.turns)?.0.lines.first()?.clone(),
     };
     // Its lines are joined by spaces: the daemon's marks between them would only clutter one.
     Some(one_line(&uncounted(&text).replace(" ↵ ", " ")))
@@ -1490,8 +1491,9 @@ struct Tail {
     stop: Option<(&'static str, String)>,
     /// `prompt.md`, read once.
     prompt: Option<Text>,
-    /// Results by turn: the latest, and those of the turns whose last messages are kept.
-    results: BTreeMap<u32, Text>,
+    /// Results by turn: the latest, and those of the turns whose last messages are kept; and
+    /// whether each is whole, its size the same when read again.
+    results: BTreeMap<u32, (Text, bool)>,
 }
 
 impl Tail {
@@ -2627,6 +2629,32 @@ mod tests {
         assert_eq!(
             cells(&view.frame(NOW, None, None), "t1"),
             ["t1", "idle", "All tests pass."]
+        );
+
+        // Read half written, and the next turn over before the next refresh: it is read again.
+        let said = |seq, turn| {
+            store
+                .append(&event(seq, 1_000, "t1", "said", json!({"text": "Part"})))
+                .unwrap();
+            let ended = json!({"turn": turn, "ok": true});
+            store
+                .append(&event(seq + 1, 1_000, "t1", "turn_ended", ended))
+                .unwrap();
+        };
+        said(1, 1);
+        store.save_turn("t1", 1, "Part").unwrap();
+        view.refresh();
+        said(3, 2);
+        store
+            .save(&task("t1", "user", "idle", NOW, json!({"turns": 2})))
+            .unwrap();
+        store.save_turn("t1", 1, "Part one.\nPart two.").unwrap();
+        store.save_turn("t1", 2, "Done.").unwrap();
+        view.refresh();
+        let text = view.task_frame("t1", NOW, None, false).join("\n");
+        assert!(
+            text.contains("\n• Part one.\n  Part two.\n\n• Done."),
+            "{text}"
         );
     }
 
