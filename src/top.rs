@@ -1,7 +1,8 @@
-//! `axiopera top`: every task on one line, with what matters most of it now, redrawn each
-//! second for a person watching sub-agents work; `top <task>` shows one task in detail. It only
-//! reads the data directory and never connects to the daemon, so it starts nothing, takes no
-//! messages and marks no result delivered.
+//! `axiopera top`: every task on one line, its name, its state and what it last said, redrawn
+//! each second for a person watching sub-agents work. The arrow keys choose a task and Enter
+//! shows it in detail, as `top <task>` does; Esc goes back. It only reads the data directory
+//! and never connects to the daemon, so it starts nothing, takes no messages and marks no
+//! result delivered.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -36,18 +37,18 @@ const READ_BYTES: u64 = 64 * 1024;
 const WITH_TASKS: u8 = u8::MAX;
 /// Assumed when the terminal does not tell its size.
 const FALLBACK_SIZE: (usize, usize) = (100, 30);
-/// Characters of a task name shown.
-const NAME: usize = 16;
+/// Columns of a task's name shown in its line.
+const NAME: usize = 20;
 /// Characters of a host session's ID shown: enough to tell sessions apart.
 const SESSION: usize = 8;
-/// Columns of the agent cell of a task's line.
-const AGENT: usize = 6;
 /// Columns of the state cell: its longest word, `interrupted`, so that a state that comes and
 /// goes does not move the cells after it.
 const STATE: usize = 11;
 
 const BOLD: &str = "1";
 const DIM: &str = "2";
+/// The chosen task's line, given as the color of an empty first piece: see `paint`.
+const CHOSEN: &str = "7";
 const RED: &str = "31";
 const GREEN: &str = "32";
 const YELLOW: &str = "33";
@@ -59,13 +60,13 @@ pub async fn run(home: &Path, task: Option<&str>, all: bool) -> Result<i32> {
     let mut view = View::new(home, all);
     view.refresh();
     let focus = task.map(|r| view.find(r)).transpose()?;
-    let draw = |view: &View, size| match &focus {
-        Some(id) => view.task_frame(id, store::now_ms(), size),
-        None => view.frame(store::now_ms(), size),
-    };
     if !std::io::stdout().is_terminal() {
         let mut out = std::io::stdout().lock();
-        for line in draw(&view, None) {
+        let lines = match &focus {
+            Some(id) => view.task_frame(id, store::now_ms(), None, false),
+            None => view.frame(store::now_ms(), None, None),
+        };
+        for line in lines {
             writeln!(out, "{line}")?;
         }
         return Ok(0);
@@ -78,29 +79,179 @@ pub async fn run(home: &Path, task: Option<&str>, all: bool) -> Result<i32> {
         _ = &mut stop => return Ok(0),
         () = std::future::ready(()) => {}
     }
+    // Without a terminal to read keys from, such as mintty without ConPTY, the view only
+    // shows, and Ctrl-C is a signal as before.
+    let keys = match std::io::stdin().is_terminal() {
+        true => platform::Keys::enable(),
+        false => None,
+    };
+    let (send, mut pressed) = tokio::sync::mpsc::unbounded_channel();
+    if keys.is_some() {
+        std::thread::spawn(move || read_keys(send));
+    }
+    let mut ui = Ui {
+        open: focus.clone(),
+        chosen: focus,
+        keys: keys.is_some(),
+    };
     let _ansi = platform::Ansi::enable();
     // The alternate screen leaves the shell's scrollback as it was. Without autowrap, a line
     // wider than measured is clipped instead of pushing the frame down.
     show("\x1b[?1049h\x1b[?25l\x1b[?7l")?;
+    let mut tick = tokio::time::interval(REFRESH);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
     let drawn = loop {
         let size = platform::terminal_size()
             .filter(|&(w, h)| w > 0 && h > 0)
             .or_else(env_size)
             .unwrap_or(FALLBACK_SIZE);
         // Drawn over the last frame instead of after clearing it, which would flicker.
-        let lines = draw(&view, Some(size));
+        let lines = ui.draw(&view, store::now_ms(), size);
         if let Err(e) = show(&format!("\x1b[H{}\x1b[K\x1b[J", lines.join("\x1b[K\r\n"))) {
             break Err(e);
         }
+        // A key is followed at once; the files are read again each second.
         tokio::select! {
             _ = &mut stop => break Ok(()),
-            () = tokio::time::sleep(REFRESH) => {}
+            Some(key) = pressed.recv() => {
+                if !ui.press(key, &view, store::now_ms()) {
+                    break Ok(());
+                }
+            }
+            _ = tick.tick() => view.refresh(),
         }
-        view.refresh();
     };
     show("\x1b[?7h\x1b[?25h\x1b[?1049l")?;
+    drop(keys);
     drawn?;
     Ok(0)
+}
+
+/// A key that does something in `top`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Key {
+    Up,
+    Down,
+    Open,
+    Back,
+    /// `q`: back from a task, or quit from the list.
+    Q,
+    Quit,
+}
+
+/// The keys in what one read of the terminal gave. Terminals send an escape sequence whole, so
+/// an escape that ends a read is the Esc key.
+fn keys(bytes: &[u8]) -> Vec<Key> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        let (key, used) = match rest {
+            // CSI: parameters, then a final byte. SS3: one byte.
+            [0x1b, b'[', tail @ ..] => {
+                let params = tail
+                    .iter()
+                    .take_while(|b| (0x20..0x40).contains(*b))
+                    .count();
+                (tail.get(params).and_then(|b| arrow(*b)), 2 + params + 1)
+            }
+            [0x1b, b'O', b, ..] => (arrow(*b), 3),
+            [0x1b, ..] => (Some(Key::Back), 1),
+            [b'\r' | b'\n', ..] => (Some(Key::Open), 1),
+            [b'k', ..] => (Some(Key::Up), 1),
+            [b'j', ..] => (Some(Key::Down), 1),
+            [b'q', ..] => (Some(Key::Q), 1),
+            [0x7f | 0x08, ..] => (Some(Key::Back), 1),
+            [0x03, ..] => (Some(Key::Quit), 1),
+            _ => (None, 1),
+        };
+        out.extend(key);
+        i += used;
+    }
+    out
+}
+
+/// The key an arrow's last byte stands for: right opens, left goes back.
+fn arrow(b: u8) -> Option<Key> {
+    match b {
+        b'A' => Some(Key::Up),
+        b'B' => Some(Key::Down),
+        b'C' => Some(Key::Open),
+        b'D' => Some(Key::Back),
+        _ => None,
+    }
+}
+
+/// Reads keys from stdin until `top` ends. Blocks, so it runs on a thread of its own.
+fn read_keys(send: tokio::sync::mpsc::UnboundedSender<Key>) {
+    let mut stdin = std::io::stdin().lock();
+    let mut bytes = [0; 64];
+    loop {
+        match stdin.read(&mut bytes) {
+            // A Windows console reads Ctrl-Z as the end of input: nothing to do.
+            Ok(0) => std::thread::sleep(Duration::from_millis(50)),
+            Ok(n) => {
+                for key in keys(&bytes[..n]) {
+                    if send.send(key).is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
+}
+
+/// What a person looks at: the list or one task, and the task chosen in the list.
+struct Ui {
+    /// The task shown alone, if any.
+    open: Option<String>,
+    /// The task whose line is marked in the list, which Enter opens.
+    chosen: Option<String>,
+    /// Whether keys can be read: without them nothing is chosen.
+    keys: bool,
+}
+
+impl Ui {
+    fn draw(&mut self, view: &View, now: u64, size: (usize, usize)) -> Vec<String> {
+        if let Some(id) = &self.open {
+            return view.task_frame(id, now, Some(size), self.keys);
+        }
+        if self.keys {
+            // The first task when the chosen one is gone or none was.
+            let ids = view.order(now);
+            if !self.chosen.as_ref().is_some_and(|c| ids.contains(c)) {
+                self.chosen = ids.into_iter().next();
+            }
+        }
+        view.frame(now, Some(size), self.chosen.as_deref())
+    }
+
+    /// Follows a key. Returns false when it quits.
+    fn press(&mut self, key: Key, view: &View, now: u64) -> bool {
+        match (key, &self.open) {
+            (Key::Quit, _) | (Key::Q, None) => return false,
+            (Key::Back | Key::Q, Some(_)) => self.open = None,
+            (Key::Open, None) => self.open = self.chosen.clone(),
+            (Key::Up | Key::Down, None) => {
+                let ids = view.order(now);
+                let at = self
+                    .chosen
+                    .as_ref()
+                    .and_then(|c| ids.iter().position(|id| id == c));
+                let next = match (key, at) {
+                    (Key::Up, Some(i)) => i.saturating_sub(1),
+                    (_, Some(i)) => (i + 1).min(ids.len().saturating_sub(1)),
+                    _ => 0,
+                };
+                self.chosen = ids.into_iter().nth(next);
+            }
+            _ => {}
+        }
+        true
+    }
 }
 
 fn show(s: &str) -> std::io::Result<()> {
@@ -133,10 +284,10 @@ struct View {
     all: bool,
     tasks: HashMap<String, Task>,
     tails: HashMap<String, Tail>,
-    /// The widest cells of the list seen since top started: columns widen once for a new
-    /// task, when its line moves the others anyway, and do not narrow when one leaves, which
-    /// would move every line.
-    widths: Widths,
+    /// The widest name cell of the list seen since top started: the column widens once for a
+    /// new task, when its line moves the others anyway, and does not narrow when one leaves,
+    /// which would move every line.
+    width: usize,
     /// When each session first spawned, by its caller, as seen since top started: sessions
     /// keep their order when their oldest tasks are hidden or removed.
     first_spawned: HashMap<String, u64>,
@@ -149,7 +300,7 @@ impl View {
             all,
             tasks: HashMap::new(),
             tails: HashMap::new(),
-            widths: Widths::LEAST,
+            width: 0,
             first_spawned: HashMap::new(),
         }
     }
@@ -185,8 +336,7 @@ impl View {
                     .or_insert(u64::MAX);
                 *at = (*at).min(t.created_ms);
             }
-            let cell = format!("{}{}", "  ".repeat(depth), t.id);
-            self.widths = self.widths.with(&cell, t);
+            self.width = self.width.max(columns(&name_cell(depth, t)));
         }
         let store = &self.store;
         self.tails.retain(|id, _| store.exists(id));
@@ -245,9 +395,10 @@ impl View {
         self.tails.get(id).unwrap_or(&NONE)
     }
 
-    /// A line for each task: fitted to `size` with colors, or whole and plain without it.
-    fn frame(&self, now: u64, size: Option<(usize, usize)>) -> Vec<String> {
-        let (header, rows, hidden) = self.table(now);
+    /// A line for each task: fitted to `size` with colors, or whole and plain without it. The
+    /// `chosen` task's line is marked and always shown.
+    fn frame(&self, now: u64, size: Option<(usize, usize)>, chosen: Option<&str>) -> Vec<String> {
+        let (mut rows, hidden) = self.table(now);
         let count = |s: Status| self.tasks.values().filter(|t| t.status == s).count();
         let approvals: usize = self
             .tasks
@@ -273,12 +424,20 @@ impl View {
         if hidden > 0 {
             title.push((format!("  {hidden} older hidden (--all)"), DIM));
         }
+        if chosen.is_some() {
+            title.push(("  ↑↓ choose  Enter open  q quit".into(), DIM));
+        }
         let mut lines = vec![title, vec![]];
         if rows.is_empty() {
             lines.push(vec![("no tasks".into(), DIM)]);
             return finish(&lines, size);
         }
-        lines.push(header);
+        if let Some(row) = chosen.and_then(|c| rows.iter_mut().find(|r| r.id.as_deref() == Some(c)))
+        {
+            row.rank = 0;
+            row.spawned = u64::MAX;
+            row.segs.insert(0, (String::new(), CHOSEN));
+        }
         match size {
             None => lines.extend(rows.into_iter().map(|r| r.segs)),
             Some((_, height)) => {
@@ -289,10 +448,14 @@ impl View {
         finish(&lines, size)
     }
 
+    /// The tasks of the list in its order, for the keys that choose one.
+    fn order(&self, now: u64) -> Vec<String> {
+        self.table(now).0.into_iter().filter_map(|r| r.id).collect()
+    }
+
     /// A line for each task, sub-tasks under their parent, and with several sessions a line
-    /// for each above the tasks it spawned; with the columns' titles. Also returns how many
-    /// stopped tasks are left out.
-    fn table(&self, now: u64) -> (Vec<Seg>, Vec<Row>, usize) {
+    /// for each above the tasks it spawned. Also returns how many stopped tasks are left out.
+    fn table(&self, now: u64) -> (Vec<Row>, usize) {
         let mut shown: HashSet<&str> = self
             .tasks
             .values()
@@ -339,29 +502,24 @@ impl View {
                 },
             )
             .collect();
-        // Lines in order: `None` for a session's, else the task with its ID cell, indented
-        // by its depth.
-        let mut order: Vec<(&str, Option<(String, &Task)>)> = Vec::new();
+        // Lines in order: `None` for a session's, else the task with its depth.
+        let mut order: Vec<(&str, Option<(usize, &Task)>)> = Vec::new();
         for (caller, roots) in &groups {
             order.push((*caller, None));
             let mut stack: Vec<(usize, &Task)> = roots.iter().rev().map(|t| (1, *t)).collect();
             while let Some((depth, t)) = stack.pop() {
-                order.push((
-                    *caller,
-                    Some((format!("{}{}", "  ".repeat(depth), t.id), t)),
-                ));
+                order.push((*caller, Some((depth, t))));
                 if let Some(kids) = children.get(t.id.as_str()) {
                     stack.extend(kids.iter().rev().map(|k| (depth + 1, *k)));
                 }
             }
         }
-        let widths = self.widths;
         let several = groups.len() > 1;
         let mut rows = Vec::new();
         let mut lines: HashMap<&str, usize> = HashMap::new();
         let mut group = None;
         for (caller, row) in order {
-            let Some((cell, t)) = row else {
+            let Some((depth, t)) = row else {
                 if several {
                     group = Some(rows.len());
                     rows.push(Row {
@@ -381,63 +539,68 @@ impl View {
             lines.insert(&t.id, rows.len());
             rows.push(Row {
                 with,
-                ..self.task_row(&cell, t, widths, now)
+                ..self.task_row(&name_cell(depth, t), t, self.width)
             });
         }
-        (widths.header(), rows, hidden)
+        (rows, hidden)
     }
 
-    /// A task on one line: its ID cell, name, agent and state, the time since it last
-    /// changed, and what matters most of it now.
-    fn task_row(&self, cell: &str, t: &Task, widths: Widths, now: u64) -> Row {
+    /// A task on one line: its name, indented by its depth, its state, and what it last said.
+    fn task_row(&self, cell: &str, t: &Task, width: usize) -> Row {
         let tail = self.tail(&t.id);
         let (state, color) = state(t, tail);
-        let mut segs = vec![
-            (
-                format!(
-                    "{}  {}  {}  ",
-                    pad(cell, widths.id),
-                    pad(&name_cell(t), widths.name),
-                    pad(render::agent_name(t.agent), AGENT)
-                ),
-                "",
-            ),
-            (pad(state, STATE), color),
-            (
-                format!(
-                    "  {:>4}  ",
-                    short_age(now.saturating_sub(last_change(t, tail)))
-                ),
-                DIM,
-            ),
-        ];
-        if let Some((label, text)) = latest(t, tail) {
-            segs.push((format!("{label:<6}  "), DIM));
-            segs.push((text, ""));
+        let mut segs = vec![(format!("{}  ", pad(cell, width)), "")];
+        match words(t, tail) {
+            Some(text) => {
+                segs.push((pad(state, STATE), color));
+                segs.push((format!("  {text}"), ""));
+            }
+            None => segs.push((state.into(), color)),
         }
         Row {
             rank: rank(t, tail),
             spawned: t.created_ms,
+            id: Some(t.id.clone()),
             ..Row::new(segs)
         }
     }
 
     /// One task in detail: what it is and what it waits for, says and does now, then what it
-    /// was given, its sub-tasks, its latest result and its events.
-    fn task_frame(&self, id: &str, now: u64, size: Option<(usize, usize)>) -> Vec<String> {
+    /// was given, its sub-tasks, its latest result and its events. With `keys`, its title says
+    /// how to go back to the list.
+    fn task_frame(
+        &self,
+        id: &str,
+        now: u64,
+        size: Option<(usize, usize)>,
+        keys: bool,
+    ) -> Vec<String> {
+        // The way back is told however narrow the window: the title gives way to it.
+        let width = size.map(|(w, _)| w);
+        let back = |title: Vec<Seg>| match keys {
+            true => hinted(title, "  Esc back", width),
+            false => title,
+        };
         let Some(t) = self.tasks.get(id) else {
             let gone = format!("{id} is gone: it was removed, by gc or by hand");
-            return finish(&[vec![(gone, DIM)]], size);
+            return finish(&[back(vec![(gone, DIM)])], size);
         };
         let tail = self.tail(id);
         let ago = |ms: u64| age(now.saturating_sub(ms));
         let (state, color) = state(t, tail);
-        let title: Vec<Seg> = vec![
+        let title = back(vec![
             (format!("axiopera top {id}"), BOLD),
-            (format!("  {}  {}  ", name_cell(t), agent_cell(t)), ""),
+            (
+                format!(
+                    "  {}  {}  ",
+                    t.name.as_deref().unwrap_or("-"),
+                    agent_cell(t)
+                ),
+                "",
+            ),
             (state.into(), color),
             (format!("  {}", meta(t, tail, now)), ""),
-        ];
+        ]);
         // Its session's ID last: whole, it is long.
         let mut about = format!("spawned {} ago in {}", ago(t.created_ms), t.cwd.display());
         if let Some(model) = &t.model {
@@ -463,7 +626,6 @@ impl View {
         }
         head.extend(now_rows);
 
-        let width = size.map(|(w, _)| w);
         let task_text = match &tail.prompt {
             Some(text) => Section::Text(
                 "Task".into(),
@@ -480,18 +642,16 @@ impl View {
             .filter(|k| identity::task_of(&k.parent) == Some(id))
             .collect();
         kids.sort_by_key(|k| (k.created_ms, k.id.as_str()));
-        let kids: Vec<(String, &Task)> = kids
-            .into_iter()
-            .map(|k| (format!("  {}", k.id), k))
-            .collect();
-        // Its own sub-tasks' widths: a task elsewhere does not move these lines. All of them
-        // are shown, so only one spawned or removed changes them.
-        let kid_widths = kids
+        // Its own sub-tasks' width: a task elsewhere does not move these lines. All of them
+        // are shown, so only one spawned or removed changes it.
+        let kid_width = kids
             .iter()
-            .fold(Widths::LEAST, |w, (cell, k)| w.with(cell, k));
+            .map(|k| columns(&name_cell(1, k)))
+            .max()
+            .unwrap_or(0);
         let kids: Vec<Row> = kids
             .iter()
-            .map(|(cell, k)| self.task_row(cell, k, kid_widths, now))
+            .map(|k| self.task_row(&name_cell(1, k), k, kid_width))
             .collect();
         let events: Vec<Vec<Seg>> = tail.recent.iter().map(|e| event_row(e, t, now)).collect();
 
@@ -653,41 +813,6 @@ fn arrange(sections: &[&Section], room: usize) -> (Vec<usize>, bool) {
     (rooms, false)
 }
 
-// Widths of the ID and name columns of task lines, as wide as their widest cells, so that
-/// what matters most of each task has the rest.
-#[derive(Clone, Copy)]
-struct Widths {
-    id: usize,
-    name: usize,
-}
-
-impl Widths {
-    const LEAST: Widths = Widths { id: 6, name: 4 };
-
-    /// Wide enough for a task's line too, given with its ID cell.
-    fn with(self, cell: &str, t: &Task) -> Widths {
-        Widths {
-            id: self.id.max(columns(cell)),
-            name: self.name.max(columns(&name_cell(t)).min(NAME)),
-        }
-    }
-
-    /// The columns' titles.
-    fn header(self) -> Vec<Seg> {
-        vec![(
-            format!(
-                "{}  {}  {}  {}  {:>4}  LATEST",
-                pad("  TASK", self.id),
-                pad("NAME", self.name),
-                pad("AGENT", AGENT),
-                pad("STATE", STATE),
-                "AGO"
-            ),
-            DIM,
-        )]
-    }
-}
-
 /// Lines for sections that want `wants` lines, out of `room`: first their `mins`, then an
 /// equal share each of what is left, up to what they want.
 fn share(wants: &[usize], mins: &[usize], room: usize) -> Vec<usize> {
@@ -707,9 +832,21 @@ fn share(wants: &[usize], mins: &[usize], room: usize) -> Vec<usize> {
     }
 }
 
-/// When a task last changed, by its own account or by its latest event.
-fn last_change(t: &Task, tail: &Tail) -> u64 {
-    tail.recent.back().map_or(0, |e| e.ts).max(t.updated_ms)
+/// A title with `hint` at its end, cut so that the hint fits a window `width` wide.
+fn hinted(title: Vec<Seg>, hint: &str, width: Option<usize>) -> Vec<Seg> {
+    // The last column stays empty.
+    let mut room = width.map_or(usize::MAX, |w| w.saturating_sub(1 + columns(hint)));
+    let mut out = Vec::new();
+    for (text, color) in title {
+        let (piece, cut) = fit(&clean(&text), room);
+        room -= columns(&piece);
+        out.push((piece, color));
+        if cut {
+            break;
+        }
+    }
+    out.push((hint.to_string(), DIM));
+    out
 }
 
 /// The lines painted, and no more than the window holds.
@@ -731,6 +868,8 @@ struct Row {
     spawned: u64,
     /// The lines it is shown with: its session's and its ancestors'.
     with: Vec<usize>,
+    /// Its task's, for a task's line.
+    id: Option<String>,
 }
 
 impl Row {
@@ -740,6 +879,7 @@ impl Row {
             rank: 0,
             spawned: 0,
             with: Vec::new(),
+            id: None,
         }
     }
 }
@@ -820,8 +960,10 @@ fn event_row(e: &Event, t: &Task, now: u64) -> Vec<Seg> {
     ]
 }
 
-fn name_cell(t: &Task) -> String {
-    t.name.clone().unwrap_or_else(|| "-".into())
+/// A task's cell in a list: its name, or its ID without one, indented by its depth.
+fn name_cell(depth: usize, t: &Task) -> String {
+    let name = clean(t.name.as_deref().unwrap_or(&t.id));
+    format!("{}{}", "  ".repeat(depth), fit(&name, NAME).0)
 }
 
 fn agent_cell(t: &Task) -> String {
@@ -860,7 +1002,7 @@ fn meta(t: &Task, tail: &Tail, now: u64) -> String {
 }
 
 /// A line under a task's title in its view: what it waits for, says or does, or how it ended
-/// badly. Only its label tells which, as in the list.
+/// badly. Only its label tells which.
 struct Detail {
     label: &'static str,
     at: Option<u64>,
@@ -929,37 +1071,20 @@ fn waits(t: &Task, tail: &Tail) -> bool {
         || !t.status.is_final() && t.open_questions().next().is_some()
 }
 
-/// What matters most of a task now, for its line, with a label that tells what it is: what
-/// it waits for (`needs`, `asks`), what it last said (`says`), how it ended (`result`, `error`,
-/// `why`), or else what it was given (`task`). Tool calls are left to the task's view: they
-/// change too often to read.
-fn latest(t: &Task, tail: &Tail) -> Option<(&'static str, String)> {
-    let more = |n: usize| match n {
-        0 | 1 => String::new(),
-        n => format!(" (and {} more)", n - 1),
+/// What a task last said, for its line: its latest message, or a question it asks since. A
+/// task whose messages are no longer in its events has the first line of its latest result.
+fn words(t: &Task, tail: &Tail) -> Option<String> {
+    let asked = match t.status.is_final() {
+        true => None,
+        false => t.open_questions().max_by_key(|q| q.asked_ms),
     };
-    let first = |text: Option<&Text>| text?.lines.first().cloned();
-    let open: Vec<_> = match t.status.is_final() {
-        true => Vec::new(),
-        false => t.open_questions().collect(),
+    let text = match (&tail.words, asked) {
+        (Some((said, at)), Some(q)) if *at > q.asked_ms => said.clone(),
+        (_, Some(q)) => q.text.clone(),
+        (Some((said, _)), None) => said.clone(),
+        (None, None) => tail.result.as_ref()?.1.lines.first()?.clone(),
     };
-    let found = match (tail.approvals.first(), open.first()) {
-        (Some((id, summary)), _) if t.status == Status::Running => Some((
-            "needs",
-            format!("approval {id}: {summary}{}", more(tail.approvals.len())),
-        )),
-        (_, Some(q)) => Some(("asks", format!("{}: {}{}", q.id, q.text, more(open.len())))),
-        _ => match t.status {
-            Status::Running | Status::Queued => {
-                tail.said.as_ref().map(|(text, _)| ("says", text.clone()))
-            }
-            _ => stop(t, tail)
-                .map(|(label, text, _)| (label, text.to_string()))
-                .or_else(|| Some(("result", first(tail.result.as_ref().map(|(_, r)| r))?))),
-        },
-    };
-    let (label, text) = found.or_else(|| Some(("task", first(tail.prompt.as_ref())?)))?;
-    Some((label, one_line(&text)))
+    Some(one_line(&text))
 }
 
 /// Text on one line: its lines and runs of spaces joined by single spaces.
@@ -974,16 +1099,6 @@ fn age(ms: u64) -> String {
         return render::duration(ms);
     }
     format!("{}d{:02}h", ms / DAY_MS, ms % DAY_MS / (60 * 60 * 1000))
-}
-
-/// A duration in its largest unit, for a task's line: it changes once a minute past the first.
-fn short_age(ms: u64) -> String {
-    match ms / 1000 {
-        s @ 0..60 => format!("{s}s"),
-        s @ 60..3600 => format!("{}m", s / 60),
-        s @ 3600..172_800 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
-    }
 }
 
 fn active(t: &Task) -> bool {
@@ -1181,6 +1296,8 @@ struct Tail {
     last_tool: Option<(String, u64)>,
     /// The agent's latest message in this turn.
     said: Option<(String, u64)>,
+    /// The agent's latest message in any turn.
+    words: Option<(String, u64)>,
     /// Approval requests of the current turn without a decision, with their summaries.
     approvals: Vec<(String, String)>,
     /// How the last turn or the task ended badly: a label, the text and when.
@@ -1203,6 +1320,7 @@ impl Tail {
             tool_calls: 0,
             last_tool: None,
             said: None,
+            words: None,
             approvals: Vec::new(),
             stop: None,
             recent: VecDeque::new(),
@@ -1252,6 +1370,7 @@ impl Tail {
                     self.start(e.ts);
                 }
                 self.said = Some((text("text").into(), e.ts));
+                self.words = self.said.clone();
             }
             "tool" => {
                 if !self.in_turn {
@@ -1289,22 +1408,37 @@ impl Tail {
     }
 }
 
-/// One line from its pieces. Given a width, it is cut to fit and colored.
+/// One line from its pieces. Given a width, it is cut to fit and colored, and a line whose
+/// first piece is empty with the color `CHOSEN` is shown in reverse across the window.
 fn paint(segs: &[Seg], width: Option<usize>) -> String {
     // The last column stays empty: writing there makes some terminals wrap.
     let mut room = width.map_or(usize::MAX, |w| w.saturating_sub(1));
+    let chosen = width.is_some()
+        && segs
+            .first()
+            .is_some_and(|(t, c)| t.is_empty() && *c == CHOSEN);
+    let sgr = |color: &str| match (chosen, color) {
+        (false, "") => None,
+        (false, c) => Some(c.to_string()),
+        (true, "") => Some(CHOSEN.to_string()),
+        (true, c) => Some(format!("{c};{CHOSEN}")),
+    };
     let mut line = String::new();
     for (text, color) in segs {
         let (piece, cut) = fit(&clean(text), room);
         room -= columns(&piece);
-        if width.is_some() && !color.is_empty() && !piece.is_empty() {
-            line.push_str(&format!("\x1b[{color}m{piece}\x1b[0m"));
-        } else {
-            line.push_str(&piece);
+        match sgr(color) {
+            Some(sgr) if width.is_some() && !piece.is_empty() => {
+                line.push_str(&format!("\x1b[{sgr}m{piece}\x1b[0m"));
+            }
+            _ => line.push_str(&piece),
         }
         if cut {
             break;
         }
+    }
+    if chosen && room > 0 {
+        line.push_str(&format!("\x1b[{CHOSEN}m{}\x1b[0m", " ".repeat(room)));
     }
     line
 }
@@ -1429,9 +1563,9 @@ mod tests {
             .unwrap_or_else(|| panic!("no line starting {start:?} in {frame:#?}"))
     }
 
-    /// A task's line split into its cells: ID, name, agent, state, age and what matters most.
-    fn cells<'a>(frame: &'a [String], id: &str) -> Vec<&'a str> {
-        line_of(frame, &format!("{id} "))
+    /// A task's line split into its cells: its name, its state and what it last said.
+    fn cells<'a>(frame: &'a [String], name: &str) -> Vec<&'a str> {
+        line_of(frame, &format!("{name} "))
             .split("  ")
             .map(str::trim)
             .filter(|c| !c.is_empty())
@@ -1443,7 +1577,7 @@ mod tests {
     }
 
     #[test]
-    fn each_task_is_one_line_of_what_matters_most_now() {
+    fn each_task_is_one_line_of_its_name_state_and_words() {
         let h = home();
         let store = Store::new(&h.0);
         for (t, prompt) in [
@@ -1533,7 +1667,7 @@ mod tests {
         }
         let mut view = View::new(&h.0, false);
         view.refresh();
-        let frame = view.frame(NOW, None);
+        let frame = view.frame(NOW, None, None);
         let text = frame.join("\n");
         assert!(
             frame[0].starts_with(
@@ -1541,10 +1675,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(
-            frame[2].trim_start().starts_with("TASK") && frame[2].ends_with("AGO  LATEST"),
-            "{text}"
-        );
+        assert_eq!(frame[1..3], ["", "user: terminals and unrecognized agents"]);
         // With tasks of two sessions, a line for each, its ID cut to tell them apart.
         assert!(text.contains("\nclaude session s1234567\n"), "{text}");
         assert!(
@@ -1553,53 +1684,37 @@ mod tests {
         );
         assert!(!text.contains("t4 "), "{text}");
 
-        // What waits for someone comes before what the agent says or does.
+        // What it last said, on one line, past the tool calls after it; its state tells that
+        // it waits for an approval.
         assert_eq!(
-            cells(&frame, "t1")[1..],
-            [
-                "审查",
-                "codex",
-                "approval",
-                "5s",
-                "needs",
-                "approval r1: push"
-            ],
+            cells(&frame, "审查"),
+            ["审查", "approval", "Running the tests."],
             "{text}"
         );
         for child in ["t2", "t3"] {
             assert_eq!(
                 indent(line_of(&frame, &format!("{child} "))),
-                indent(line_of(&frame, "t1 ")) + 2,
+                indent(line_of(&frame, "审查 ")) + 2,
                 "{text}"
             );
         }
-        assert_eq!(
-            cells(&frame, "t2")[3..],
-            ["idle", "8m", "result", "All tests pass."]
-        );
-        assert_eq!(
-            cells(&frame, "t3")[3..],
-            ["waiting", "6m", "asks", "q1: Which port?"]
-        );
-        assert_eq!(cells(&frame, "t5")[3..], ["idle", "3h"]);
+        // Without a message in its events, the first line of its result.
+        assert_eq!(cells(&frame, "t2"), ["t2", "idle", "All tests pass."]);
+        // A question is what it said last.
+        assert_eq!(cells(&frame, "t3"), ["t3", "waiting", "Which port?"]);
+        assert_eq!(cells(&frame, "t5"), ["t5", "idle"]);
         assert!(indent(line_of(&frame, "t6 ")) > indent(line_of(&frame, "t5 ")));
-        // Before it says anything, what it was given.
-        assert_eq!(
-            cells(&frame, "t6")[3..],
-            ["queued", "1s", "task", "Check the adapter."]
-        );
-        assert_eq!(
-            cells(&frame, "t7")[3..],
-            ["failed", "1s", "error", "429 rate limited"]
-        );
+        // Before it says anything, its state alone; how it failed is left to its view.
+        assert_eq!(cells(&frame, "t6"), ["t6", "queued"]);
+        assert_eq!(cells(&frame, "t7"), ["t7", "failed"]);
 
         // A line still being written is left for the next refresh.
         let more = serde_json::to_string(&event(
             7,
             1_000,
             "t1",
-            "tool",
-            json!({"name": "Edit", "detail": "a.rs"}),
+            "said",
+            json!({"text": "Editing a.rs."}),
         ))
         .unwrap();
         let (head, rest) = more.split_at(20);
@@ -1609,7 +1724,10 @@ mod tests {
             .unwrap();
         f.write_all(head.as_bytes()).unwrap();
         view.refresh();
-        assert_eq!(cells(&view.frame(NOW, None), "t1")[4], "5s");
+        assert_eq!(
+            cells(&view.frame(NOW, None, None), "审查")[2],
+            "Running the tests."
+        );
         f.write_all(format!("{rest}\n").as_bytes()).unwrap();
         drop(f);
         store
@@ -1622,10 +1740,9 @@ mod tests {
             ))
             .unwrap();
         view.refresh();
-        // What it said stays over the tool calls after it, on one line.
         assert_eq!(
-            cells(&view.frame(NOW, None), "t1")[3..],
-            ["running", "0s", "says", "Running the tests."]
+            cells(&view.frame(NOW, None, None), "审查")[1..],
+            ["running", "Editing a.rs."]
         );
 
         // Nothing the daemon delivers was changed.
@@ -1638,7 +1755,7 @@ mod tests {
         everything.refresh();
         assert!(
             everything
-                .frame(NOW, None)
+                .frame(NOW, None, None)
                 .iter()
                 .any(|l| l.contains("t4 "))
         );
@@ -1714,12 +1831,14 @@ mod tests {
             "2 tasks are named tests; give one of their IDs: t2, t3"
         );
 
-        let frame = view.task_frame("t1", NOW, None);
+        let frame = view.task_frame("t1", NOW, None, false);
         let text = frame.join("\n");
         assert!(
             frame[0].starts_with("axiopera top t1  review  codex/work  idle  2 turn(s)"),
             "{text}"
         );
+        // With keys, how to go back.
+        assert!(view.task_frame("t1", NOW, None, true)[0].ends_with(" ago  Esc back"));
         assert_eq!(
             frame[1],
             "spawned 10m00s ago in ., model gpt-5.5, by claude session s1"
@@ -1731,10 +1850,10 @@ mod tests {
         // The result is not repeated under Now.
         assert!(!text.contains("\nNow\n"), "{text}");
         // Sub-tasks on lines like the list's.
-        assert!(text.contains("\nSub-tasks\n  t2  "), "{text}");
+        assert!(text.contains("\nSub-tasks\n  tests  "), "{text}");
         assert_eq!(
-            cells(&frame, "t2")[1..],
-            ["tests", "codex", "running", "10s", "says", "Running them."]
+            cells(&frame, "tests"),
+            ["tests", "running", "Running them."]
         );
         assert!(
             text.contains("\nResult of turn 2\n  No bugs.\n  - checked the reader\n"),
@@ -1752,7 +1871,7 @@ mod tests {
         // Fitted to the window, without blank lines once not all fits, the events last and
         // the first to go.
         let fitted: Vec<String> = view
-            .task_frame("t1", NOW, Some((60, 14)))
+            .task_frame("t1", NOW, Some((60, 14)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
@@ -1761,7 +1880,7 @@ mod tests {
         assert!(fitted[13].contains("turn 2 finished"), "{fitted:#?}");
         assert!(fitted.iter().all(|l| columns(l) <= 59));
         let short: Vec<String> = view
-            .task_frame("t1", NOW, Some((60, 10)))
+            .task_frame("t1", NOW, Some((60, 10)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
@@ -1772,7 +1891,7 @@ mod tests {
                 "  Review the parser.",
                 "  Report findings.",
                 "Sub-tasks",
-                line_of(&short, "t2 "),
+                line_of(&short, "tests "),
                 "Result of turn 2",
                 "  No bugs.",
                 "  - checked the reader"
@@ -1792,15 +1911,19 @@ mod tests {
             .unwrap();
         view.refresh();
         assert_eq!(
-            line_of(&view.task_frame("t1", NOW, None), "t2 "),
-            line_of(&frame, "t2 ")
+            line_of(&view.task_frame("t1", NOW, None, false), "tests "),
+            line_of(&frame, "tests ")
         );
 
         std::fs::remove_dir_all(h.0.join("tasks").join("t1")).unwrap();
         view.refresh();
         assert_eq!(
-            view.task_frame("t1", NOW, None),
+            view.task_frame("t1", NOW, None, false),
             ["t1 is gone: it was removed, by gc or by hand"]
+        );
+        assert_eq!(
+            view.task_frame("t1", NOW, None, true),
+            ["t1 is gone: it was removed, by gc or by hand  Esc back"]
         );
     }
 
@@ -1830,7 +1953,11 @@ mod tests {
                 .iter()
                 .map(|d| format!("{} {}", d.label, d.text))
                 .collect();
-            (meta(t, tail, NOW), lines, latest_line(t, tail))
+            (
+                meta(t, tail, NOW),
+                lines,
+                words(t, tail).unwrap_or_default(),
+            )
         };
         assert_eq!(
             state(event(1, 9_000, "t1", "turn_started", json!({"turn": 1}))),
@@ -1847,13 +1974,7 @@ mod tests {
             "approval_request",
             json!({"id": "r9", "summary": "push"}),
         ));
-        assert_eq!(
-            (&waits.1[..], &waits.2[..]),
-            (
-                &["needs approval r9: push".to_string()][..],
-                "needs approval r9: push"
-            )
-        );
+        assert_eq!(waits.1, ["needs approval r9: push"]);
         state(event(3, 7_000, "t1", "denied", json!({"id": "r9"})));
         assert_eq!(
             state(event(4, 7_000, "t1", "said", json!({"text": "Done."}))).1,
@@ -1894,7 +2015,7 @@ mod tests {
                     "says The build finished.".to_string(),
                     "doing monitor".to_string()
                 ],
-                "says The build finished.".to_string()
+                "The build finished.".to_string()
             )
         );
         // What it said stays over the tool calls after it.
@@ -1905,7 +2026,7 @@ mod tests {
             "tool",
             json!({"name": "Read", "detail": "x"}),
         ));
-        assert_eq!(next.2, "says The build finished.");
+        assert_eq!(next.2, "The build finished.");
         assert_eq!(
             state(event(
                 9,
@@ -1917,16 +2038,20 @@ mod tests {
             .1,
             ["says The build finished."]
         );
-        // A new turn forgets what was said in the last, and its tool calls are not shown.
+        // A new turn's view forgets what was said in the last; its line keeps it until the
+        // agent says more, and does not show its tool calls.
         state(event(10, 900, "t1", "turn_started", json!({"turn": 3})));
-        let (_, _, text) = state(event(
+        let (_, lines, text) = state(event(
             11,
             800,
             "t1",
             "tool",
             json!({"name": "Read", "detail": "y"}),
         ));
-        assert_eq!(text, "");
+        assert_eq!(
+            (&lines[..], &text[..]),
+            (&["doing Read: y".to_string()][..], "The build finished.")
+        );
         store
             .save(&task("t1", "codex:s", "failed", NOW, json!({"turns": 3})))
             .unwrap();
@@ -1942,14 +2067,6 @@ mod tests {
         view.refresh();
         let t = &view.tasks["t1"];
         assert_eq!(details(t, view.tail("t1"))[0].text, "boom");
-        assert_eq!(latest_line(t, view.tail("t1")), "error boom");
-    }
-
-    /// What a task's line says of it, after its label.
-    fn latest_line(t: &Task, tail: &Tail) -> String {
-        latest(t, tail)
-            .map(|(label, text)| format!("{label} {text}"))
-            .unwrap_or_default()
     }
 
     #[test]
@@ -1989,21 +2106,21 @@ mod tests {
         }
         let mut view = View::new(&h.0, false);
         view.refresh();
-        let frame = view.frame(NOW, Some((40, 12)));
+        let frame = view.frame(NOW, Some((40, 12)), None);
         assert_eq!(frame.len(), 12, "{frame:#?}");
         let plain: Vec<String> = frame.iter().map(|l| strip_sgr(l)).collect();
         // One session: no line for it. The latest tasks fill the window.
-        assert!(plain[3].starts_with("  t22 "), "{plain:#?}");
-        assert_eq!(plain[11], "  …and 22 more task(s)", "{plain:#?}");
+        assert!(plain[2].starts_with("  t21 "), "{plain:#?}");
+        assert_eq!(plain[11], "  …and 21 more task(s)", "{plain:#?}");
         for (line, plain) in frame.iter().zip(&plain) {
             assert!(!plain.contains('\x1b'), "{line:?}");
             assert!(columns(plain) <= 39, "{plain:?}");
         }
-        // What it said shows on one line after its dim label, without its control characters.
-        let all = view.frame(NOW, Some((100, 40)));
+        // What it said shows on one line, without its control characters.
+        let all = view.frame(NOW, Some((100, 40)), None);
         let t00 = line_of(&all, "t00 ");
         assert!(
-            t00.ends_with("\x1b[2msays    \x1b[0mprintf ' [2J [H' rm -rf build"),
+            t00.ends_with("\x1b[0m  printf ' [2J [H' rm -rf build"),
             "{t00:?}"
         );
 
@@ -2012,7 +2129,7 @@ mod tests {
             .append(&event(10, 0, "t00", "said", json!({"text": "Building."})))
             .unwrap();
         view.refresh();
-        assert_eq!(view.frame(NOW, Some((40, 12))), frame);
+        assert_eq!(view.frame(NOW, Some((40, 12)), None), frame);
     }
 
     fn strip_sgr(line: &str) -> String {
@@ -2021,7 +2138,7 @@ mod tests {
         while let Some(start) = rest.find("\x1b[") {
             out.push_str(&rest[..start]);
             let after = &rest[start + 2..];
-            match after.find(|c: char| !c.is_ascii_digit()) {
+            match after.find(|c: char| !c.is_ascii_digit() && c != ';') {
                 Some(end) if after[end..].starts_with('m') => rest = &after[end + 1..],
                 _ => {
                     out.push_str(&rest[start..]);
@@ -2046,12 +2163,6 @@ mod tests {
     fn ages_past_two_days_count_days() {
         assert_eq!(age(47 * HOUR + 60_000), "47h01m");
         assert_eq!(age(435 * HOUR + 54 * 60_000), "18d03h");
-        // A task's line has room for the largest unit only.
-        let short: Vec<String> = [59_999, 60_000, HOUR - 1, HOUR, 48 * HOUR - 1, 48 * HOUR]
-            .into_iter()
-            .map(short_age)
-            .collect();
-        assert_eq!(short, ["59s", "1m", "59m", "1h", "47h", "2d"]);
     }
 
     #[test]
@@ -2086,13 +2197,13 @@ mod tests {
             .unwrap();
         let mut view = View::new(&h.0, false);
         view.refresh();
-        let before = view.frame(NOW, None);
+        let before = view.frame(NOW, None, None);
         std::fs::write(h.0.join("tasks").join("t1").join("task.json"), "{").unwrap();
         view.refresh();
-        assert_eq!(view.frame(NOW, None), before);
+        assert_eq!(view.frame(NOW, None, None), before);
         store.remove("t1").unwrap();
         view.refresh();
-        let after = view.frame(NOW, None).join("\n");
+        let after = view.frame(NOW, None, None).join("\n");
         assert!(!after.contains("t1 ") && after.contains("t2 "), "{after}");
     }
 
@@ -2140,28 +2251,22 @@ mod tests {
         }
         let mut view = View::new(&h.0, false);
         view.refresh();
-        // 7 lines for the 13 of the table.
-        let frame = view.frame(NOW, Some((100, 10)));
+        // 8 lines for the 13 of the list.
+        let frame = view.frame(NOW, Some((100, 10)), None);
         let plain: Vec<String> = frame.iter().map(|l| strip_sgr(l)).collect();
         let text = plain.join("\n");
         assert_eq!(plain.len(), 10, "{text}");
-        assert_eq!(
-            cells(&plain, "tw")[3..],
-            ["waiting", "20s", "asks", "q1: Which port?"]
-        );
-        assert_eq!(
-            cells(&plain, "tr")[3..],
-            ["approval", "7s", "needs", "approval r1: push"]
-        );
+        assert_eq!(cells(&plain, "tw"), ["tw", "waiting", "Which port?"]);
+        assert_eq!(cells(&plain, "tr"), ["tr", "approval", "Pushing."]);
         // A sub-task is shown under its parent, and its session's line with them.
         assert!(text.contains("\n  tp "), "{text}");
         assert!(text.contains("\ncodex session s\n"), "{text}");
         // The latest of the rest fill what is left.
         assert!(
-            text.contains("\n  t7 ") && !text.contains("\n  t6 "),
+            text.contains("\n  t6 ") && !text.contains("\n  t5 "),
             "{text}"
         );
-        assert_eq!(plain[9], "  …and 7 more task(s)", "{text}");
+        assert_eq!(plain[9], "  …and 6 more task(s)", "{text}");
         // Order is kept: sessions in the order they first spawned, sub-tasks under parents.
         let at = |s: &str| text.find(s).unwrap();
         assert!(at("\n  t7 ") < at("\n  tp ") && at("\n  tp ") < at("\n    tr "));
@@ -2177,7 +2282,7 @@ mod tests {
             .append(&event(4, 0, "t0", "said", json!({"text": "Late words."})))
             .unwrap();
         view.refresh();
-        assert_eq!(view.frame(NOW, Some((100, 10))), frame);
+        assert_eq!(view.frame(NOW, Some((100, 10)), None), frame);
         store
             .save(&task(
                 "t0",
@@ -2188,7 +2293,7 @@ mod tests {
             ))
             .unwrap();
         view.refresh();
-        assert_eq!(view.frame(NOW, Some((100, 10))), frame);
+        assert_eq!(view.frame(NOW, Some((100, 10)), None), frame);
         // The daemon may leave the stalled mark on a task that stopped.
         assert_eq!(state(&view.tasks["t0"], view.tail("t0")).0, "cancelled");
     }
@@ -2211,7 +2316,7 @@ mod tests {
             .unwrap();
         let mut view = View::new(&h.0, false);
         view.refresh();
-        let text = view.frame(NOW, None).join("\n");
+        let text = view.frame(NOW, None, None).join("\n");
         // A stays first though its first task is hidden; their IDs are whole, being alike cut.
         assert!(!text.contains("a1 "), "{text}");
         let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s} in {text}"));
@@ -2221,12 +2326,12 @@ mod tests {
         );
         // With room for one of them, the later spawned.
         let frame: Vec<String> = view
-            .frame(NOW, Some((100, 6)))
+            .frame(NOW, Some((100, 5)), None)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
         assert_eq!(
-            frame[3..],
+            frame[2..],
             [
                 "codex session 019a2b3c-1111",
                 line_of(&frame, "a2 "),
@@ -2235,7 +2340,7 @@ mod tests {
             "{frame:#?}"
         );
         // A task's view tells its session whole.
-        let one = view.task_frame("b1", NOW, None);
+        let one = view.task_frame("b1", NOW, None, false);
         assert!(
             one[1].ends_with(", by codex session 019a2b3c-2222"),
             "{one:#?}"
@@ -2243,7 +2348,7 @@ mod tests {
 
         // Nor does A move when gc removes its first task, or the columns when a task with a
         // long name and deep under others comes and goes.
-        let before = view.frame(NOW, None);
+        let before = view.frame(NOW, None, None);
         store.remove("a1").unwrap();
         store
             .save(&task("b2", "task:b1", "idle", NOW, json!({})))
@@ -2258,18 +2363,17 @@ mod tests {
             ))
             .unwrap();
         view.refresh();
-        let wide = view.frame(NOW, None);
-        let b3 = cells(&wide, "b3");
-        assert_eq!(b3[1], "a name longer t…", "{wide:#?}");
+        let wide = view.frame(NOW, None, None);
+        let b3 = cells(&wide, "a name");
+        assert_eq!(b3[0], "a name longer than …", "{wide:#?}");
         store.remove("b3").unwrap();
         store.remove("b2").unwrap();
         view.refresh();
-        let after = view.frame(NOW, None);
+        let after = view.frame(NOW, None, None);
         assert_eq!(after.len(), before.len());
-        assert_eq!(after[2], wide[2]);
         assert_eq!(line_of(&after, "a2 "), line_of(&wide, "a2 "));
-        assert_ne!(after[2], before[2]);
-        assert!(after[3].ends_with("019a2b3c-1111"), "{after:#?}");
+        assert_ne!(line_of(&after, "a2 "), line_of(&before, "a2 "));
+        assert!(after[2].ends_with("019a2b3c-1111"), "{after:#?}");
     }
 
     #[test]
@@ -2283,12 +2387,12 @@ mod tests {
         store.save_turn("t1", 1, "").unwrap();
         let mut view = View::new(&h.0, false);
         view.refresh();
-        assert_eq!(cells(&view.frame(NOW, None), "t1").len(), 5);
+        assert_eq!(cells(&view.frame(NOW, None, None), "t1"), ["t1", "idle"]);
         store.save_turn("t1", 1, "All tests pass.").unwrap();
         view.refresh();
         assert_eq!(
-            cells(&view.frame(NOW, None), "t1")[5..],
-            ["result", "All tests pass."]
+            cells(&view.frame(NOW, None, None), "t1"),
+            ["t1", "idle", "All tests pass."]
         );
     }
 
@@ -2309,14 +2413,14 @@ mod tests {
         view.refresh();
 
         // Without a window, all of it.
-        let plain = view.task_frame("t1", NOW, None).join("\n");
+        let plain = view.task_frame("t1", NOW, None, false).join("\n");
         assert!(
             plain.contains(&format!("\n  {long}\n  line 1\n")) && plain.ends_with("\n  line 30"),
             "{plain}"
         );
 
         let frame: Vec<String> = view
-            .task_frame("t1", NOW, Some((40, 20)))
+            .task_frame("t1", NOW, Some((40, 20)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
@@ -2417,7 +2521,7 @@ mod tests {
         let mut view = View::new(&h.0, false);
         view.refresh();
         let frame: Vec<String> = view
-            .task_frame("tp", NOW, Some((100, 16)))
+            .task_frame("tp", NOW, Some((100, 16)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
@@ -2428,21 +2532,12 @@ mod tests {
         // and what went wrong first, then the latest. The title says how many there are.
         assert!(text.contains("\nSub-tasks  5 of 13 shown\n"), "{text}");
         assert_eq!(
-            cells(&frame, "k12")[3..],
-            ["waiting", "49s", "asks", "q1: Which port?"],
+            cells(&frame, "k12"),
+            ["k12", "waiting", "Which port?"],
             "{text}"
         );
-        // A sub-task's task text gives way to what else is told of it.
-        assert_eq!(
-            cells(&frame, "k00")[3..],
-            ["failed", "1s", "error", "429"],
-            "{text}"
-        );
-        assert_eq!(
-            cells(&frame, "k11")[3..],
-            ["idle", "49s", "task", "Part 11."],
-            "{text}"
-        );
+        assert_eq!(cells(&frame, "k00"), ["k00", "failed"], "{text}");
+        assert_eq!(cells(&frame, "k11"), ["k11", "idle"], "{text}");
         assert!(!text.contains("k08 "), "{text}");
         assert!(text.ends_with("[tp codex] Read"), "{text}");
 
@@ -2481,7 +2576,7 @@ mod tests {
         }
         view.refresh();
         let frame: Vec<String> = view
-            .task_frame("tr", NOW, Some((80, 24)))
+            .task_frame("tr", NOW, Some((80, 24)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
@@ -2514,7 +2609,7 @@ mod tests {
         let mut view = View::new(&h.0, false);
         view.refresh();
         let frame: Vec<String> = view
-            .task_frame("t1", NOW, Some((80, 24)))
+            .task_frame("t1", NOW, Some((80, 24)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
@@ -2523,8 +2618,116 @@ mod tests {
         assert_eq!(frame[23], "  …and 2 more");
 
         // Without events yet, no title for them.
-        let frame = view.task_frame("t1", NOW, None).join("\n");
+        let frame = view.task_frame("t1", NOW, None, false).join("\n");
         assert!(!frame.contains("Events"), "{frame}");
+    }
+
+    #[test]
+    fn keys_choose_a_task_open_it_and_go_back() {
+        use Key::*;
+        assert_eq!(
+            keys(b"\x1b[A\x1b[B\x1bOC\x1b[1;5D\x1b[5~\rkjq\x1b\x03\x7fx"),
+            [Up, Down, Open, Back, Open, Up, Down, Q, Back, Quit, Back]
+        );
+
+        let h = home();
+        let store = Store::new(&h.0);
+        // Older idle tasks first, then one that waits.
+        for i in 0..6 {
+            store
+                .save(&task(
+                    &format!("t{i}"),
+                    "user",
+                    "idle",
+                    NOW - 50_000 + i,
+                    json!({}),
+                ))
+                .unwrap();
+        }
+        store
+            .save(&task(
+                "tw",
+                "user",
+                "waiting",
+                NOW - 1_000,
+                json!({"name": "ask"}),
+            ))
+            .unwrap();
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let mut ui = Ui {
+            open: None,
+            chosen: None,
+            keys: true,
+        };
+        let plain = |ui: &mut Ui, view: &View| -> Vec<String> {
+            ui.draw(view, NOW, (80, 6))
+                .iter()
+                .map(|l| strip_sgr(l))
+                .collect()
+        };
+
+        // The first task is chosen, marked across the window, and shown though the older
+        // tasks give way to the one that waits.
+        let frame = ui.draw(&view, NOW, (80, 6));
+        assert_eq!(ui.chosen.as_deref(), Some("t0"));
+        assert!(frame[2].starts_with("\x1b[7m  t0 "), "{frame:#?}");
+        let shown = plain(&mut ui, &view);
+        assert!(
+            shown[0].ends_with("  ↑↓ choose  Enter open  q quit"),
+            "{shown:#?}"
+        );
+        assert_eq!(columns(&shown[2]), 79, "{shown:#?}");
+        assert!(shown[3].starts_with("  t5 ") && shown[4].starts_with("  ask "));
+        assert_eq!(shown[5], "  …and 4 more task(s)");
+
+        // Up and down move through the list in its order, and stop at its ends.
+        for (key, chosen) in [(Down, "t1"), (Up, "t0"), (Up, "t0")] {
+            assert!(ui.press(key, &view, NOW));
+            assert_eq!(ui.chosen.as_deref(), Some(chosen));
+        }
+        for _ in 0..10 {
+            ui.press(Down, &view, NOW);
+        }
+        assert_eq!(ui.chosen.as_deref(), Some("tw"));
+
+        // Enter opens it; up and down do nothing there, and Esc goes back to it in the list.
+        ui.press(Open, &view, NOW);
+        let one = plain(&mut ui, &view);
+        assert!(one[0].starts_with("axiopera top tw  ask") && one[0].ends_with("  Esc back"));
+        ui.press(Down, &view, NOW);
+        assert_eq!(ui.open.as_deref(), Some("tw"));
+        ui.press(Back, &view, NOW);
+        assert_eq!(
+            (ui.open.as_deref(), ui.chosen.as_deref()),
+            (None, Some("tw"))
+        );
+        // q goes back from a task, and quits from the list; Ctrl-C quits from both.
+        ui.press(Open, &view, NOW);
+        assert!(ui.press(Q, &view, NOW) && ui.open.is_none());
+        assert!(!ui.press(Q, &view, NOW));
+        ui.press(Open, &view, NOW);
+        assert!(!ui.press(Quit, &view, NOW));
+
+        // When the chosen task is removed, the first is chosen.
+        ui.open = None;
+        store.remove("tw").unwrap();
+        view.refresh();
+        plain(&mut ui, &view);
+        assert_eq!(ui.chosen.as_deref(), Some("t0"));
+
+        // Without keys, nothing is chosen and the title tells of no keys.
+        let mut no_keys = Ui {
+            open: None,
+            chosen: None,
+            keys: false,
+        };
+        let shown = plain(&mut no_keys, &view);
+        assert!(
+            no_keys.chosen.is_none() && !shown[0].contains("choose"),
+            "{shown:#?}"
+        );
+        assert!(!shown.iter().any(|l| columns(l) == 79), "{shown:#?}");
     }
 
     #[test]

@@ -33,7 +33,7 @@ cargo package --locked --target-dir target/package-verify
 
 普通测试使用本地临时数据，不调用模型。当前测试覆盖消息解析、消费确认、任务状态、结果游标、配置、`top` 画面和平台辅助函数。CI 在 Windows、Linux 和 macOS 上运行上述检查，并按 `Cargo.toml` 的 `rust-version` 检查最低 Rust 版本。
 
-修改 `top` 后，在真实终端中运行 `python scripts/top_demo.py` 查看画面。脚本在临时数据目录写入各种状态的任务，在当前终端运行 `target/debug` 下的 `top`，并像 daemon 一样持续写入，不启动 daemon，也不调用 agent。Ctrl-C 退出后删除数据，`--keep` 保留，`--all` 和 `--` 之后的参数传给 `top`，例如 `-- trun` 只看一个任务。
+修改 `top` 后，在真实终端中运行 `python scripts/top_demo.py` 查看画面。脚本在临时数据目录写入各种状态的任务，在当前终端运行 `target/debug` 下的 `top`，并像 daemon 一样持续写入，不启动 daemon，也不调用 agent。`top` 退出后删除数据，`--keep` 保留，`--all` 和 `--` 之后的参数传给 `top`，例如 `-- trun` 只看一个任务。
 
 从源码安装使用 `cargo install --path . --locked`。
 

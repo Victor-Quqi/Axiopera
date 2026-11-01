@@ -515,6 +515,31 @@ impl Drop for Ansi {
     }
 }
 
+/// Keys read one at a time from a stdin console, without echo, with arrows as escape
+/// sequences where the console makes them, and with Ctrl-C as a key rather than a signal.
+/// `None` when stdin is not a console. The previous mode comes back on drop.
+pub struct Keys(CONSOLE_MODE);
+
+impl Keys {
+    pub fn enable() -> Option<Keys> {
+        let handle = io::stdin().as_raw_handle();
+        let mut mode = 0;
+        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+            return None;
+        }
+        let raw = mode & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+        // Consoles before Windows 10 have no escape sequences for arrows: letters still work.
+        let set = |m| unsafe { SetConsoleMode(handle, m) } != 0;
+        (set(raw | ENABLE_VIRTUAL_TERMINAL_INPUT) || set(raw)).then_some(Keys(mode))
+    }
+}
+
+impl Drop for Keys {
+    fn drop(&mut self) {
+        unsafe { SetConsoleMode(io::stdin().as_raw_handle(), self.0) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

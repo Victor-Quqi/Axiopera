@@ -199,3 +199,30 @@ impl Ansi {
         Ansi
     }
 }
+
+/// Keys read one at a time from a stdin terminal, without echo, and with Ctrl-C and Ctrl-Z
+/// as keys rather than signals. `None` when stdin is not a terminal. The previous mode comes
+/// back on drop.
+pub struct Keys(libc::termios);
+
+impl Keys {
+    pub fn enable() -> Option<Keys> {
+        let mut old: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut old) } != 0 {
+            return None;
+        }
+        let mut raw = old;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG | libc::IEXTEN);
+        raw.c_iflag &= !(libc::IXON | libc::ICRNL);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        (unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw) } == 0)
+            .then_some(Keys(old))
+    }
+}
+
+impl Drop for Keys {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0) };
+    }
+}

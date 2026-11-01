@@ -6,7 +6,7 @@
 Writes the tasks to a new temporary data directory and runs `axiopera top` on it in this
 terminal, while a thread keeps writing the way the daemon does: events appended, some a half
 line at a time, `task.json` replaced whole, tasks added and removed. No daemon or agent runs.
-Ctrl-C quits; the directory is then deleted unless --keep. Arguments after `--` go to top,
+q or Ctrl-C quits; the directory is then deleted unless --keep. Arguments after `--` go to top,
 e.g. `-- trun` for the view of one task.
 """
 
@@ -248,7 +248,7 @@ def main():
     try:
         argv = [args.bin, "top", *(["--all"] if args.all else []), *args.top_args]
         child = subprocess.Popen(argv, env=env)
-        # Ctrl-C reaches top as well; it restores the terminal and exits.
+        # Ctrl-C reaches top as a key or a signal; it restores the terminal and exits.
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         code = child.wait()
     finally:
