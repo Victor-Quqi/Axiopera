@@ -392,8 +392,7 @@ impl View {
     fn task_row(&self, cell: &str, t: &Task, widths: Widths, now: u64) -> Row {
         let tail = self.tail(&t.id);
         let (state, color) = state(t, tail);
-        let (text, text_color) = latest(t, tail);
-        let segs = vec![
+        let mut segs = vec![
             (
                 format!(
                     "{}  {}  {}  ",
@@ -411,8 +410,11 @@ impl View {
                 ),
                 DIM,
             ),
-            (text, text_color),
         ];
+        if let Some((label, text)) = latest(t, tail) {
+            segs.push((format!("{label:<6}  "), DIM));
+            segs.push((text, ""));
+        }
         Row {
             rank: rank(t, tail),
             spawned: t.created_ms,
@@ -841,49 +843,37 @@ fn waits(t: &Task, tail: &Tail) -> bool {
         || !t.status.is_final() && t.open_questions().next().is_some()
 }
 
-/// What matters most of a task now, for its line: what it waits for, what it last said or
-/// else is doing, how it ended, or else what it was given. A tool call or a task text is dim,
-/// so that what the agent says stands out among them.
-fn latest(t: &Task, tail: &Tail) -> (String, &'static str) {
+/// What matters most of a task now, for its line, with a label that tells what it is: what
+/// it waits for (`needs`, `asks`), what it last said (`says`), how it ended (`result`, `error`,
+/// `why`), or else what it was given (`task`). Tool calls are left to the task's view: they
+/// change too often to read.
+fn latest(t: &Task, tail: &Tail) -> Option<(&'static str, String)> {
     let more = |n: usize| match n {
         0 | 1 => String::new(),
         n => format!(" (and {} more)", n - 1),
     };
-    if t.status == Status::Running
-        && let Some((id, summary)) = tail.approvals.first()
-    {
-        return (
-            one_line(&format!("{id}: {summary}{}", more(tail.approvals.len()))),
-            "",
-        );
-    }
-    if !t.status.is_final() {
-        let open: Vec<_> = t.open_questions().collect();
-        if let Some(q) = open.first() {
-            return (
-                one_line(&format!("{}: {}{}", q.id, q.text, more(open.len()))),
-                "",
-            );
-        }
-    }
     let first = |text: Option<&Text>| text?.lines.first().cloned();
-    let found = match t.status {
-        Status::Running | Status::Queued => tail
-            .said
-            .as_ref()
-            .map(|(text, _)| (text.clone(), ""))
-            .or_else(|| {
-                let (call, _) = tail.last_tool.as_ref().filter(|_| tail.in_turn)?;
-                Some((call.clone(), DIM))
-            }),
-        _ => stop(t, tail)
-            .map(|(_, text, _)| (text.to_string(), ""))
-            .or_else(|| Some((first(tail.result.as_ref().map(|(_, r)| r))?, ""))),
+    let open: Vec<_> = match t.status.is_final() {
+        true => Vec::new(),
+        false => t.open_questions().collect(),
     };
-    let (text, color) = found
-        .or_else(|| Some((first(tail.prompt.as_ref())?, DIM)))
-        .unwrap_or_default();
-    (one_line(&text), color)
+    let found = match (tail.approvals.first(), open.first()) {
+        (Some((id, summary)), _) if t.status == Status::Running => Some((
+            "needs",
+            format!("approval {id}: {summary}{}", more(tail.approvals.len())),
+        )),
+        (_, Some(q)) => Some(("asks", format!("{}: {}{}", q.id, q.text, more(open.len())))),
+        _ => match t.status {
+            Status::Running | Status::Queued => {
+                tail.said.as_ref().map(|(text, _)| ("says", text.clone()))
+            }
+            _ => stop(t, tail)
+                .map(|(label, text, _)| (label, text.to_string()))
+                .or_else(|| Some(("result", first(tail.result.as_ref().map(|(_, r)| r))?))),
+        },
+    };
+    let (label, text) = found.or_else(|| Some(("task", first(tail.prompt.as_ref())?)))?;
+    Some((label, one_line(&text)))
 }
 
 /// Text on one line: its lines and runs of spaces joined by single spaces.
@@ -1506,7 +1496,14 @@ mod tests {
         // What waits for someone comes before what the agent says or does.
         assert_eq!(
             cells(&frame, "t1")[1..],
-            ["审查", "codex", "approval", "5s", "r1: push"],
+            [
+                "审查",
+                "codex",
+                "approval",
+                "5s",
+                "needs",
+                "approval r1: push"
+            ],
             "{text}"
         );
         for child in ["t2", "t3"] {
@@ -1516,21 +1513,24 @@ mod tests {
                 "{text}"
             );
         }
-        assert_eq!(cells(&frame, "t2")[3..], ["idle", "8m", "All tests pass."]);
+        assert_eq!(
+            cells(&frame, "t2")[3..],
+            ["idle", "8m", "result", "All tests pass."]
+        );
         assert_eq!(
             cells(&frame, "t3")[3..],
-            ["waiting", "6m", "q1: Which port?"]
+            ["waiting", "6m", "asks", "q1: Which port?"]
         );
         assert_eq!(cells(&frame, "t5")[3..], ["idle", "3h"]);
         assert!(indent(line_of(&frame, "t6 ")) > indent(line_of(&frame, "t5 ")));
         // Before it says anything, what it was given.
         assert_eq!(
             cells(&frame, "t6")[3..],
-            ["queued", "1s", "Check the adapter."]
+            ["queued", "1s", "task", "Check the adapter."]
         );
         assert_eq!(
             cells(&frame, "t7")[3..],
-            ["failed", "1s", "429 rate limited"]
+            ["failed", "1s", "error", "429 rate limited"]
         );
 
         // A line still being written is left for the next refresh.
@@ -1565,7 +1565,7 @@ mod tests {
         // What it said stays over the tool calls after it, on one line.
         assert_eq!(
             cells(&view.frame(NOW, None), "t1")[3..],
-            ["running", "0s", "Running the tests."]
+            ["running", "0s", "says", "Running the tests."]
         );
 
         // Nothing the daemon delivers was changed.
@@ -1671,7 +1671,7 @@ mod tests {
         assert!(text.contains("\nSub-tasks\n  t2  "), "{text}");
         assert_eq!(
             cells(&frame, "t2")[1..],
-            ["tests", "codex", "running", "10s", "Running them."]
+            ["tests", "codex", "running", "10s", "says", "Running them."]
         );
         assert!(
             text.contains("\nResult of turn 2\n  No bugs.\n  - checked the reader\n"),
@@ -1745,7 +1745,7 @@ mod tests {
                 .iter()
                 .map(|d| format!("{} {}", d.label, d.text))
                 .collect();
-            (meta(t, tail, NOW), lines, latest(t, tail).0)
+            (meta(t, tail, NOW), lines, latest_line(t, tail))
         };
         assert_eq!(
             state(event(1, 9_000, "t1", "turn_started", json!({"turn": 1}))),
@@ -1764,7 +1764,10 @@ mod tests {
         ));
         assert_eq!(
             (&waits.1[..], &waits.2[..]),
-            (&["needs approval r9: push".to_string()][..], "r9: push")
+            (
+                &["needs approval r9: push".to_string()][..],
+                "needs approval r9: push"
+            )
         );
         state(event(3, 7_000, "t1", "denied", json!({"id": "r9"})));
         assert_eq!(
@@ -1806,7 +1809,7 @@ mod tests {
                     "says The build finished.".to_string(),
                     "doing monitor".to_string()
                 ],
-                "The build finished.".to_string()
+                "says The build finished.".to_string()
             )
         );
         // What it said stays over the tool calls after it.
@@ -1817,7 +1820,7 @@ mod tests {
             "tool",
             json!({"name": "Read", "detail": "x"}),
         ));
-        assert_eq!(next.2, "The build finished.");
+        assert_eq!(next.2, "says The build finished.");
         assert_eq!(
             state(event(
                 9,
@@ -1829,7 +1832,7 @@ mod tests {
             .1,
             ["says The build finished."]
         );
-        // A new turn forgets what was said in the last: its tool calls show until it speaks.
+        // A new turn forgets what was said in the last, and its tool calls are not shown.
         state(event(10, 900, "t1", "turn_started", json!({"turn": 3})));
         let (_, _, text) = state(event(
             11,
@@ -1838,7 +1841,7 @@ mod tests {
             "tool",
             json!({"name": "Read", "detail": "y"}),
         ));
-        assert_eq!(text, "Read: y");
+        assert_eq!(text, "");
         store
             .save(&task("t1", "codex:s", "failed", NOW, json!({"turns": 3})))
             .unwrap();
@@ -1854,7 +1857,14 @@ mod tests {
         view.refresh();
         let t = &view.tasks["t1"];
         assert_eq!(details(t, view.tail("t1"))[0].text, "boom");
-        assert_eq!(latest(t, view.tail("t1")).0, "boom");
+        assert_eq!(latest_line(t, view.tail("t1")), "error boom");
+    }
+
+    /// What a task's line says of it, after its label.
+    fn latest_line(t: &Task, tail: &Tail) -> String {
+        latest(t, tail)
+            .map(|(label, text)| format!("{label} {text}"))
+            .unwrap_or_default()
     }
 
     #[test]
@@ -1877,14 +1887,18 @@ mod tests {
         store
             .append(&event(0, 2_000, "t00", "turn_started", json!({"turn": 1})))
             .unwrap();
-        for i in 1..10 {
+        store
+            .append(&event(1, 1_000, "t00", "said", json!({"text": detail})))
+            .unwrap();
+        // Tool calls after it are left to the task's view.
+        for i in 2..10 {
             store
                 .append(&event(
                     i,
                     1_000,
                     "t00",
                     "tool",
-                    json!({"name": "Bash", "detail": detail}),
+                    json!({"name": "Bash", "detail": "cargo build"}),
                 ))
                 .unwrap();
         }
@@ -1900,11 +1914,11 @@ mod tests {
             assert!(!plain.contains('\x1b'), "{line:?}");
             assert!(columns(plain) <= 39, "{plain:?}");
         }
-        // The tool call shows on one line, dim, without its control characters.
+        // What it said shows on one line after its dim label, without its control characters.
         let all = view.frame(NOW, Some((100, 40)));
         let t00 = line_of(&all, "t00 ");
         assert!(
-            t00.ends_with("\x1b[2mBash: printf ' [2J [H' rm -rf build\x1b[0m"),
+            t00.ends_with("\x1b[2msays    \x1b[0mprintf ' [2J [H' rm -rf build"),
             "{t00:?}"
         );
 
@@ -2048,9 +2062,12 @@ mod tests {
         assert_eq!(plain.len(), 10, "{text}");
         assert_eq!(
             cells(&plain, "tw")[3..],
-            ["waiting", "20s", "q1: Which port?"]
+            ["waiting", "20s", "asks", "q1: Which port?"]
         );
-        assert_eq!(cells(&plain, "tr")[3..], ["approval", "7s", "r1: push"]);
+        assert_eq!(
+            cells(&plain, "tr")[3..],
+            ["approval", "7s", "needs", "approval r1: push"]
+        );
         // A sub-task is shown under its parent, and its session's line with them.
         assert!(text.contains("\n  tp "), "{text}");
         assert!(text.contains("\ncodex session s\n"), "{text}");
@@ -2184,7 +2201,10 @@ mod tests {
         assert_eq!(cells(&view.frame(NOW, None), "t1").len(), 5);
         store.save_turn("t1", 1, "All tests pass.").unwrap();
         view.refresh();
-        assert_eq!(cells(&view.frame(NOW, None), "t1")[5], "All tests pass.");
+        assert_eq!(
+            cells(&view.frame(NOW, None), "t1")[5..],
+            ["result", "All tests pass."]
+        );
     }
 
     #[test]
@@ -2330,14 +2350,18 @@ mod tests {
         assert!(text.contains("\n  …and 5 more task(s)\n"), "{text}");
         assert_eq!(
             cells(&frame, "k12")[3..],
-            ["waiting", "49s", "q1: Which port?"],
+            ["waiting", "49s", "asks", "q1: Which port?"],
             "{text}"
         );
         // A sub-task's task text gives way to what else is told of it.
-        assert_eq!(cells(&frame, "k00")[3..], ["failed", "1s", "429"], "{text}");
+        assert_eq!(
+            cells(&frame, "k00")[3..],
+            ["failed", "1s", "error", "429"],
+            "{text}"
+        );
         assert_eq!(
             cells(&frame, "k11")[3..],
-            ["idle", "49s", "Part 11."],
+            ["idle", "49s", "task", "Part 11."],
             "{text}"
         );
         assert!(!text.contains("k05 "), "{text}");
