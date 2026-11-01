@@ -920,7 +920,7 @@ fn tool_call(name: &str, detail: &str, cwd: &str) -> (String, String) {
 
 /// Blocks in `room` lines of a window `width` wide, the latest last: whole while they fit, then
 /// the end of the one before. When the latest alone does not fit, its start, and how much more
-/// there is and where.
+/// there is and where; or of tool calls, the latest.
 fn transcript(blocks: &[Block], width: usize, room: usize, cwd: &str) -> Vec<Vec<Seg>> {
     let mut shown: Vec<Vec<Vec<Seg>>> = Vec::new();
     let mut left = room;
@@ -938,7 +938,8 @@ fn transcript(blocks: &[Block], width: usize, room: usize, cwd: &str) -> Vec<Vec
             shown.push(rows);
             continue;
         }
-        if next.is_none() {
+        // Of the latest tool calls, the latest are what the agent is doing.
+        if next.is_none() && !matches!(b, Block::Tools(_)) {
             // How much is left out, and where all of it is, before any of it.
             let lead = |keep: usize| match keep {
                 0 => format!("{:GUTTER$}{whole} line(s)", ""),
@@ -2932,6 +2933,35 @@ mod tests {
         );
         assert!(text.ends_with("\n\n• m25\n  └ Run c25"), "{text}");
         assert!(!text.contains("c5"), "{text}");
+    }
+
+    #[test]
+    fn the_latest_tool_calls_show_when_they_fill_the_window() {
+        let h = home();
+        let store = Store::new(&h.0);
+        store
+            .save(&task("t1", "user", "running", NOW, json!({"turns": 0})))
+            .unwrap();
+        let said = json!({"text": "Working."});
+        store.append(&event(1, 20_000, "t1", "said", said)).unwrap();
+        for i in 1..=10 {
+            let tool = json!({"name": "Bash", "detail": format!("c{i}")});
+            store
+                .append(&event(i + 1, 10_000, "t1", "tool", tool))
+                .unwrap();
+        }
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let frame: Vec<String> = view
+            .task_frame("t1", NOW, Some((60, 5)), false)
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect();
+        assert_eq!(
+            frame[1..],
+            ["…   Run c7", "    Run c8", "    Run c9", "    Run c10"],
+            "{frame:#?}"
+        );
     }
 
     #[test]
