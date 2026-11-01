@@ -1254,10 +1254,37 @@ fn break_at(piece: &str, next: char) -> Option<usize> {
     None
 }
 
-/// Text without markdown's bold marks: `**` pairs around text, outside code, and not part of
-/// a path, a glob or an expression such as `src/**/*.rs` or `2**10`. Code is between runs of
-/// as many backticks, a fenced block's as well as a span's.
-fn unbold(line: &str) -> String {
+/// Text without markdown's bold marks, outside fenced code blocks: a block opens on a line
+/// that starts with three or more backticks or tildes, and closes on a line of no fewer of the
+/// same and nothing else.
+fn unbold(text: &str) -> String {
+    let mut fence: Option<(char, usize)> = None;
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(|line| {
+            let t = line.trim();
+            let marker = ['`', '~']
+                .into_iter()
+                .map(|c| (c, t.chars().take_while(|x| *x == c).count()))
+                .find(|(_, n)| *n >= 3);
+            match (fence, marker) {
+                (None, Some(m)) => fence = Some(m),
+                (Some((c, n)), Some((m, k))) if m == c && k >= n && t.chars().all(|x| x == c) => {
+                    fence = None
+                }
+                (Some(_), _) => {}
+                (None, None) => return unbold_line(line),
+            }
+            line.to_string()
+        })
+        .collect();
+    lines.join("\n")
+}
+
+/// A line without markdown's bold marks: `**` pairs around text, outside code spans, and not
+/// part of a path, a glob or an expression such as `src/**/*.rs` or `2**10`. A code span is
+/// between runs of as many backticks.
+fn unbold_line(line: &str) -> String {
     let chars: Vec<char> = line.chars().collect();
     // Outside the marks: not a letter, digit or what joins a path or expression.
     let outside =
@@ -2554,6 +2581,13 @@ mod tests {
                 "```\nprint(\"**hi**\")\n```\n**done**",
                 "```\nprint(\"**hi**\")\n```\ndone",
             ),
+            // A block ends only on a line of its own fence.
+            (
+                "```rust\nlet s = \"```\";\nprint(\"**hi**\")\n```\n**done**",
+                "```rust\nlet s = \"```\";\nprint(\"**hi**\")\n```\ndone",
+            ),
+            ("~~~\n**x**\n~~~\n**y**", "~~~\n**x**\n~~~\ny"),
+            ("````\n```\n**x**\n````\n**y**", "````\n```\n**x**\n````\ny"),
         ] {
             assert_eq!(unbold(line), plain);
         }
