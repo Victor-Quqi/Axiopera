@@ -449,7 +449,19 @@ impl View {
         about.push_str(&format!(", by {}", caller_label(&t.parent, usize::MAX)));
         // What it waits for, says and does needs no title: each line has a label.
         let mut head = vec![title, vec![(about, DIM)]];
-        head.extend(details(t, tail).iter().map(|d| d.row("  ", now)));
+        let mut now_rows: Vec<Vec<Seg>> =
+            details(t, tail).iter().map(|d| d.row("  ", now)).collect();
+        // Approvals and questions may be more than the window holds: as many as fit, and how
+        // many more there are.
+        if let Some((_, height)) = size
+            && now_rows.len() > height.saturating_sub(head.len())
+        {
+            let kept = height.saturating_sub(head.len() + 1);
+            let more = now_rows.len() - kept;
+            now_rows.truncate(kept);
+            now_rows.push(vec![(format!("  …and {more} more"), DIM)]);
+        }
+        head.extend(now_rows);
 
         let width = size.map(|(w, _)| w);
         let task_text = match &tail.prompt {
@@ -505,7 +517,7 @@ impl View {
         };
         let mut lines = head;
         for ((section, _), room) in sections.into_iter().zip(rooms) {
-            if room == 0 {
+            if room == 0 || section.want() == 0 {
                 continue;
             }
             if blanks {
@@ -539,6 +551,8 @@ impl Section {
             }
             Section::Note(..) => 1,
             Section::Tasks(rows) => 1 + rows.len(),
+            // Nothing at all before its first event.
+            Section::Events(events) if events.is_empty() => 0,
             Section::Events(events) => 1 + events.len(),
         }
     }
@@ -602,9 +616,10 @@ fn arrange(sections: &[&Section], room: usize) -> (Vec<usize>, bool) {
     let last = sections.len() - 1;
     let events_least = sections[last].least();
     let rest: usize = sections[..last].iter().map(|s| s.want()).sum();
-    if rest + events_least + sections.len() <= room {
+    let blanks = sections.iter().filter(|s| s.want() > 0).count();
+    if rest + events_least + blanks <= room {
         let mut rooms: Vec<usize> = sections[..last].iter().map(|s| s.want()).collect();
-        rooms.push(room - rest - sections.len());
+        rooms.push(room - rest - blanks);
         return (rooms, true);
     }
     // Task text, result, sub-tasks, events.
@@ -2296,7 +2311,7 @@ mod tests {
         // Without a window, all of it.
         let plain = view.task_frame("t1", NOW, None).join("\n");
         assert!(
-            plain.contains(&format!("\n  {long}\n  line 1\n")) && plain.contains("\n  line 30\n"),
+            plain.contains(&format!("\n  {long}\n  line 1\n")) && plain.ends_with("\n  line 30"),
             "{plain}"
         );
 
@@ -2325,7 +2340,7 @@ mod tests {
         let task = &frame[title + pieces + 1..];
         assert_eq!(task[0], format!("  {}word", "word ".repeat(6)), "{text}");
         assert!(task[1].starts_with("  word "), "{text}");
-        assert!(text.contains("\nEvents"), "{text}");
+        assert!(frame[19].starts_with("  line "), "{text}");
 
         let lines = |n| vec![vec![("  a".to_string(), "")]; n];
         let plain = |lines: Vec<Vec<Seg>>| -> Vec<String> {
@@ -2478,6 +2493,38 @@ mod tests {
         assert!(result.replace("\n  ", "").contains(&turn), "{text}");
         assert!(text.contains("\nSub-tasks  2 of 7 shown\n"), "{text}");
         assert!(text.ends_with("[tr codex] Read: b"), "{text}");
+    }
+
+    #[test]
+    fn a_task_view_counts_what_waits_past_the_window_and_skips_what_is_not_there() {
+        let h = home();
+        let store = Store::new(&h.0);
+        let questions: Vec<Value> = (0..23)
+            .map(|i| json!({"id": format!("q{i}"), "text": "Which?", "answer": null, "asked_ms": NOW}))
+            .collect();
+        store
+            .save(&task(
+                "t1",
+                "user",
+                "waiting",
+                NOW,
+                json!({"questions": questions}),
+            ))
+            .unwrap();
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let frame: Vec<String> = view
+            .task_frame("t1", NOW, Some((80, 24)))
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect();
+        assert_eq!(frame.len(), 24, "{frame:#?}");
+        assert!(frame[22].contains("q20: Which?"), "{frame:#?}");
+        assert_eq!(frame[23], "  …and 2 more");
+
+        // Without events yet, no title for them.
+        let frame = view.task_frame("t1", NOW, None).join("\n");
+        assert!(!frame.contains("Events"), "{frame}");
     }
 
     #[test]
