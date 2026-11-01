@@ -925,10 +925,11 @@ fn from_dir(text: &str, cwd: &str) -> String {
     let mut kept = 0;
     for (i, _) in text.match_indices(cwd) {
         let end = i + cwd.len();
+        // What a path starts after in a command or a sentence.
         let starts = text[..i]
             .chars()
             .next_back()
-            .is_none_or(|c| !c.is_alphanumeric() && !"/\\._-~:".contains(c));
+            .is_none_or(|c| c.is_whitespace() || "\"'`=(<>,;|&".contains(c));
         if i >= kept && starts && text[end..].starts_with(['/', '\\']) {
             out.push_str(&text[kept..i]);
             kept = end + 1;
@@ -2938,6 +2939,11 @@ mod tests {
             ),
             ("--file=/work/x", "--file=x"),
             ("/workshop/a /work", "/workshop/a /work"),
+            (
+                "cat '/backup(2025)/work/a.rs'",
+                "cat '/backup(2025)/work/a.rs'",
+            ),
+            ("see (/work/a.rs)", "see (a.rs)"),
         ] {
             let cwd = if text.starts_with('D') {
                 r"D:\work"
