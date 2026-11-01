@@ -121,10 +121,11 @@ pub async fn run(home: &Path, task: Option<&str>, all: bool) -> Result<i32> {
             bytes = read.recv(), if ui.keys => match bytes {
                 Some(bytes) => input.feed(&bytes),
                 // Keys can no longer be read: the terminal is given back its own handling of
-                // Ctrl-C, and the view only shows.
+                // Ctrl-C, and the view only shows, with nothing chosen.
                 None => {
                     keys = None;
                     ui.keys = false;
+                    input = Input::default();
                     Vec::new()
                 }
             },
@@ -216,15 +217,20 @@ impl Input {
 fn key_at(bytes: &[u8]) -> Option<(Option<Key>, usize)> {
     Some(match bytes {
         [] | [0x1b] | [0x1b, b'[' | b'O'] => return None,
-        // CSI: parameters, then a final byte. SS3: one byte.
+        // CSI: parameters, then a final byte. SS3: one byte. A byte that cannot end them, such
+        // as Ctrl-C, ends what came before it and is read on its own.
         [0x1b, b'[', tail @ ..] => {
             let params = tail
                 .iter()
                 .take_while(|b| (0x20..0x40).contains(*b))
                 .count();
-            (arrow(*tail.get(params)?), 2 + params + 1)
+            match *tail.get(params)? {
+                end @ 0x40..=0x7e => (arrow(end), 2 + params + 1),
+                _ => (None, 2 + params),
+            }
         }
-        [0x1b, b'O', b, ..] => (arrow(*b), 3),
+        [0x1b, b'O', end @ 0x40..=0x7e, ..] => (arrow(*end), 3),
+        [0x1b, b'O', ..] => (None, 2),
         [0x1b, ..] => (Some(Key::Back), 1),
         [b'\r' | b'\n', ..] => (Some(Key::Open), 1),
         [b'k', ..] => (Some(Key::Up), 1),
@@ -284,12 +290,13 @@ impl Ui {
         if let Some(id) = &self.open {
             return view.task_frame(id, now, Some(size), self.keys);
         }
-        if self.keys {
-            // The first task when the chosen one is gone or none was.
-            let ids = view.order(now);
-            if !self.chosen.as_ref().is_some_and(|c| ids.contains(c)) {
-                self.chosen = ids.into_iter().next();
-            }
+        if !self.keys {
+            return view.frame(now, Some(size), None);
+        }
+        // The first task when the chosen one is gone or none was.
+        let ids = view.order(now);
+        if !self.chosen.as_ref().is_some_and(|c| ids.contains(c)) {
+            self.chosen = ids.into_iter().next();
         }
         view.frame(now, Some(size), self.chosen.as_deref())
     }
@@ -2725,6 +2732,12 @@ mod tests {
         assert_eq!(input.flush(), [Back]);
         input.feed(b"\x1bO");
         assert!(input.flush().is_empty() && !input.waiting());
+        // Ctrl-C is never taken into a sequence.
+        for start in [&b"\x1b["[..], b"\x1b[1;", b"\x1bO"] {
+            assert!(input.feed(start).is_empty());
+            assert_eq!(input.feed(b"\x03"), [Quit]);
+            assert!(!input.waiting());
+        }
 
         let h = home();
         let store = Store::new(&h.0);
@@ -2812,17 +2825,13 @@ mod tests {
         plain(&mut ui, &view);
         assert_eq!(ui.chosen.as_deref(), Some("t0"));
 
-        // Without keys, nothing is chosen and the title tells of no keys.
-        let mut no_keys = Ui {
-            open: None,
-            chosen: None,
-            keys: false,
-        };
-        let shown = plain(&mut no_keys, &view);
-        assert!(
-            no_keys.chosen.is_none() && !shown[0].contains("choose"),
-            "{shown:#?}"
-        );
+        // Without keys, as when they can no longer be read, no line is marked and the title
+        // tells of no keys.
+        ui.keys = false;
+        let frame = ui.draw(&view, NOW, (80, 6));
+        assert!(!frame.iter().any(|l| l.contains("\x1b[7m")), "{frame:#?}");
+        let shown = plain(&mut ui, &view);
+        assert!(!shown[0].contains("choose"), "{shown:#?}");
         assert!(!shown.iter().any(|l| columns(l) == 79), "{shown:#?}");
     }
 
