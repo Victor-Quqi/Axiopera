@@ -37,7 +37,7 @@ const WITH_TASKS: u8 = u8::MAX;
 /// Assumed when the terminal does not tell its size.
 const FALLBACK_SIZE: (usize, usize) = (100, 30);
 /// Characters of a task name shown.
-const NAME: usize = 24;
+const NAME: usize = 16;
 /// Characters of a host session's ID shown: enough to tell sessions apart.
 const SESSION: usize = 8;
 /// Columns of the agent cell of a task's line.
@@ -133,6 +133,12 @@ struct View {
     all: bool,
     tasks: HashMap<String, Task>,
     tails: HashMap<String, Tail>,
+    /// The widest cells seen since top started: columns widen for a new task, and do not
+    /// narrow when one leaves, which would move every line.
+    widths: Widths,
+    /// When each session first spawned, by its caller, as seen since top started: sessions
+    /// keep their order when their oldest tasks are hidden or removed.
+    first_spawned: HashMap<String, u64>,
 }
 
 impl View {
@@ -142,6 +148,11 @@ impl View {
             all,
             tasks: HashMap::new(),
             tails: HashMap::new(),
+            widths: Widths {
+                id: columns("  TASK"),
+                name: columns("NAME"),
+            },
+            first_spawned: HashMap::new(),
         }
     }
 
@@ -161,6 +172,26 @@ impl View {
             }
         }
         self.tasks = tasks;
+        for t in self.tasks.values() {
+            let mut depth = 1;
+            let mut up = self.parent(t);
+            // A bound, should parents ever form a loop.
+            while let Some(p) = up.filter(|_| depth <= self.tasks.len()) {
+                depth += 1;
+                up = self.parent(p);
+            }
+            if depth == 1 {
+                let at = self
+                    .first_spawned
+                    .entry(t.parent.clone())
+                    .or_insert(u64::MAX);
+                *at = (*at).min(t.created_ms);
+            }
+            self.widths = Widths {
+                id: self.widths.id.max(2 * depth + columns(&t.id)),
+                name: self.widths.name.max(columns(&name_cell(t)).min(NAME)),
+            };
+        }
         let store = &self.store;
         self.tails.retain(|id, _| store.exists(id));
         for (id, t) in &self.tasks {
@@ -296,14 +327,7 @@ impl View {
                 },
             }
         }
-        // Sessions in the order they first spawned, hidden tasks included, so that a session
-        // whose oldest task leaves the list does not move after another.
-        let mut first: HashMap<&str, u64> = HashMap::new();
-        for t in self.tasks.values().filter(|t| self.parent(t).is_none()) {
-            let at = first.entry(t.parent.as_str()).or_insert(u64::MAX);
-            *at = (*at).min(t.created_ms);
-        }
-        groups.sort_by_key(|(caller, _)| (first.get(caller).copied(), *caller));
+        groups.sort_by_key(|(caller, _)| (self.first_spawned.get(*caller).copied(), *caller));
         // Session IDs are cut unless that leaves two alike.
         let short: Vec<String> = groups
             .iter()
@@ -335,7 +359,7 @@ impl View {
                 }
             }
         }
-        let widths = widths(order.iter().filter_map(|(_, row)| row.as_ref()));
+        let widths = self.widths;
         let several = groups.len() > 1;
         let mut rows = Vec::new();
         let mut lines: HashMap<&str, usize> = HashMap::new();
@@ -450,7 +474,7 @@ impl View {
             .into_iter()
             .map(|k| (format!("  {}", k.id), k))
             .collect();
-        let kid_widths = widths(kids.iter());
+        let kid_widths = self.widths;
         let kids: Vec<Row> = kids
             .iter()
             .map(|(cell, k)| self.task_row(cell, k, kid_widths, now))
@@ -523,24 +547,12 @@ impl View {
     }
 }
 
-/// Widths of the ID and name columns of task lines: those of their widest cells, so that what
-/// matters most of each task has the rest.
+/// Widths of the ID and name columns of task lines, as wide as their widest cells, so that
+/// what matters most of each task has the rest.
 #[derive(Clone, Copy)]
 struct Widths {
     id: usize,
     name: usize,
-}
-
-/// Widths for these task lines, given with their ID cells.
-fn widths<'a>(lines: impl Iterator<Item = &'a (String, &'a Task)>) -> Widths {
-    let least = Widths {
-        id: columns("  TASK"),
-        name: columns("NAME"),
-    };
-    lines.fold(least, |w, (cell, t)| Widths {
-        id: w.id.max(columns(cell)),
-        name: w.name.max(columns(&name_cell(t)).min(NAME)),
-    })
 }
 
 impl Widths {
@@ -2100,6 +2112,36 @@ mod tests {
             one[1].contains("by codex session 019a2b3c-2222 "),
             "{one:#?}"
         );
+
+        // Nor does A move when gc removes its first task, or the columns when a task with a
+        // long name and deep under others comes and goes.
+        let before = view.frame(NOW, None);
+        store.remove("a1").unwrap();
+        store
+            .save(&task("b2", "task:b1", "idle", NOW, json!({})))
+            .unwrap();
+        store
+            .save(&task(
+                "b3",
+                "task:b2",
+                "idle",
+                NOW,
+                json!({"name": "a name longer than the column"}),
+            ))
+            .unwrap();
+        view.refresh();
+        let wide = view.frame(NOW, None);
+        let b3 = cells(&wide, "b3");
+        assert_eq!(b3[1], "a name longer t…", "{wide:#?}");
+        store.remove("b3").unwrap();
+        store.remove("b2").unwrap();
+        view.refresh();
+        let after = view.frame(NOW, None);
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[2], wide[2]);
+        assert_eq!(line_of(&after, "a2 "), line_of(&wide, "a2 "));
+        assert_ne!(after[2], before[2]);
+        assert!(after[3].ends_with("019a2b3c-1111"), "{after:#?}");
     }
 
     #[test]
