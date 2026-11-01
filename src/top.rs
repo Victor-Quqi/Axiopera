@@ -679,38 +679,46 @@ impl View {
         }
         head.extend(waiting);
 
-        let mut said = Vec::new();
+        // What it was given first, then what was said, in the order it was said.
+        let ago = |at: u64| age(now.saturating_sub(at));
+        let mut said: Vec<(u64, Message)> = Vec::new();
         match &tail.prompt {
-            Some(text) => said.push(Message {
-                label: "task".into(),
-                lines: text.shown(),
-                file: Some(self.store.prompt_path(id)),
-            }),
-            None if tail.log.is_empty() => said.push(Message {
-                label: "task".into(),
-                lines: vec!["not recorded: spawned before axiopera kept it".into()],
-                file: None,
-            }),
+            Some(text) => said.push((
+                0,
+                Message {
+                    label: "task".into(),
+                    lines: text.shown(),
+                    file: Some(self.store.prompt_path(id)),
+                },
+            )),
+            None if tail.log.is_empty() => said.push((
+                0,
+                Message {
+                    label: "task".into(),
+                    lines: vec!["not recorded: spawned before axiopera kept it".into()],
+                    file: None,
+                },
+            )),
             None => {}
         }
-        let skip = match size {
-            None => tail.log.len().saturating_sub(PLAIN_MESSAGES),
-            Some(_) => 0,
+        let given = said.len();
+        // A turn's last message is its result, whole in its file. A result whose message is
+        // not among them, as of a task from before messages were kept, comes on its own.
+        let result = tail.result.as_ref().filter(|(_, r)| !r.lines.is_empty());
+        let as_result = |turn: u32, r: &Text, at: u64| Message {
+            label: ago(at),
+            lines: r.shown(),
+            file: Some(self.store.turn_path(id, turn)),
         };
-        for s in tail.log.iter().skip(skip) {
-            // A turn's last message is its result, whole in its file.
-            let result = tail
-                .result
-                .as_ref()
-                .filter(|(turn, _)| s.turn == Some(*turn));
-            said.push(match result {
-                Some((turn, r)) => Message {
-                    label: age(now.saturating_sub(s.at)),
-                    lines: r.shown(),
-                    file: Some(self.store.turn_path(id, *turn)),
-                },
+        let mut result_shown = false;
+        for s in &tail.log {
+            let message = match result.filter(|(turn, _)| s.turn == Some(*turn)) {
+                Some((turn, r)) => {
+                    result_shown = true;
+                    as_result(*turn, r, s.at)
+                }
                 None => Message {
-                    label: age(now.saturating_sub(s.at)),
+                    label: ago(s.at),
                     lines: s
                         .text
                         .split(" ↵ ")
@@ -720,7 +728,21 @@ impl View {
                         .collect(),
                     file: None,
                 },
-            });
+            };
+            said.push((s.at, message));
+        }
+        if let Some((turn, r)) = result.filter(|_| !result_shown) {
+            let at = match tail.ended_ms {
+                0 => t.updated_ms,
+                at => at,
+            };
+            said.push((at, as_result(*turn, r, at)));
+        }
+        said[given..].sort_by_key(|(at, _)| *at);
+        let mut said: Vec<Message> = said.into_iter().map(|(_, m)| m).collect();
+        if size.is_none() {
+            let extra = (said.len() - given).saturating_sub(PLAIN_MESSAGES);
+            said.drain(given..given + extra);
         }
         let mut lines = head;
         match size {
@@ -745,6 +767,46 @@ impl View {
     }
 }
 
+/// How many lines of a message are left out, and the file with all of it: its path whole,
+/// after the count when it fits a window `width` wide, else on lines of its own.
+fn left_out(more: usize, file: Option<&Path>, width: usize) -> Vec<Vec<Seg>> {
+    let count = format!("{:LABEL$}…{more} more line(s)", "");
+    let Some(file) = file else {
+        return vec![vec![(count, DIM)]];
+    };
+    let path = file.display().to_string();
+    let one = format!("{count}; all in {path}");
+    // The last column stays empty.
+    if columns(&one) < width {
+        return vec![vec![(one, DIM)]];
+    }
+    let pieces = chop(&path, width.saturating_sub(LABEL + 1));
+    std::iter::once(vec![(format!("{count}; all in:"), DIM)])
+        .chain(
+            pieces
+                .into_iter()
+                .map(|p| vec![(format!("{:LABEL$}{p}", ""), DIM)]),
+        )
+        .collect()
+}
+
+/// Text in pieces of up to `room` columns, broken anywhere: a path must keep its spaces.
+fn chop(text: &str, room: usize) -> Vec<String> {
+    let room = room.max(2);
+    let mut out = vec![String::new()];
+    let mut used = 0;
+    for c in text.chars() {
+        let w = char_columns(c);
+        if used + w > room {
+            out.push(String::new());
+            used = 0;
+        }
+        out.last_mut().unwrap().push(c);
+        used += w;
+    }
+    out
+}
+
 /// What a task was given, or a message of its agent, for its view.
 struct Message {
     /// When it was said, or `task` for the task text.
@@ -766,14 +828,16 @@ impl Message {
             .collect()
     }
 
-    /// The lines as rows. `cut` marks the first as following lines left out above it.
+    /// The lines as rows. `cut` marks the first as following lines left out above it, in the
+    /// label's columns, which the text does not use.
     fn rows(&self, text: Vec<String>, cut: bool) -> Vec<Vec<Seg>> {
+        let mark = if cut { "…" } else { " " };
         text.into_iter()
             .enumerate()
             .map(|(i, line)| match i {
                 0 => vec![
-                    (format!("{:>w$}  ", self.label, w = LABEL - 2), DIM),
-                    (format!("{}{line}", if cut { "…" } else { "" }), ""),
+                    (format!("{:>w$}{mark} ", self.label, w = LABEL - 2), DIM),
+                    (line, ""),
                 ],
                 _ => vec![(format!("{:LABEL$}{line}", ""), "")],
             })
@@ -795,14 +859,12 @@ fn transcript(said: Vec<Message>, width: usize, room: usize) -> Vec<Vec<Seg>> {
             continue;
         }
         if k == 0 {
-            let keep = left.saturating_sub(1);
+            let room = |more| left.saturating_sub(left_out(more, m.file.as_deref(), width).len());
+            // A line of it at least, when there are two, before the count.
+            let keep = room(text.len()).max(usize::from(left >= 2));
             let more = text.len() - keep;
             let mut rows = m.rows(text.into_iter().take(keep).collect(), false);
-            let mut note = format!("{:LABEL$}…{more} more line(s)", "");
-            if let Some(file) = &m.file {
-                note.push_str(&format!("; all in {}", file.display()));
-            }
-            rows.push(vec![(note, DIM)]);
+            rows.extend(left_out(more, m.file.as_deref(), width));
             rows.truncate(left);
             shown.push(rows);
         } else if left > 0 {
@@ -1178,12 +1240,43 @@ fn break_at(piece: &str, next: char) -> Option<usize> {
     None
 }
 
-/// A line without markdown's bold marks, when they come in pairs.
+/// A line without markdown's bold marks: `**` pairs around text, outside code spans, and not
+/// part of a path, a glob or an expression such as `src/**/*.rs` or `2**10`.
 fn unbold(line: &str) -> String {
-    match line.matches("**").count() {
-        n if n > 0 && n % 2 == 0 => line.replace("**", ""),
-        _ => line.to_string(),
+    let chars: Vec<char> = line.chars().collect();
+    // Outside the marks: not a letter, digit or what joins a path or expression.
+    let outside =
+        |c: Option<&char>| c.is_none_or(|c| !c.is_ascii_alphanumeric() && !"/*\\_".contains(*c));
+    // Inside the marks: text.
+    let inside = |c: Option<&char>| c.is_some_and(|c| !c.is_whitespace() && !"*/".contains(*c));
+    let mut marks = Vec::new();
+    let mut open = None;
+    let mut code = false;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '`' {
+            code = !code;
+        } else if !code && chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
+            let (before, after) = (i.checked_sub(1).map(|j| &chars[j]), chars.get(i + 2));
+            match open {
+                Some(at) if inside(before) && outside(after) => {
+                    marks.extend([at, i]);
+                    open = None;
+                }
+                _ if outside(before) && inside(after) => open = Some(i),
+                _ => {}
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
     }
+    chars
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| !marks.iter().any(|m| (*m..m + 2).contains(j)))
+        .map(|(_, c)| c)
+        .collect()
 }
 
 /// What a task's files tell beyond its `task.json`.
@@ -1776,7 +1869,7 @@ mod tests {
             .map(|l| strip_sgr(l))
             .collect();
         assert_eq!(fitted[2..], frame[4..], "{fitted:#?}");
-        assert_eq!(fitted[1], "  task  …Report findings.");
+        assert_eq!(fitted[1], "  task… Report findings.");
         // With room for all, a blank line under the title.
         let roomy = view.task_frame("t1", NOW, Some((60, 20)), false);
         assert_eq!(roomy.len(), frame.len(), "{roomy:#?}");
@@ -1788,7 +1881,7 @@ mod tests {
             .collect();
         assert_eq!(short[1], "   20s  No bugs.", "{short:#?}");
         assert!(
-            short[2].starts_with("        …2 more line(s); all in "),
+            short[2].starts_with("        …2 more line(s); all in"),
             "{short:#?}"
         );
         assert!(short.iter().all(|l| columns(l) <= 59), "{short:#?}");
@@ -2320,10 +2413,20 @@ mod tests {
         assert_eq!(frame.len(), 8, "{text}");
         assert_eq!(frame[1], format!("  task  {}word", "word ".repeat(5)));
         assert!(frame[2].starts_with("        word "), "{text}");
-        assert!(
-            frame[7].starts_with("        …28 more line(s); all in "),
+        // The path whole, on lines of its own when it does not fit after the count.
+        let path = store.prompt_path("t1").display().to_string();
+        let pieces = path.chars().count().div_ceil(31);
+        let note = frame.len() - 1 - pieces;
+        assert_eq!(
+            frame[note],
+            format!("        …{} more line(s); all in:", 34 - (note - 1)),
             "{text}"
         );
+        let shown: String = frame[note + 1..]
+            .iter()
+            .map(|l| l.strip_prefix("        ").unwrap())
+            .collect();
+        assert_eq!(shown, path, "{text}");
         assert!(frame.iter().all(|l| columns(l) <= 39), "{text}");
     }
 
@@ -2405,11 +2508,68 @@ mod tests {
         assert_eq!(
             short[2..],
             [
-                "   50s  …Then fixing.",
+                "   50s… Then fixing.",
                 "   30s  Fixed the reader.",
                 "   10s  Done: all tests pass.",
             ],
             "{short:#?}"
+        );
+
+        // Bold marks go; a path, a glob, an expression or code keeps its stars.
+        for (line, plain) in [
+            ("**Done**: all", "Done: all"),
+            ("里加了**断言**，然后", "里加了断言，然后"),
+            ("**`code`** here", "`code` here"),
+            (
+                "src/**/*.rs and tests/**/*.rs",
+                "src/**/*.rs and tests/**/*.rs",
+            ),
+            ("2**10 and 3**2", "2**10 and 3**2"),
+            ("a ** b ** c", "a ** b ** c"),
+            ("`**x**` stays", "`**x**` stays"),
+        ] {
+            assert_eq!(unbold(line), plain);
+        }
+
+        // A turn that ended with nothing to say keeps what was said in it.
+        store.save_turn("t1", 1, "").unwrap();
+        store
+            .save(&task("t1", "user", "failed", NOW, json!({"turns": 1})))
+            .unwrap();
+        store
+            .append(&event(
+                7,
+                1_000,
+                "t1",
+                "turn_ended",
+                json!({"turn": 1, "ok": false, "error": "max turns"}),
+            ))
+            .unwrap();
+        view.refresh();
+        let ended = view.task_frame("t1", NOW, None, false).join("\n");
+        assert!(ended.ends_with("   10s  Done: all tests pass."), "{ended}");
+        assert!(ended.contains("\n error  max turns\n"), "{ended}");
+    }
+
+    #[test]
+    fn a_result_without_its_message_still_shows() {
+        // A task from before messages were kept: its result, and no message.
+        let h = home();
+        let store = Store::new(&h.0);
+        store
+            .save(&task("t1", "user", "idle", NOW - 60_000, json!({})))
+            .unwrap();
+        store.save_turn("t1", 1, "All done.\nNo bugs.").unwrap();
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        assert_eq!(
+            view.task_frame("t1", NOW, None, false)[1..],
+            [
+                "",
+                "  task  not recorded: spawned before axiopera kept it",
+                " 1m00s  All done.",
+                "        No bugs.",
+            ]
         );
     }
 
