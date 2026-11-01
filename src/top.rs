@@ -1259,6 +1259,8 @@ fn break_at(piece: &str, next: char) -> Option<usize> {
 /// same and nothing else.
 fn unbold(text: &str) -> String {
     let mut fence: Option<(char, usize)> = None;
+    // A code span may go on over lines.
+    let mut code = 0;
     let lines: Vec<String> = text
         .split('\n')
         .map(|line| {
@@ -1268,12 +1270,15 @@ fn unbold(text: &str) -> String {
                 .map(|c| (c, t.chars().take_while(|x| *x == c).count()))
                 .find(|(_, n)| *n >= 3);
             match (fence, marker) {
-                (None, Some(m)) => fence = Some(m),
+                (None, Some(m)) => {
+                    fence = Some(m);
+                    code = 0;
+                }
                 (Some((c, n)), Some((m, k))) if m == c && k >= n && t.chars().all(|x| x == c) => {
                     fence = None
                 }
                 (Some(_), _) => {}
-                (None, None) => return unbold_line(line),
+                (None, None) => return unbold_line(line, &mut code),
             }
             line.to_string()
         })
@@ -1283,8 +1288,9 @@ fn unbold(text: &str) -> String {
 
 /// A line without markdown's bold marks: `**` pairs around text, outside code spans, and not
 /// part of a path, a glob or an expression such as `src/**/*.rs` or `2**10`. A code span is
-/// between runs of as many backticks.
-fn unbold_line(line: &str) -> String {
+/// between runs of as many backticks; `code` is the run that opened the span the line starts
+/// in, 0 outside one, and what it ends in.
+fn unbold_line(line: &str, code: &mut usize) -> String {
     let chars: Vec<char> = line.chars().collect();
     // Outside the marks: not a letter, digit or what joins a path or expression.
     let outside =
@@ -1293,20 +1299,18 @@ fn unbold_line(line: &str) -> String {
     let inside = |c: Option<&char>| c.is_some_and(|c| !c.is_whitespace() && !"*/".contains(*c));
     let mut marks = Vec::new();
     let mut open = None;
-    // The backticks that opened the code it is in, none outside.
-    let mut code = 0;
     let mut i = 0;
     while i < chars.len() {
         if chars[i] == '`' {
             let run = chars[i..].iter().take_while(|c| **c == '`').count();
-            code = match code {
+            *code = match *code {
                 0 => run,
                 n if n == run => 0,
                 n => n,
             };
             i += run;
             continue;
-        } else if code == 0 && chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
+        } else if *code == 0 && chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
             let (before, after) = (i.checked_sub(1).map(|j| &chars[j]), chars.get(i + 2));
             match open {
                 Some(at) if inside(before) && outside(after) => {
@@ -2587,6 +2591,11 @@ mod tests {
                 "```rust\nlet s = \"```\";\nprint(\"**hi**\")\n```\ndone",
             ),
             ("~~~\n**x**\n~~~\n**y**", "~~~\n**x**\n~~~\ny"),
+            // A code span over lines.
+            (
+                "`first\n**literal**\nlast` and **x**",
+                "`first\n**literal**\nlast` and x",
+            ),
             ("````\n```\n**x**\n````\n**y**", "````\n```\n**x**\n````\ny"),
         ] {
             assert_eq!(unbold(line), plain);
