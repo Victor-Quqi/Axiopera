@@ -42,9 +42,9 @@ const NAME: usize = 24;
 const SESSION: usize = 8;
 /// Columns of the agent cell of a task's line.
 const AGENT: usize = 6;
-/// Least columns of the state cell: all states fit but `cancelled` and `interrupted`, so that
-/// one that comes and goes, such as `approval`, does not move the cells after it.
-const STATE: usize = 8;
+/// Columns of the state cell: its longest word, `interrupted`, so that a state that comes and
+/// goes does not move the cells after it.
+const STATE: usize = 11;
 
 const BOLD: &str = "1";
 const DIM: &str = "2";
@@ -296,6 +296,29 @@ impl View {
                 },
             }
         }
+        // Sessions in the order they first spawned, hidden tasks included, so that a session
+        // whose oldest task leaves the list does not move after another.
+        let mut first: HashMap<&str, u64> = HashMap::new();
+        for t in self.tasks.values().filter(|t| self.parent(t).is_none()) {
+            let at = first.entry(t.parent.as_str()).or_insert(u64::MAX);
+            *at = (*at).min(t.created_ms);
+        }
+        groups.sort_by_key(|(caller, _)| (first.get(caller).copied(), *caller));
+        // Session IDs are cut unless that leaves two alike.
+        let short: Vec<String> = groups
+            .iter()
+            .map(|(c, _)| caller_label(c, SESSION))
+            .collect();
+        let labels: HashMap<&str, String> = groups
+            .iter()
+            .zip(&short)
+            .map(
+                |((caller, _), label)| match short.iter().filter(|l| *l == label).count() {
+                    1 => (*caller, label.clone()),
+                    _ => (*caller, caller_label(caller, usize::MAX)),
+                },
+            )
+            .collect();
         // Lines in order: `None` for a session's, else the task with its ID cell, indented
         // by its depth.
         let mut order: Vec<(&str, Option<(String, &Task)>)> = Vec::new();
@@ -312,7 +335,7 @@ impl View {
                 }
             }
         }
-        let widths = self.widths(order.iter().filter_map(|(_, row)| row.as_ref()));
+        let widths = widths(order.iter().filter_map(|(_, row)| row.as_ref()));
         let several = groups.len() > 1;
         let mut rows = Vec::new();
         let mut lines: HashMap<&str, usize> = HashMap::new();
@@ -323,7 +346,7 @@ impl View {
                     group = Some(rows.len());
                     rows.push(Row {
                         rank: WITH_TASKS,
-                        ..Row::new(vec![(caller_label(caller), DIM)])
+                        ..Row::new(vec![(labels[caller].clone(), DIM)])
                     });
                 }
                 continue;
@@ -344,20 +367,6 @@ impl View {
         (widths.header(), rows, hidden)
     }
 
-    /// Widths for these task lines, given with their ID cells.
-    fn widths<'a>(&self, lines: impl Iterator<Item = &'a (String, &'a Task)>) -> Widths {
-        let least = Widths {
-            id: columns("  TASK"),
-            name: columns("NAME"),
-            state: STATE,
-        };
-        lines.fold(least, |w, (cell, t)| Widths {
-            id: w.id.max(columns(cell)),
-            name: w.name.max(columns(&name_cell(t)).min(NAME)),
-            state: w.state.max(columns(state(t, self.tail(&t.id)).0)),
-        })
-    }
-
     /// A task on one line: its ID cell, name, agent and state, the time since it last
     /// changed, and what matters most of it now.
     fn task_row(&self, cell: &str, t: &Task, widths: Widths, now: u64) -> Row {
@@ -374,7 +383,7 @@ impl View {
                 ),
                 "",
             ),
-            (pad(state, widths.state), color),
+            (pad(state, STATE), color),
             (
                 format!(
                     "  {:>4}  ",
@@ -386,6 +395,7 @@ impl View {
         ];
         Row {
             rank: rank(t, tail),
+            spawned: t.created_ms,
             ..Row::new(segs)
         }
     }
@@ -409,7 +419,7 @@ impl View {
         let mut about = format!(
             "spawned {} ago by {} in {}",
             ago(t.created_ms),
-            caller_label(&t.parent),
+            caller_label(&t.parent, usize::MAX),
             t.cwd.display()
         );
         if let Some(model) = &t.model {
@@ -440,7 +450,7 @@ impl View {
             .into_iter()
             .map(|k| (format!("  {}", k.id), k))
             .collect();
-        let kid_widths = self.widths(kids.iter());
+        let kid_widths = widths(kids.iter());
         let kids: Vec<Row> = kids
             .iter()
             .map(|(cell, k)| self.task_row(cell, k, kid_widths, now))
@@ -513,13 +523,24 @@ impl View {
     }
 }
 
-/// Widths of the columns of task lines that change with the tasks: those of their widest
-/// cells, so that what matters most of each task has the rest.
+/// Widths of the ID and name columns of task lines: those of their widest cells, so that what
+/// matters most of each task has the rest.
 #[derive(Clone, Copy)]
 struct Widths {
     id: usize,
     name: usize,
-    state: usize,
+}
+
+/// Widths for these task lines, given with their ID cells.
+fn widths<'a>(lines: impl Iterator<Item = &'a (String, &'a Task)>) -> Widths {
+    let least = Widths {
+        id: columns("  TASK"),
+        name: columns("NAME"),
+    };
+    lines.fold(least, |w, (cell, t)| Widths {
+        id: w.id.max(columns(cell)),
+        name: w.name.max(columns(&name_cell(t)).min(NAME)),
+    })
 }
 
 impl Widths {
@@ -531,7 +552,7 @@ impl Widths {
                 pad("  TASK", self.id),
                 pad("NAME", self.name),
                 pad("AGENT", AGENT),
-                pad("STATE", self.state),
+                pad("STATE", STATE),
                 "AGO"
             ),
             DIM,
@@ -591,6 +612,8 @@ struct Row {
     segs: Vec<Seg>,
     /// Lines of lower rank are shown first: see `rank`.
     rank: u8,
+    /// When its task was spawned: of lines with the same rank, the later are shown first.
+    spawned: u64,
     /// The lines it is shown with: its session's and its ancestors'.
     with: Vec<usize>,
 }
@@ -600,6 +623,7 @@ impl Row {
         Row {
             segs,
             rank: 0,
+            spawned: 0,
             with: Vec::new(),
         }
     }
@@ -620,8 +644,8 @@ fn rank(t: &Task, tail: &Tail) -> u8 {
 }
 
 /// As many rows as fit in `room`, in their order. When not all fit, the lowest ranks are
-/// chosen, the later of the same rank first, and the last line says how many are left out.
-/// Rows are not chosen by when they last changed: those shown would change every second.
+/// chosen, the later spawned of the same rank first, and the last line says how many are left
+/// out. Rows are not chosen by when they last changed: those shown would change every second.
 fn choose(rows: Vec<Row>, room: usize) -> Vec<Vec<Seg>> {
     if rows.len() <= room {
         return rows.into_iter().map(|r| r.segs).collect();
@@ -630,7 +654,7 @@ fn choose(rows: Vec<Row>, room: usize) -> Vec<Vec<Seg>> {
     let mut order: Vec<usize> = (0..rows.len())
         .filter(|&i| rows[i].rank != WITH_TASKS)
         .collect();
-    order.sort_by_key(|&i| (rows[i].rank, Reverse(i)));
+    order.sort_by_key(|&i| (rows[i].rank, Reverse(rows[i].spawned), Reverse(i)));
     let mut kept = vec![false; rows.len()];
     let mut used = 0;
     for i in order {
@@ -874,7 +898,8 @@ fn state(t: &Task, tail: &Tail) -> (&'static str, &'static str) {
     match t.status {
         _ if t.detached => ("detached", RED),
         Status::Running if !tail.approvals.is_empty() => ("approval", YELLOW),
-        _ if t.stalled => ("stalled", RED),
+        // The daemon leaves the mark on a task that stops while stalled.
+        Status::Running if t.stalled => ("stalled", RED),
         Status::Queued => ("queued", DIM),
         Status::Running => ("running", GREEN),
         Status::Idle => ("idle", DIM),
@@ -885,13 +910,14 @@ fn state(t: &Task, tail: &Tail) -> (&'static str, &'static str) {
     }
 }
 
-// Who spawned a group of tasks: a host session, `user`, or a task already removed. Agents
-/// other than the known hosts call as `user` too, like a person at a terminal.
-fn caller_label(caller: &str) -> String {
+/// Who spawned a group of tasks: a host session, `user`, or a task already removed. Agents
+/// other than the known hosts call as `user` too, like a person at a terminal. A session's ID
+/// is cut to `session_chars` characters.
+fn caller_label(caller: &str, session_chars: usize) -> String {
     match caller.split_once(':') {
         _ if caller == "user" => "user: terminals and unrecognized agents".into(),
         Some((host, session)) if host != "task" => {
-            let session: String = session.chars().take(SESSION).collect();
+            let session: String = session.chars().take(session_chars).collect();
             format!("{host} session {session}")
         }
         _ => caller.into(),
@@ -2005,12 +2031,75 @@ mod tests {
         assert!(line_of(&frame, "tr ").contains("\x1b[33mapproval"));
         assert!(line_of(&frame, "t7 ").contains("\x1b[2midle"));
 
-        // A hidden task that changes is not brought in for it.
+        // A hidden task that changes is not brought in for it, and a longer state of its own
+        // does not move the cells of the others.
         store
             .append(&event(4, 0, "t0", "said", json!({"text": "Late words."})))
             .unwrap();
         view.refresh();
         assert_eq!(view.frame(NOW, Some((100, 10))), frame);
+        store
+            .save(&task(
+                "t0",
+                "user",
+                "cancelled",
+                NOW - 50_000,
+                json!({"stalled": true}),
+            ))
+            .unwrap();
+        view.refresh();
+        assert_eq!(view.frame(NOW, Some((100, 10))), frame);
+        // The daemon may leave the stalled mark on a task that stopped.
+        assert_eq!(state(&view.tasks["t0"], view.tail("t0")).0, "cancelled");
+    }
+
+    #[test]
+    fn sessions_keep_their_place_and_can_be_told_apart() {
+        let h = home();
+        let store = Store::new(&h.0);
+        let a = "codex:019a2b3c-1111";
+        let b = "codex:019a2b3c-2222";
+        // A spawned first, long ago, then B, then A again.
+        store
+            .save(&task("a1", a, "idle", NOW - 3 * HOUR, json!({})))
+            .unwrap();
+        store
+            .save(&task("b1", b, "idle", NOW - 2_000, json!({})))
+            .unwrap();
+        store
+            .save(&task("a2", a, "idle", NOW - 1_000, json!({})))
+            .unwrap();
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let text = view.frame(NOW, None).join("\n");
+        // A stays first though its first task is hidden; their IDs are whole, being alike cut.
+        assert!(!text.contains("a1 "), "{text}");
+        let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s} in {text}"));
+        assert!(
+            at("\ncodex session 019a2b3c-1111\n") < at("\ncodex session 019a2b3c-2222\n"),
+            "{text}"
+        );
+        // With room for one of them, the later spawned.
+        let frame: Vec<String> = view
+            .frame(NOW, Some((100, 6)))
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect();
+        assert_eq!(
+            frame[3..],
+            [
+                "codex session 019a2b3c-1111",
+                line_of(&frame, "a2 "),
+                "  …and 1 more task(s)"
+            ],
+            "{frame:#?}"
+        );
+        // A task's view tells its session whole.
+        let one = view.task_frame("b1", NOW, None);
+        assert!(
+            one[1].contains("by codex session 019a2b3c-2222 "),
+            "{one:#?}"
+        );
     }
 
     #[test]
