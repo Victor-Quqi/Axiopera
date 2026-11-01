@@ -422,8 +422,8 @@ impl View {
         }
     }
 
-    /// One task in detail: what it was given, what it waits for and is doing, its sub-tasks,
-    /// its latest result, and its events.
+    /// One task in detail: what it is and what it waits for, says and does now, then what it
+    /// was given, its sub-tasks, its latest result and its events.
     fn task_frame(&self, id: &str, now: u64, size: Option<(usize, usize)>) -> Vec<String> {
         let Some(t) = self.tasks.get(id) else {
             let gone = format!("{id} is gone: it was removed, by gc or by hand");
@@ -438,30 +438,30 @@ impl View {
             (state.into(), color),
             (format!("  {}", meta(t, tail, now)), ""),
         ];
-        let mut about = format!(
-            "spawned {} ago by {} in {}",
-            ago(t.created_ms),
-            caller_label(&t.parent, usize::MAX),
-            t.cwd.display()
-        );
+        // Its session's ID last: whole, it is long.
+        let mut about = format!("spawned {} ago in {}", ago(t.created_ms), t.cwd.display());
         if let Some(model) = &t.model {
             about.push_str(&format!(", model {model}"));
         }
         if let Some(effort) = &t.effort {
             about.push_str(&format!(", effort {effort}"));
         }
-        let mut lines = vec![
-            title,
-            vec![(about, DIM)],
-            vec![],
-            vec![("Task".into(), BOLD)],
-        ];
+        about.push_str(&format!(", by {}", caller_label(&t.parent, usize::MAX)));
+        // What it waits for, says and does needs no title: each line has a label.
+        let mut head = vec![title, vec![(about, DIM)]];
+        head.extend(details(t, tail).iter().map(|d| d.row("  ", now)));
+
         let width = size.map(|(w, _)| w);
         let task_text = match &tail.prompt {
-            Some(text) => text.wrapped(width, self.store.prompt_path(id)),
-            None => Wrapped::note("  not recorded: spawned before axiopera kept it"),
+            Some(text) => Section::Text(
+                "Task".into(),
+                text.wrapped(width, self.store.prompt_path(id)),
+            ),
+            None => Section::Note(
+                "Task".into(),
+                "not recorded: spawned before axiopera kept it".into(),
+            ),
         };
-        let now_rows = details(t, tail);
         let mut kids: Vec<&Task> = self
             .tasks
             .values()
@@ -481,75 +481,164 @@ impl View {
             .iter()
             .map(|(cell, k)| self.task_row(cell, k, kid_widths, now))
             .collect();
-        let result = tail
-            .result
-            .as_ref()
-            .map(|(turn, r)| (turn, r.wrapped(width, self.store.turn_path(id, *turn))));
-        let mut events: Vec<Vec<Seg>> = tail.recent.iter().map(|e| event_row(e, t, now)).collect();
+        let events: Vec<Vec<Seg>> = tail.recent.iter().map(|e| event_row(e, t, now)).collect();
 
-        let (task_room, kids_room, result_room, events_room) = match size {
-            None => (usize::MAX, usize::MAX, PLAIN_RESULT, PLAIN_FEED),
+        // Each section with the lines it gets in plain output, in the order they are shown.
+        let mut sections = vec![(task_text, usize::MAX)];
+        if !kids.is_empty() {
+            sections.push((Section::Tasks(kids), usize::MAX));
+        }
+        if let Some((turn, r)) = &tail.result {
+            let text = r.wrapped(width, self.store.turn_path(id, *turn));
+            sections.push((
+                Section::Text(format!("Result of turn {turn}"), text),
+                1 + PLAIN_RESULT,
+            ));
+        }
+        sections.push((Section::Events(events), 1 + PLAIN_FEED));
+        let (rooms, blanks) = match size {
+            None => (sections.iter().map(|(_, plain)| *plain).collect(), true),
             Some((_, height)) => {
-                // A blank line and a title before each section after the task text.
-                let titles = |n: usize| if n > 0 { 2 } else { 0 };
-                let fixed = lines.len()
-                    + titles(now_rows.len())
-                    + now_rows.len()
-                    + titles(kids.len())
-                    + titles(usize::from(result.is_some()))
-                    + 2;
-                let room = height.saturating_sub(fixed);
-                let events_min = events.len().min(MIN_EVENTS);
-                let result_len = result.as_ref().map_or(0, |(_, r)| r.len());
-                // Enough for a text to say where all of it is, and for one sub-task or the
-                // count of them.
-                let mins = [
-                    task_text.len().min(task_text.rest_len().max(1)),
-                    kids.len().min(1),
-                    result
-                        .as_ref()
-                        .map_or(0, |(_, r)| r.len().min(r.rest_len().max(1))),
-                ];
-                let wants = [task_text.len(), kids.len(), result_len];
-                let got = share(&wants, &mins, room.saturating_sub(events_min));
-                let used: usize = got.iter().sum();
-                (
-                    got[0],
-                    got[1],
-                    got[2],
-                    room.saturating_sub(used).max(events_min),
-                )
+                let sections: Vec<&Section> = sections.iter().map(|(s, _)| s).collect();
+                arrange(&sections, height.saturating_sub(head.len()))
             }
         };
-        lines.extend(task_text.cut(task_room));
-        if !now_rows.is_empty() {
-            lines.push(vec![]);
-            lines.push(vec![("Now".into(), BOLD)]);
-            lines.extend(now_rows.iter().map(|d| d.row("  ", now)));
+        let mut lines = head;
+        for ((section, _), room) in sections.into_iter().zip(rooms) {
+            if room == 0 {
+                continue;
+            }
+            if blanks {
+                lines.push(vec![]);
+            }
+            lines.extend(section.lines(room));
         }
-        if !kids.is_empty() {
-            lines.push(vec![]);
-            lines.push(vec![("Sub-tasks".into(), BOLD)]);
-            lines.extend(choose(kids, kids_room));
-        }
-        if let Some((turn, r)) = result {
-            lines.push(vec![]);
-            lines.push(vec![(format!("Result of turn {turn}"), BOLD)]);
-            lines.extend(r.cut(result_room));
-        }
-        lines.push(vec![]);
-        lines.push(vec![("Events".into(), BOLD)]);
-        events.drain(..events.len().saturating_sub(events_room));
-        // Only a window too short for the least of each section has more lines than it holds.
-        if let Some((_, height)) = size {
-            cut(&mut lines, height.saturating_sub(events.len()));
-        }
-        lines.extend(events);
         finish(&lines, size)
     }
 }
 
-/// Widths of the ID and name columns of task lines, as wide as their widest cells, so that
+/// A part of a task's view: a title and lines under it, cut to the room it gets. What a cut
+/// leaves out is told on the title's line, so that it takes no line of its own.
+enum Section {
+    /// A text, with where all of it is when not all is shown.
+    Text(String, Wrapped),
+    /// A title with what there is to say on its line.
+    Note(String, String),
+    /// Sub-tasks, one on each line.
+    Tasks(Vec<Row>),
+    /// Events, the latest last.
+    Events(Vec<Vec<Seg>>),
+}
+
+impl Section {
+    /// Lines to show all of it.
+    fn want(&self) -> usize {
+        match self {
+            Section::Text(name, text) => {
+                text.titled(name, text.lines.len()).len() + text.lines.len()
+            }
+            Section::Note(..) => 1,
+            Section::Tasks(rows) => 1 + rows.len(),
+            Section::Events(events) => 1 + events.len(),
+        }
+    }
+
+    /// The fewest lines it is worth showing in: a text's first line and where all of it is,
+    /// the count of sub-tasks, or the latest few events.
+    fn least(&self) -> usize {
+        let least = match self {
+            Section::Text(name, text) => text.cut_title(name) + 1,
+            Section::Note(..) | Section::Tasks(_) => 1,
+            Section::Events(events) => 1 + events.len().min(MIN_EVENTS),
+        };
+        least.min(self.want())
+    }
+
+    /// No more than `room` lines of it.
+    fn lines(self, room: usize) -> Vec<Vec<Seg>> {
+        let title = |name: &str| vec![(name.to_string(), BOLD)];
+        let want = self.want();
+        match self {
+            Section::Text(name, text) => {
+                let all = text.lines.len();
+                let shown = match room >= want {
+                    true => all,
+                    // As many lines as the title leaves, saying where all of it is.
+                    false => room.saturating_sub(text.cut_title(&name)).min(all),
+                };
+                let mut out = text.titled(&name, shown);
+                out.extend(text.lines.into_iter().take(shown));
+                out
+            }
+            Section::Note(name, note) => {
+                let mut line = title(&name);
+                line.push((format!("  {note}"), DIM));
+                vec![line]
+            }
+            Section::Tasks(rows) => {
+                let all = rows.len();
+                let (rows, left) = pick(rows, room.saturating_sub(1));
+                let mut line = title("Sub-tasks");
+                if left > 0 {
+                    line.push((format!("  {} of {all} shown", all - left), DIM));
+                }
+                std::iter::once(line).chain(rows).collect()
+            }
+            Section::Events(mut events) => {
+                events.drain(..events.len().saturating_sub(room.saturating_sub(1)));
+                std::iter::once(title("Events")).chain(events).collect()
+            }
+        }
+    }
+}
+
+/// Lines for each of a task's sections out of `room`, and whether a blank line goes before
+/// each. When all but the events fit whole with the blank lines, the events take what is
+/// left. Else, without blank lines, each section gets its least while there is room for it,
+/// the task text first, then the result, the sub-tasks and the events: what the task says and
+/// does now is above them all. The texts and sub-tasks then share what is left, and the events
+/// take the rest.
+fn arrange(sections: &[&Section], room: usize) -> (Vec<usize>, bool) {
+    let last = sections.len() - 1;
+    let events_least = sections[last].least();
+    let rest: usize = sections[..last].iter().map(|s| s.want()).sum();
+    if rest + events_least + sections.len() <= room {
+        let mut rooms: Vec<usize> = sections[..last].iter().map(|s| s.want()).collect();
+        rooms.push(room - rest - sections.len());
+        return (rooms, true);
+    }
+    // Task text, result, sub-tasks, events.
+    let mut order: Vec<usize> = (0..sections.len()).collect();
+    order.sort_by_key(|&i| match sections[i] {
+        Section::Text(..) | Section::Note(..) if i == 0 => 0,
+        Section::Text(..) => 1,
+        Section::Tasks(_) => 2,
+        _ => 3,
+    });
+    let mut least = vec![0; sections.len()];
+    let mut used = 0;
+    for i in order {
+        if used + sections[i].least() <= room {
+            least[i] = sections[i].least();
+            used += least[i];
+        }
+    }
+    let wants: Vec<usize> = (0..last)
+        .map(|i| match least[i] {
+            0 => 0,
+            _ => sections[i].want(),
+        })
+        .collect();
+    let mut rooms = share(&wants, &least[..last], room - least[last]);
+    let taken: usize = rooms.iter().sum();
+    rooms.push(match least[last] {
+        0 => 0,
+        _ => room - taken,
+    });
+    (rooms, false)
+}
+
+// Widths of the ID and name columns of task lines, as wide as their widest cells, so that
 /// what matters most of each task has the rest.
 #[derive(Clone, Copy)]
 struct Widths {
@@ -618,19 +707,6 @@ fn finish(lines: &[Vec<Seg>], size: Option<(usize, usize)>) -> Vec<String> {
     out
 }
 
-/// Rows cut to `room`, the last one saying how many more there were.
-fn cut(rows: &mut Vec<Vec<Seg>>, room: usize) {
-    if rows.len() <= room {
-        return;
-    }
-    let kept = room.saturating_sub(1);
-    let more = rows.len() - kept;
-    rows.truncate(kept);
-    if room > 0 {
-        rows.push(vec![(format!("  …and {more} more lines"), DIM)]);
-    }
-}
-
 /// A line of a list, with what decides whether it is shown when the window is too short.
 struct Row {
     segs: Vec<Seg>,
@@ -667,14 +743,23 @@ fn rank(t: &Task, tail: &Tail) -> u8 {
     }
 }
 
-/// As many rows as fit in `room`, in their order. When not all fit, the lowest ranks are
-/// chosen, the later spawned of the same rank first, and the last line says how many are left
-/// out. Rows are not chosen by when they last changed: those shown would change every second.
+/// As many rows as fit in `room`, in their order; when not all fit, the last line says how
+/// many are left out.
 fn choose(rows: Vec<Row>, room: usize) -> Vec<Vec<Seg>> {
     if rows.len() <= room {
         return rows.into_iter().map(|r| r.segs).collect();
     }
-    let budget = room.saturating_sub(1);
+    let (mut out, left) = pick(rows, room.saturating_sub(1));
+    if room > 0 {
+        out.push(vec![(format!("  …and {left} more task(s)"), DIM)]);
+    }
+    out
+}
+
+/// No more than `room` rows, in their order, and how many tasks are left out. The lowest ranks
+/// are chosen, the later spawned of the same rank first. Rows are not chosen by when they last
+/// changed: those shown would change every second.
+fn pick(rows: Vec<Row>, budget: usize) -> (Vec<Vec<Seg>>, usize) {
     let mut order: Vec<usize> = (0..rows.len())
         .filter(|&i| rows[i].rank != WITH_TASKS)
         .collect();
@@ -697,16 +782,13 @@ fn choose(rows: Vec<Row>, room: usize) -> Vec<Vec<Seg>> {
         .zip(&kept)
         .filter(|(r, k)| !**k && r.rank != WITH_TASKS)
         .count();
-    let mut out: Vec<Vec<Seg>> = rows
+    let out = rows
         .into_iter()
         .zip(kept)
         .filter(|(_, k)| *k)
         .map(|(r, _)| r.segs)
         .collect();
-    if room > 0 && left > 0 {
-        out.push(vec![(format!("  …and {left} more task(s)"), DIM)]);
-    }
-    out
+    (out, left)
 }
 
 /// An event on one line. Tool calls are dimmed, so that what the agent says and how the
@@ -762,12 +844,12 @@ fn meta(t: &Task, tail: &Tail, now: u64) -> String {
     }
 }
 
-/// A line under Now in a task's view: what it waits for, says or does, or how it ended badly.
+/// A line under a task's title in its view: what it waits for, says or does, or how it ended
+/// badly. Only its label tells which, as in the list.
 struct Detail {
     label: &'static str,
     at: Option<u64>,
     text: String,
-    color: &'static str,
 }
 
 impl Detail {
@@ -778,7 +860,7 @@ impl Detail {
             .unwrap_or_default();
         vec![
             (format!("{indent}{:<6} {at:>6}  ", self.label), DIM),
-            (self.text.clone(), self.color),
+            (one_line(&self.text), ""),
         ]
     }
 }
@@ -786,20 +868,10 @@ impl Detail {
 /// What a task waits for, what it says and does, or how it ended badly.
 fn details(t: &Task, tail: &Tail) -> Vec<Detail> {
     let mut out = Vec::new();
-    let line = |label, at, text: String, color| Detail {
-        label,
-        at,
-        text,
-        color,
-    };
+    let line = |label, at, text: String| Detail { label, at, text };
     if t.status == Status::Running {
         for (id, summary) in &tail.approvals {
-            out.push(line(
-                "needs",
-                None,
-                format!("approval {id}: {summary}"),
-                YELLOW,
-            ));
+            out.push(line("needs", None, format!("approval {id}: {summary}")));
         }
     }
     if !t.status.is_final() {
@@ -808,22 +880,21 @@ fn details(t: &Task, tail: &Tail) -> Vec<Detail> {
                 "asks",
                 Some(q.asked_ms),
                 format!("{}: {}", q.id, q.text),
-                YELLOW,
             ));
         }
     }
     match t.status {
         Status::Running | Status::Queued => {
             if let Some((text, at)) = &tail.said {
-                out.push(line("says", Some(*at), text.clone(), ""));
+                out.push(line("says", Some(*at), text.clone()));
             }
             if let (true, Some((call, at))) = (tail.in_turn, &tail.last_tool) {
-                out.push(line("doing", Some(*at), call.clone(), ""));
+                out.push(line("doing", Some(*at), call.clone()));
             }
         }
         _ => {
             if let Some((label, text, at)) = stop(t, tail) {
-                out.push(line(label, Some(at), text.into(), RED));
+                out.push(line(label, Some(at), text.into()));
             }
         }
     }
@@ -996,72 +1067,46 @@ struct Wrapped {
 }
 
 impl Wrapped {
-    fn note(text: &str) -> Wrapped {
-        Wrapped {
-            lines: vec![vec![(text.into(), DIM)]],
-            file: None,
-            width: None,
-        }
+    /// Lines of the title when not all is shown: the most any number shown takes.
+    fn cut_title(&self, name: &str) -> usize {
+        self.titled(name, self.lines.len().saturating_sub(1)).len()
     }
 
-    /// The lines that say where all of it is.
-    fn rest_len(&self) -> usize {
-        self.rest(0).len()
-    }
-
-    /// Lines to show it all, or as much as was read and where the rest is.
-    fn len(&self) -> usize {
-        let rest = match self.file {
-            Some((_, false)) => self.rest(0).len(),
-            _ => 0,
-        };
-        self.lines.len() + rest
-    }
-
-    /// No more than `room` lines. When some are left out, the last say where all of it is.
-    fn cut(self, room: usize) -> Vec<Vec<Seg>> {
-        let whole = match &self.file {
-            Some((_, whole)) => *whole,
-            None => true,
-        };
-        if whole && self.lines.len() <= room || self.file.is_none() {
-            return self.lines.into_iter().take(room).collect();
-        }
-        let kept = self
-            .lines
-            .len()
-            .min(room.saturating_sub(self.rest(0).len()));
-        let rest = self.rest(self.lines.len() - kept);
-        let mut lines = self.lines;
-        lines.truncate(kept);
-        lines.extend(rest);
-        lines
-    }
-
-    /// Where to read what `more` lines leave out: the file's path on lines of its own, whole
-    /// however narrow the window.
-    fn rest(&self, more: usize) -> Vec<Vec<Seg>> {
+    /// The title's line for `shown` of its lines. When they are not all of it, the line also
+    /// says where all of it is: the file's path follows on the same line when it fits there,
+    /// else on lines of its own, whole however narrow the window.
+    fn titled(&self, name: &str, shown: usize) -> Vec<Vec<Seg>> {
+        let mut title = vec![(name.to_string(), BOLD)];
         let Some((path, whole)) = &self.file else {
-            return Vec::new();
+            return vec![title];
         };
-        let head = match (whole, more) {
-            (false, 0) => "  …the rest is in:".to_string(),
-            _ => format!("  …{more} more line(s); all of it is in:"),
+        if *whole && shown >= self.lines.len() {
+            return vec![title];
+        }
+        let note = match whole {
+            true => format!("  {shown} of {} lines; all in", self.lines.len()),
+            false => format!("  first {shown} lines; all in"),
         };
         let path = path.display().to_string();
-        let pieces = match self.width {
-            // Two columns of indent, and the last column stays empty.
-            Some(w) => chop(&path, w.saturating_sub(3)),
-            None => vec![path],
-        };
-        std::iter::once(head)
-            .chain(pieces.into_iter().map(|p| format!("  {p}")))
-            .map(|l| vec![(l, DIM)])
-            .collect()
+        match self.width {
+            // The last column stays empty.
+            Some(w) if columns(name) + columns(&note) + 1 + columns(&path) >= w => {
+                title.push((format!("{note}:"), DIM));
+                // Two columns of indent, and the last column stays empty.
+                let pieces = chop(&path, w.saturating_sub(3));
+                std::iter::once(title)
+                    .chain(pieces.into_iter().map(|p| vec![(format!("  {p}"), DIM)]))
+                    .collect()
+            }
+            _ => {
+                title.push((format!("{note} {path}"), DIM));
+                vec![title]
+            }
+        }
     }
 }
 
-/// Text in pieces of up to `room` columns, broken anywhere: a path must keep its spaces.
+// Text in pieces of up to `room` columns, broken anywhere: a path must keep its spaces.
 fn chop(text: &str, room: usize) -> Vec<String> {
     let room = room.max(2);
     let mut out = vec![String::new()];
@@ -1660,7 +1705,10 @@ mod tests {
             frame[0].starts_with("axiopera top t1  review  codex/work  idle  2 turn(s)"),
             "{text}"
         );
-        assert!(frame[1].contains("by claude session s1") && frame[1].ends_with(", model gpt-5.5"));
+        assert_eq!(
+            frame[1],
+            "spawned 10m00s ago in ., model gpt-5.5, by claude session s1"
+        );
         assert!(
             text.contains("\nTask\n  Review the parser.\n  Report findings.\n"),
             "{text}"
@@ -1686,14 +1734,36 @@ mod tests {
             assert!(events.contains(line), "{events}");
         }
 
-        // Fitted to the window, events keep the bottom lines.
-        let fitted = view.task_frame("t1", NOW, Some((60, 10)));
-        assert_eq!(fitted.len(), 10, "{fitted:#?}");
-        assert!(
-            strip_sgr(&fitted[9]).contains("turn 2 finished"),
-            "{fitted:#?}"
+        // Fitted to the window, without blank lines once not all fits, the events last and
+        // the first to go.
+        let fitted: Vec<String> = view
+            .task_frame("t1", NOW, Some((60, 14)))
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect();
+        assert_eq!(fitted.len(), 14, "{fitted:#?}");
+        assert!(fitted.iter().all(|l| !l.is_empty()), "{fitted:#?}");
+        assert!(fitted[13].contains("turn 2 finished"), "{fitted:#?}");
+        assert!(fitted.iter().all(|l| columns(l) <= 59));
+        let short: Vec<String> = view
+            .task_frame("t1", NOW, Some((60, 10)))
+            .iter()
+            .map(|l| strip_sgr(l))
+            .collect();
+        assert_eq!(
+            short[2..],
+            [
+                "Task",
+                "  Review the parser.",
+                "  Report findings.",
+                "Sub-tasks",
+                line_of(&short, "t2 "),
+                "Result of turn 2",
+                "  No bugs.",
+                "  - checked the reader"
+            ],
+            "{short:#?}"
         );
-        assert!(fitted.iter().all(|l| columns(&strip_sgr(l)) <= 59));
 
         // A task elsewhere does not move its sub-tasks' lines.
         store
@@ -2152,7 +2222,7 @@ mod tests {
         // A task's view tells its session whole.
         let one = view.task_frame("b1", NOW, None);
         assert!(
-            one[1].contains("by codex session 019a2b3c-2222 "),
+            one[1].ends_with(", by codex session 019a2b3c-2222"),
             "{one:#?}"
         );
 
@@ -2237,31 +2307,32 @@ mod tests {
             .collect();
         let text = frame.join("\n");
         assert_eq!(frame.len(), 20, "{text}");
-        // Long lines are broken between words.
-        let task = &frame[frame.iter().position(|l| l == "Task").unwrap() + 1..];
-        assert_eq!(task[0], format!("  {}word", "word ".repeat(6)), "{text}");
-        assert!(task[1].starts_with("  word "), "{text}");
-        let note = frame
+        // How much is shown is on the title's line; the path, whole, on lines of its own after
+        // it when it does not fit there.
+        let title = frame
             .iter()
-            .position(|l| l.starts_with("  …"))
+            .position(|l| l.starts_with("Task  "))
             .unwrap_or_else(|| panic!("{text}"));
-        assert!(
-            frame[note].ends_with(" more line(s); all of it is in:"),
-            "{text}"
-        );
-        // The path is whole, on lines of its own.
+        assert!(frame[title].ends_with(" lines; all in:"), "{text}");
         let path = store.prompt_path("t1").display().to_string();
-        let shown: String = frame[note + 1..]
+        let pieces = path.chars().count().div_ceil(37);
+        let shown: String = frame[title + 1..=title + pieces]
             .iter()
-            .take_while(|l| !l.is_empty())
             .map(|l| l.strip_prefix("  ").unwrap())
             .collect();
         assert_eq!(shown, path, "{text}");
+        // Long lines are broken between words.
+        let task = &frame[title + pieces + 1..];
+        assert_eq!(task[0], format!("  {}word", "word ".repeat(6)), "{text}");
+        assert!(task[1].starts_with("  word "), "{text}");
         assert!(text.contains("\nEvents"), "{text}");
 
         let lines = |n| vec![vec![("  a".to_string(), "")]; n];
-        let shown = |w: Wrapped, room| -> Vec<String> {
-            w.cut(room).into_iter().map(|l| l[0].0.clone()).collect()
+        let plain = |lines: Vec<Vec<Seg>>| -> Vec<String> {
+            lines
+                .iter()
+                .map(|l| l.iter().map(|(s, _)| s.as_str()).collect())
+                .collect()
         };
         let file = Some((PathBuf::from("dir/x.md"), true));
         let full = Wrapped {
@@ -2269,14 +2340,10 @@ mod tests {
             file: file.clone(),
             width: None,
         };
+        assert_eq!(plain(full.titled("T", 5)), ["T"]);
         assert_eq!(
-            shown(full, 4),
-            [
-                "  a",
-                "  a",
-                "  …3 more line(s); all of it is in:",
-                "  dir/x.md"
-            ]
+            plain(Section::Text("T".into(), full).lines(4)),
+            ["T  3 of 5 lines; all in dir/x.md", "  a", "  a", "  a"]
         );
         let narrow = Wrapped {
             lines: lines(5),
@@ -2284,21 +2351,18 @@ mod tests {
             width: Some(7),
         };
         assert_eq!(
-            shown(narrow, 4),
-            [
-                "  a",
-                "  …4 more line(s); all of it is in:",
-                "  dir/",
-                "  x.md"
-            ]
+            plain(Section::Text("T".into(), narrow).lines(4)),
+            ["T  1 of 5 lines; all in:", "  dir/", "  x.md", "  a"]
         );
         let partial = Wrapped {
             lines: lines(1),
             file: Some((PathBuf::from("x.md"), false)),
             width: None,
         };
-        assert_eq!(partial.len(), 3);
-        assert_eq!(shown(partial, 5), ["  a", "  …the rest is in:", "  x.md"]);
+        assert_eq!(
+            plain(Section::Text("T".into(), partial).lines(5)),
+            ["T  first 1 lines; all in x.md", "  a"]
+        );
     }
 
     #[test]
@@ -2338,16 +2402,16 @@ mod tests {
         let mut view = View::new(&h.0, false);
         view.refresh();
         let frame: Vec<String> = view
-            .task_frame("tp", NOW, Some((100, 24)))
+            .task_frame("tp", NOW, Some((100, 16)))
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
         let text = frame.join("\n");
-        assert_eq!(frame.len(), 24, "{text}");
+        assert_eq!(frame.len(), 16, "{text}");
         assert!(text.contains("\nResult of turn 1\n  Fixed.\n"), "{text}");
-        // One-line texts leave 9 lines: 8 sub-tasks, what waits for someone and what went
-        // wrong first, then the latest.
-        assert!(text.contains("\n  …and 5 more task(s)\n"), "{text}");
+        // One-line texts and the least of the events leave 5 lines: what waits for someone
+        // and what went wrong first, then the latest. The title says how many there are.
+        assert!(text.contains("\nSub-tasks  5 of 13 shown\n"), "{text}");
         assert_eq!(
             cells(&frame, "k12")[3..],
             ["waiting", "49s", "asks", "q1: Which port?"],
@@ -2364,7 +2428,7 @@ mod tests {
             ["idle", "49s", "task", "Part 11."],
             "{text}"
         );
-        assert!(!text.contains("k05 "), "{text}");
+        assert!(!text.contains("k08 "), "{text}");
         assert!(text.ends_with("[tp codex] Read"), "{text}");
 
         // A running task with long texts and many sub-tasks still says where its texts are.
@@ -2409,13 +2473,10 @@ mod tests {
         let text = frame.join("\n");
         assert_eq!(frame.len(), 24, "{text}");
         let turn = store.turn_path("tr", 1).display().to_string();
-        let result = &text[text.find("\nResult of turn 1\n").unwrap()..];
-        assert!(
-            result.contains("more line(s); all of it is in:\n"),
-            "{text}"
-        );
+        let result = &text[text.find("\nResult of turn 1  ").unwrap()..];
+        assert!(result.contains(" of 20 lines; all in:\n"), "{text}");
         assert!(result.replace("\n  ", "").contains(&turn), "{text}");
-        assert!(text.contains("\n  …and 7 more task(s)\n"), "{text}");
+        assert!(text.contains("\nSub-tasks  2 of 7 shown\n"), "{text}");
         assert!(text.ends_with("[tr codex] Read: b"), "{text}");
     }
 
