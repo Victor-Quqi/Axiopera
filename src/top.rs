@@ -22,15 +22,12 @@ use crate::store::{self, Event, Status, Store, Task};
 const REFRESH: Duration = Duration::from_secs(1);
 /// How long a stopped task stays in view after its last change, without `--all`.
 const RECENT_MS: u64 = 60 * 60 * 1000;
-/// Events of each task kept for its own view.
-const TASK_EVENTS: usize = 200;
-/// Events shown in a task's view when the output is not a terminal.
-const PLAIN_FEED: usize = 20;
-/// Lines of a result shown in a task's view when the output is not a terminal; its task text
-/// is shown whole.
-const PLAIN_RESULT: usize = 8;
-/// Events kept in a task's view on a short window.
-const MIN_EVENTS: usize = 3;
+/// Messages of each task kept for its view.
+const MESSAGES: usize = 100;
+/// Messages shown in a task's view when the output is not a terminal.
+const PLAIN_MESSAGES: usize = 20;
+/// Columns before the text of a message in a task's view: when it was said.
+const LABEL: usize = 8;
 /// Bytes read of a task text or a result. Past them, the view points to the file.
 const READ_BYTES: u64 = 64 * 1024;
 /// The rank of a line that goes only with the lines of its tasks: a session's line.
@@ -345,11 +342,6 @@ fn env_size() -> Option<(usize, usize)> {
     Some((get("COLUMNS")?, get("LINES").unwrap_or(FALLBACK_SIZE.1)))
 }
 
-/// Events that change where a task stands, as opposed to its moment-to-moment work.
-fn is_change(kind: &str) -> bool {
-    !matches!(kind, "tool" | "said" | "file_changed" | "input_read")
-}
-
 /// What has been read of the data directory so far.
 struct View {
     store: Store,
@@ -636,9 +628,9 @@ impl View {
         }
     }
 
-    /// One task in detail: what it is and what it waits for, says and does now, then what it
-    /// was given, its sub-tasks, its latest result and its events. With `keys`, its title says
-    /// how to go back to the list.
+    /// One task in detail: a title, what it waits for or how it ended badly, then what it was
+    /// given and what its agent said since, the latest last, as many as the window holds. With
+    /// `keys`, its title says how to go back to the list.
     fn task_frame(
         &self,
         id: &str,
@@ -657,250 +649,169 @@ impl View {
             return finish(&[back(vec![(gone, DIM)])], size);
         };
         let tail = self.tail(id);
-        let ago = |ms: u64| age(now.saturating_sub(ms));
         let (state, color) = state(t, tail);
+        let agent = format!(
+            "{}/{}",
+            render::agent_name(t.agent),
+            render::tier_name(t.tier)
+        );
+        let about = match &t.name {
+            Some(_) => format!("  {id} {agent}  "),
+            None => format!("  {agent}  "),
+        };
         let title = back(vec![
-            (format!("axiopera top {id}"), BOLD),
-            (
-                format!(
-                    "  {}  {}  ",
-                    t.name.as_deref().unwrap_or("-"),
-                    agent_cell(t)
-                ),
-                "",
-            ),
+            (clean(t.name.as_deref().unwrap_or(id)), BOLD),
+            (about, DIM),
             (state.into(), color),
             (format!("  {}", meta(t, tail, now)), ""),
         ]);
-        // Its session's ID last: whole, it is long.
-        let mut about = format!("spawned {} ago in {}", ago(t.created_ms), t.cwd.display());
-        if let Some(model) = &t.model {
-            about.push_str(&format!(", model {model}"));
-        }
-        if let Some(effort) = &t.effort {
-            about.push_str(&format!(", effort {effort}"));
-        }
-        about.push_str(&format!(", by {}", caller_label(&t.parent, usize::MAX)));
-        // What it waits for, says and does needs no title: each line has a label.
-        let mut head = vec![title, vec![(about, DIM)]];
-        let mut now_rows: Vec<Vec<Seg>> =
-            details(t, tail).iter().map(|d| d.row("  ", now)).collect();
+        let mut head = vec![title];
+        let mut waiting: Vec<Vec<Seg>> = details(t, tail).iter().map(Detail::row).collect();
         // Approvals and questions may be more than the window holds: as many as fit, and how
         // many more there are.
         if let Some((_, height)) = size
-            && now_rows.len() > height.saturating_sub(head.len())
+            && waiting.len() > height.saturating_sub(head.len())
         {
             let kept = height.saturating_sub(head.len() + 1);
-            let more = now_rows.len() - kept;
-            now_rows.truncate(kept);
-            now_rows.push(vec![(format!("  …and {more} more"), DIM)]);
+            let more = waiting.len() - kept;
+            waiting.truncate(kept);
+            waiting.push(vec![(format!("{:8}…and {more} more", ""), DIM)]);
         }
-        head.extend(now_rows);
+        head.extend(waiting);
 
-        let task_text = match &tail.prompt {
-            Some(text) => Section::Text(
-                "Task".into(),
-                text.wrapped(width, self.store.prompt_path(id)),
-            ),
-            None => Section::Note(
-                "Task".into(),
-                "not recorded: spawned before axiopera kept it".into(),
-            ),
-        };
-        let mut kids: Vec<&Task> = self
-            .tasks
-            .values()
-            .filter(|k| identity::task_of(&k.parent) == Some(id))
-            .collect();
-        kids.sort_by_key(|k| (k.created_ms, k.id.as_str()));
-        // Its own sub-tasks' width: a task elsewhere does not move these lines. All of them
-        // are shown, so only one spawned or removed changes it.
-        let kid_width = kids
-            .iter()
-            .map(|k| columns(&name_cell(1, k)))
-            .max()
-            .unwrap_or(0);
-        let kids: Vec<Row> = kids
-            .iter()
-            .map(|k| self.task_row(&name_cell(1, k), k, kid_width))
-            .collect();
-        let events: Vec<Vec<Seg>> = tail.recent.iter().map(|e| event_row(e, t, now)).collect();
-
-        // Each section with the lines it gets in plain output, in the order they are shown.
-        let mut sections = vec![(task_text, usize::MAX)];
-        if !kids.is_empty() {
-            sections.push((Section::Tasks(kids), usize::MAX));
+        let mut said = Vec::new();
+        match &tail.prompt {
+            Some(text) => said.push(Message {
+                label: "task".into(),
+                lines: text.shown(),
+                file: Some(self.store.prompt_path(id)),
+            }),
+            None if tail.log.is_empty() => said.push(Message {
+                label: "task".into(),
+                lines: vec!["not recorded: spawned before axiopera kept it".into()],
+                file: None,
+            }),
+            None => {}
         }
-        if let Some((turn, r)) = &tail.result {
-            let text = r.wrapped(width, self.store.turn_path(id, *turn));
-            sections.push((
-                Section::Text(format!("Result of turn {turn}"), text),
-                1 + PLAIN_RESULT,
-            ));
-        }
-        sections.push((Section::Events(events), 1 + PLAIN_FEED));
-        let (rooms, blanks) = match size {
-            None => (sections.iter().map(|(_, plain)| *plain).collect(), true),
-            Some((_, height)) => {
-                let sections: Vec<&Section> = sections.iter().map(|(s, _)| s).collect();
-                arrange(&sections, height.saturating_sub(head.len()))
-            }
+        let skip = match size {
+            None => tail.log.len().saturating_sub(PLAIN_MESSAGES),
+            Some(_) => 0,
         };
+        for s in tail.log.iter().skip(skip) {
+            // A turn's last message is its result, whole in its file.
+            let result = tail
+                .result
+                .as_ref()
+                .filter(|(turn, _)| s.turn == Some(*turn));
+            said.push(match result {
+                Some((turn, r)) => Message {
+                    label: age(now.saturating_sub(s.at)),
+                    lines: r.shown(),
+                    file: Some(self.store.turn_path(id, *turn)),
+                },
+                None => Message {
+                    label: age(now.saturating_sub(s.at)),
+                    lines: s
+                        .text
+                        .split(" ↵ ")
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(String::from)
+                        .collect(),
+                    file: None,
+                },
+            });
+        }
         let mut lines = head;
-        for ((section, _), room) in sections.into_iter().zip(rooms) {
-            if room == 0 || section.want() == 0 {
-                continue;
-            }
-            if blanks {
+        match size {
+            None => {
                 lines.push(vec![]);
+                for m in said {
+                    let text: Vec<String> = m.lines.iter().map(|l| unbold(&clean(l))).collect();
+                    lines.extend(m.rows(text, false));
+                }
             }
-            lines.extend(section.lines(room));
+            Some((width, height)) => {
+                let room = height.saturating_sub(lines.len());
+                let rows = transcript(said, width, room);
+                // A blank line under the head when all fits with it.
+                if rows.len() < room {
+                    lines.push(vec![]);
+                }
+                lines.extend(rows);
+            }
         }
         finish(&lines, size)
     }
 }
 
-/// A part of a task's view: a title and lines under it, cut to the room it gets. What a cut
-/// leaves out is told on the title's line, so that it takes no line of its own.
-enum Section {
-    /// A text, with where all of it is when not all is shown.
-    Text(String, Wrapped),
-    /// A title with what there is to say on its line.
-    Note(String, String),
-    /// Sub-tasks, one on each line.
-    Tasks(Vec<Row>),
-    /// Events, the latest last.
-    Events(Vec<Vec<Seg>>),
+/// What a task was given, or a message of its agent, for its view.
+struct Message {
+    /// When it was said, or `task` for the task text.
+    label: String,
+    lines: Vec<String>,
+    /// Where all of it is, when its lines are not.
+    file: Option<PathBuf>,
 }
 
-impl Section {
-    /// Lines to show all of it.
-    fn want(&self) -> usize {
-        match self {
-            Section::Text(name, text) => {
-                text.titled(name, text.lines.len()).len() + text.lines.len()
-            }
-            Section::Note(..) => 1,
-            Section::Tasks(rows) => 1 + rows.len(),
-            // Nothing at all before its first event.
-            Section::Events(events) if events.is_empty() => 0,
-            Section::Events(events) => 1 + events.len(),
-        }
+impl Message {
+    /// Its lines broken to fit a window `width` wide: the label before the first, the others
+    /// under the first's text.
+    fn wrapped(&self, width: usize) -> Vec<String> {
+        // The label's columns, and the last column stays empty.
+        let room = width.saturating_sub(LABEL + 1);
+        self.lines
+            .iter()
+            .flat_map(|l| wrap(&unbold(&clean(l)), room))
+            .collect()
     }
 
-    /// The fewest lines it is worth showing in: a text's first line and where all of it is,
-    /// the count of sub-tasks, or the latest few events.
-    fn least(&self) -> usize {
-        let least = match self {
-            Section::Text(name, text) => text.cut_title(name) + 1,
-            Section::Note(..) | Section::Tasks(_) => 1,
-            Section::Events(events) => 1 + events.len().min(MIN_EVENTS),
-        };
-        least.min(self.want())
-    }
-
-    /// No more than `room` lines of it.
-    fn lines(self, room: usize) -> Vec<Vec<Seg>> {
-        let title = |name: &str| vec![(name.to_string(), BOLD)];
-        let want = self.want();
-        match self {
-            Section::Text(name, text) => {
-                let all = text.lines.len();
-                let shown = match room >= want {
-                    true => all,
-                    // As many lines as the title leaves, saying where all of it is.
-                    false => room.saturating_sub(text.cut_title(&name)).min(all),
-                };
-                let mut out = text.titled(&name, shown);
-                out.extend(text.lines.into_iter().take(shown));
-                out
-            }
-            Section::Note(name, note) => {
-                let mut line = title(&name);
-                line.push((format!("  {note}"), DIM));
-                vec![line]
-            }
-            Section::Tasks(rows) => {
-                let all = rows.len();
-                let (rows, left) = pick(rows, room.saturating_sub(1));
-                let mut line = title("Sub-tasks");
-                if left > 0 {
-                    line.push((format!("  {} of {all} shown", all - left), DIM));
-                }
-                std::iter::once(line).chain(rows).collect()
-            }
-            Section::Events(mut events) => {
-                events.drain(..events.len().saturating_sub(room.saturating_sub(1)));
-                std::iter::once(title("Events")).chain(events).collect()
-            }
-        }
+    /// The lines as rows. `cut` marks the first as following lines left out above it.
+    fn rows(&self, text: Vec<String>, cut: bool) -> Vec<Vec<Seg>> {
+        text.into_iter()
+            .enumerate()
+            .map(|(i, line)| match i {
+                0 => vec![
+                    (format!("{:>w$}  ", self.label, w = LABEL - 2), DIM),
+                    (format!("{}{line}", if cut { "…" } else { "" }), ""),
+                ],
+                _ => vec![(format!("{:LABEL$}{line}", ""), "")],
+            })
+            .collect()
     }
 }
 
-/// Lines for each of a task's sections out of `room`, and whether a blank line goes before
-/// each. When all but the events fit whole with the blank lines, the events take what is
-/// left. Else, without blank lines, each section gets its least while there is room for it,
-/// the task text first, then the result, the sub-tasks and the events: what the task says and
-/// does now is above them all. The texts and sub-tasks then share what is left, and the events
-/// take the rest.
-fn arrange(sections: &[&Section], room: usize) -> (Vec<usize>, bool) {
-    let last = sections.len() - 1;
-    let events_least = sections[last].least();
-    let rest: usize = sections[..last].iter().map(|s| s.want()).sum();
-    let blanks = sections.iter().filter(|s| s.want() > 0).count();
-    if rest + events_least + blanks <= room {
-        let mut rooms: Vec<usize> = sections[..last].iter().map(|s| s.want()).collect();
-        rooms.push(room - rest - blanks);
-        return (rooms, true);
-    }
-    // Task text, result, sub-tasks, events.
-    let mut order: Vec<usize> = (0..sections.len()).collect();
-    order.sort_by_key(|&i| match sections[i] {
-        Section::Text(..) | Section::Note(..) if i == 0 => 0,
-        Section::Text(..) => 1,
-        Section::Tasks(_) => 2,
-        _ => 3,
-    });
-    let mut least = vec![0; sections.len()];
-    let mut used = 0;
-    for i in order {
-        if used + sections[i].least() <= room {
-            least[i] = sections[i].least();
-            used += least[i];
+/// Messages in `room` lines of a window `width` wide, the latest last: whole while they fit,
+/// then the end of the one before. When the latest alone does not fit, its start, and how much
+/// more there is and where.
+fn transcript(said: Vec<Message>, width: usize, room: usize) -> Vec<Vec<Seg>> {
+    let mut shown: Vec<Vec<Vec<Seg>>> = Vec::new();
+    let mut left = room;
+    for (k, m) in said.iter().rev().enumerate() {
+        let text = m.wrapped(width);
+        if text.len() <= left {
+            left -= text.len();
+            shown.push(m.rows(text, false));
+            continue;
         }
-    }
-    let wants: Vec<usize> = (0..last)
-        .map(|i| match least[i] {
-            0 => 0,
-            _ => sections[i].want(),
-        })
-        .collect();
-    let mut rooms = share(&wants, &least[..last], room - least[last]);
-    let taken: usize = rooms.iter().sum();
-    rooms.push(match least[last] {
-        0 => 0,
-        _ => room - taken,
-    });
-    (rooms, false)
-}
-
-/// Lines for sections that want `wants` lines, out of `room`: first their `mins`, then an
-/// equal share each of what is left, up to what they want.
-fn share(wants: &[usize], mins: &[usize], room: usize) -> Vec<usize> {
-    let mut got = mins.to_vec();
-    let mut left = room.saturating_sub(mins.iter().sum());
-    loop {
-        let open: Vec<usize> = (0..wants.len()).filter(|&i| got[i] < wants[i]).collect();
-        if open.is_empty() || left == 0 {
-            return got;
+        if k == 0 {
+            let keep = left.saturating_sub(1);
+            let more = text.len() - keep;
+            let mut rows = m.rows(text.into_iter().take(keep).collect(), false);
+            let mut note = format!("{:LABEL$}…{more} more line(s)", "");
+            if let Some(file) = &m.file {
+                note.push_str(&format!("; all in {}", file.display()));
+            }
+            rows.push(vec![(note, DIM)]);
+            rows.truncate(left);
+            shown.push(rows);
+        } else if left > 0 {
+            let from = text.len() - left;
+            shown.push(m.rows(text.into_iter().skip(from).collect(), true));
         }
-        let each = (left / open.len()).max(1);
-        for i in open {
-            let give = each.min(wants[i] - got[i]).min(left);
-            got[i] += give;
-            left -= give;
-        }
+        break;
     }
+    shown.into_iter().rev().flatten().collect()
 }
 
 /// A title with `hint` at its end, cut so that the hint fits a window `width` wide.
@@ -1027,32 +938,10 @@ fn pick(rows: Vec<Row>, budget: usize) -> (Vec<Vec<Seg>>, usize) {
     (out, left)
 }
 
-/// An event on one line. Tool calls are dimmed, so that what the agent says and how the
-/// task changes stand out among them.
-fn event_row(e: &Event, t: &Task, now: u64) -> Vec<Seg> {
-    let color = if is_change(&e.kind) || e.kind == "said" {
-        ""
-    } else {
-        DIM
-    };
-    vec![
-        (format!("{:>6}  ", age(now.saturating_sub(e.ts))), DIM),
-        (render::event_line(e, t.agent), color),
-    ]
-}
-
 /// A task's cell in a list: its name, or its ID without one, indented by its depth.
 fn name_cell(depth: usize, t: &Task) -> String {
     let name = clean(t.name.as_deref().unwrap_or(&t.id));
     format!("{}{}", "  ".repeat(depth), fit(&name, NAME).0)
-}
-
-fn agent_cell(t: &Task) -> String {
-    format!(
-        "{}/{}",
-        render::agent_name(t.agent),
-        render::tier_name(t.tier)
-    )
 }
 
 /// Where a task's turn stands, in a few words.
@@ -1082,67 +971,48 @@ fn meta(t: &Task, tail: &Tail, now: u64) -> String {
     }
 }
 
-/// A line under a task's title in its view: what it waits for, says or does, or how it ended
-/// badly. Only its label tells which.
+/// A line under a task's title in its view: what it waits for, or how it ended badly. Its
+/// label, in the color of the state it goes with, tells which.
 struct Detail {
     label: &'static str,
-    at: Option<u64>,
+    color: &'static str,
     text: String,
 }
 
 impl Detail {
-    fn row(&self, indent: &str, now: u64) -> Vec<Seg> {
-        let at = self
-            .at
-            .map(|at| age(now.saturating_sub(at)))
-            .unwrap_or_default();
+    fn row(&self) -> Vec<Seg> {
         vec![
-            (format!("{indent}{:<6} {at:>6}  ", self.label), DIM),
+            (format!("{:>w$}  ", self.label, w = LABEL - 2), self.color),
             (one_line(&self.text), ""),
         ]
     }
 }
 
-/// What a task waits for, what it says and does, or how it ended badly.
+/// What a task waits for, or how it ended badly.
 fn details(t: &Task, tail: &Tail) -> Vec<Detail> {
     let mut out = Vec::new();
-    let line = |label, at, text: String| Detail { label, at, text };
+    let line = |label, color, text: String| Detail { label, color, text };
     if t.status == Status::Running {
         for (id, summary) in &tail.approvals {
-            out.push(line("needs", None, format!("approval {id}: {summary}")));
+            out.push(line("needs", YELLOW, format!("approval {id}: {summary}")));
         }
     }
     if !t.status.is_final() {
         for q in t.open_questions() {
-            out.push(line(
-                "asks",
-                Some(q.asked_ms),
-                format!("{}: {}", q.id, q.text),
-            ));
+            out.push(line("asks", YELLOW, format!("{}: {}", q.id, q.text)));
         }
     }
-    match t.status {
-        Status::Running | Status::Queued => {
-            if let Some((text, at)) = &tail.said {
-                out.push(line("says", Some(*at), text.clone()));
-            }
-            if let (true, Some((call, at))) = (tail.in_turn, &tail.last_tool) {
-                out.push(line("doing", Some(*at), call.clone()));
-            }
-        }
-        _ => {
-            if let Some((label, text, at)) = stop(t, tail) {
-                out.push(line(label, Some(at), text.into()));
-            }
-        }
+    if let Some((label, text)) = stop(t, tail) {
+        out.push(line(label, RED, text.into()));
     }
     out
 }
 
-/// How a stopped task ended badly, if it did: a label, the text and when.
-fn stop<'a>(t: &Task, tail: &'a Tail) -> Option<(&'static str, &'a str, u64)> {
-    let (label, text, at) = tail.stop.as_ref()?;
-    (t.status != Status::Idle || t.detached).then_some((*label, text.as_str(), *at))
+/// How a stopped task ended badly, if it did: a label and the text.
+fn stop<'a>(t: &Task, tail: &'a Tail) -> Option<(&'static str, &'a str)> {
+    let (label, text) = tail.stop.as_ref()?;
+    let stopped = !matches!(t.status, Status::Running | Status::Queued | Status::Idle);
+    (stopped || t.detached).then_some((*label, text.as_str()))
 }
 
 /// Whether a task waits for someone: for an answer, or for an approval.
@@ -1165,7 +1035,7 @@ fn words(t: &Task, tail: &Tail) -> Option<String> {
         (Some((said, _)), None) => said.clone(),
         (None, None) => tail.result.as_ref()?.1.lines.first()?.clone(),
     };
-    Some(one_line(&text))
+    Some(unbold(&one_line(&text)))
 }
 
 /// Text on one line: its lines and runs of spaces joined by single spaces.
@@ -1249,92 +1119,17 @@ fn read_text(path: &Path) -> Option<Text> {
 }
 
 impl Text {
-    /// Indented, and broken to fit a window `width` wide.
-    fn wrapped(&self, width: Option<usize>, path: PathBuf) -> Wrapped {
-        let lines = self
-            .lines
-            .iter()
-            .flat_map(|l| match width {
-                // Two columns of indent, and the last column stays empty.
-                Some(w) => wrap(&clean(l), w.saturating_sub(3)),
-                None => vec![l.clone()],
-            })
-            .map(|l| vec![(format!("  {l}"), "")])
-            .collect();
-        Wrapped {
-            lines,
-            file: Some((path, self.whole)),
-            width,
+    /// Its lines, and a last one that says so when they are not all of the file.
+    fn shown(&self) -> Vec<String> {
+        let mut lines = self.lines.clone();
+        if !self.whole {
+            lines.push("…".into());
         }
+        lines
     }
 }
 
-/// A text as lines in a task's view, and its file with whether the lines hold all of it.
-struct Wrapped {
-    lines: Vec<Vec<Seg>>,
-    file: Option<(PathBuf, bool)>,
-    /// The window's, for the file's path.
-    width: Option<usize>,
-}
-
-impl Wrapped {
-    /// Lines of the title when not all is shown: the most any number shown takes.
-    fn cut_title(&self, name: &str) -> usize {
-        self.titled(name, self.lines.len().saturating_sub(1)).len()
-    }
-
-    /// The title's line for `shown` of its lines. When they are not all of it, the line also
-    /// says where all of it is: the file's path follows on the same line when it fits there,
-    /// else on lines of its own, whole however narrow the window.
-    fn titled(&self, name: &str, shown: usize) -> Vec<Vec<Seg>> {
-        let mut title = vec![(name.to_string(), BOLD)];
-        let Some((path, whole)) = &self.file else {
-            return vec![title];
-        };
-        if *whole && shown >= self.lines.len() {
-            return vec![title];
-        }
-        let note = match whole {
-            true => format!("  {shown} of {} lines; all in", self.lines.len()),
-            false => format!("  first {shown} lines; all in"),
-        };
-        let path = path.display().to_string();
-        match self.width {
-            // The last column stays empty.
-            Some(w) if columns(name) + columns(&note) + 1 + columns(&path) >= w => {
-                title.push((format!("{note}:"), DIM));
-                // Two columns of indent, and the last column stays empty.
-                let pieces = chop(&path, w.saturating_sub(3));
-                std::iter::once(title)
-                    .chain(pieces.into_iter().map(|p| vec![(format!("  {p}"), DIM)]))
-                    .collect()
-            }
-            _ => {
-                title.push((format!("{note} {path}"), DIM));
-                vec![title]
-            }
-        }
-    }
-}
-
-// Text in pieces of up to `room` columns, broken anywhere: a path must keep its spaces.
-fn chop(text: &str, room: usize) -> Vec<String> {
-    let room = room.max(2);
-    let mut out = vec![String::new()];
-    let mut used = 0;
-    for c in text.chars() {
-        let w = char_columns(c);
-        if used + w > room {
-            out.push(String::new());
-            used = 0;
-        }
-        out.last_mut().unwrap().push(c);
-        used += w;
-    }
-    out
-}
-
-/// A line broken into pieces of up to `room` columns, after a space where there is one.
+/// A line broken into pieces of up to `room` columns, where `break_at` finds a place.
 fn wrap(line: &str, room: usize) -> Vec<String> {
     let room = room.max(2);
     let mut out = Vec::new();
@@ -1348,13 +1143,13 @@ fn wrap(line: &str, room: usize) -> Vec<String> {
                 used = 0;
                 continue;
             }
-            match piece.rfind(' ') {
-                Some(i) if i > 0 => {
-                    let rest = piece.split_off(i + 1);
+            match break_at(&piece, c) {
+                Some(i) => {
+                    let rest = piece.split_off(i);
                     out.push(piece.trim_end().to_string());
                     piece = rest;
                 }
-                _ => out.push(std::mem::take(&mut piece)),
+                None => out.push(std::mem::take(&mut piece)),
             }
             used = columns(&piece);
         }
@@ -1363,6 +1158,32 @@ fn wrap(line: &str, room: usize) -> Vec<String> {
     }
     out.push(piece);
     out
+}
+
+/// The latest place in `piece` where a line may end, with `next` to follow: after a space, or
+/// next to a wide character, as between Chinese characters, though not before closing
+/// punctuation nor after opening punctuation.
+fn break_at(piece: &str, next: char) -> Option<usize> {
+    let mut after = next;
+    for (i, before) in piece.char_indices().rev() {
+        let at = i + before.len_utf8();
+        let wide = char_columns(before) == 2 || char_columns(after) == 2;
+        let held =
+            "，。、；：？！）」』】》,.;:?!)".contains(after) || "（「『【《(".contains(before);
+        if before == ' ' || wide && !held {
+            return Some(at);
+        }
+        after = before;
+    }
+    None
+}
+
+/// A line without markdown's bold marks, when they come in pairs.
+fn unbold(line: &str) -> String {
+    match line.matches("**").count() {
+        n if n > 0 && n % 2 == 0 => line.replace("**", ""),
+        _ => line.to_string(),
+    }
 }
 
 /// What a task's files tell beyond its `task.json`.
@@ -1374,17 +1195,14 @@ struct Tail {
     started_ms: u64,
     ended_ms: u64,
     tool_calls: u64,
-    last_tool: Option<(String, u64)>,
-    /// The agent's latest message in this turn.
-    said: Option<(String, u64)>,
     /// The agent's latest message in any turn.
     words: Option<(String, u64)>,
+    /// The agent's latest messages, oldest first.
+    log: VecDeque<Said>,
     /// Approval requests of the current turn without a decision, with their summaries.
     approvals: Vec<(String, String)>,
-    /// How the last turn or the task ended badly: a label, the text and when.
-    stop: Option<(&'static str, String, u64)>,
-    /// This task's latest events, oldest first.
-    recent: VecDeque<Event>,
+    /// How the last turn or the task ended badly: a label and the text.
+    stop: Option<(&'static str, String)>,
     /// `prompt.md`, read once.
     prompt: Option<Text>,
     /// The latest result read, and its turn.
@@ -1399,12 +1217,10 @@ impl Tail {
             started_ms: 0,
             ended_ms: 0,
             tool_calls: 0,
-            last_tool: None,
-            said: None,
             words: None,
+            log: VecDeque::new(),
             approvals: Vec::new(),
             stop: None,
-            recent: VecDeque::new(),
             prompt: None,
             result: None,
         }
@@ -1440,8 +1256,13 @@ impl Tail {
             "turn_ended" => {
                 self.in_turn = false;
                 self.ended_ms = e.ts;
+                // Its last message, if said in it, is its result.
+                let since = self.started_ms;
+                if let Some(last) = self.log.back_mut().filter(|s| s.at >= since) {
+                    last.turn = e.data.get("turn").and_then(Value::as_u64).map(|n| n as u32);
+                }
                 if e.data.get("ok") == Some(&Value::Bool(false)) {
-                    self.stop = Some(("error", text("error").into(), e.ts));
+                    self.stop = Some(("error", text("error").into()));
                 }
             }
             // A turn the agent started by itself that its adapter did not report begins with
@@ -1450,43 +1271,48 @@ impl Tail {
                 if !self.in_turn && self.ended_ms > 0 {
                     self.start(e.ts);
                 }
-                self.said = Some((text("text").into(), e.ts));
-                self.words = self.said.clone();
+                self.words = Some((text("text").into(), e.ts));
+                if self.log.len() == MESSAGES {
+                    self.log.pop_front();
+                }
+                self.log.push_back(Said {
+                    at: e.ts,
+                    text: text("text").into(),
+                    turn: None,
+                });
             }
             "tool" => {
                 if !self.in_turn {
                     self.start(e.ts);
                 }
-                let call = match (text("name"), text("detail")) {
-                    (name, "") => name.to_string(),
-                    (name, detail) => format!("{name}: {detail}"),
-                };
                 self.tool_calls += 1;
-                self.last_tool = Some((call, e.ts));
             }
             "approval_request" => self
                 .approvals
                 .push((text("id").into(), text("summary").into())),
             "approved" | "denied" => self.approvals.retain(|(id, _)| id != text("id")),
-            "failed" => self.stop = Some(("error", text("error").into(), e.ts)),
+            "failed" => self.stop = Some(("error", text("error").into())),
             "cancelled" | "interrupted" | "detached" => {
-                self.stop = Some(("why", text("reason").into(), e.ts));
+                self.stop = Some(("why", text("reason").into()));
             }
             _ => {}
         }
-        if self.recent.len() == TASK_EVENTS {
-            self.recent.pop_front();
-        }
-        self.recent.push_back(e.clone());
     }
 
     fn start(&mut self, at: u64) {
         self.in_turn = true;
         self.started_ms = at;
         self.tool_calls = 0;
-        self.last_tool = None;
-        self.said = None;
     }
+}
+
+/// A message of a task's agent.
+struct Said {
+    at: u64,
+    /// As the daemon recorded it: lines joined by ` ↵ `, and cut when long.
+    text: String,
+    /// The turn it ended, for the last message of a turn: its result.
+    turn: Option<u32>,
 }
 
 /// One line from its pieces. Given a width, it is cut to fit and colored, and a line whose
@@ -1853,14 +1679,17 @@ mod tests {
             NOW - 600_000,
             json!({"name": "review"}),
         );
-        t1.model = Some("gpt-5.5".into());
         t1.turns = 2;
         store
             .save_prompt("t1", "Review the parser.\nReport findings.")
             .unwrap();
         store.save(&t1).unwrap();
         store
-            .save_turn("t1", 2, "No bugs.\n\n- checked the reader\n")
+            .save_turn(
+                "t1",
+                2,
+                "No bugs.\n\n- checked the reader\n- and the writer\n",
+            )
             .unwrap();
         store
             .save(&task(
@@ -1890,7 +1719,14 @@ mod tests {
                 "tool",
                 json!({"name": "Read", "detail": "src/reader.rs"}),
             ),
-            event(4, 20_000, "t1", "said", json!({"text": "No bugs."})),
+            // The daemon keeps a message on one line, and cut when long.
+            event(
+                4,
+                20_000,
+                "t1",
+                "said",
+                json!({"text": "No bugs. ↵ - checked the reader…(+19 chars)"}),
+            ),
             event(
                 5,
                 20_000,
@@ -1912,89 +1748,50 @@ mod tests {
             "2 tasks are named tests; give one of their IDs: t2, t3"
         );
 
+        // A title, then what it was given and what its agent said, without its tool calls
+        // or its sub-tasks'; a turn's last message whole from its result.
         let frame = view.task_frame("t1", NOW, None, false);
         let text = frame.join("\n");
-        assert!(
-            frame[0].starts_with("axiopera top t1  review  codex/work  idle  2 turn(s)"),
+        assert_eq!(
+            frame,
+            [
+                "review  t1 codex/work  idle  2 turn(s), last change 10m00s ago",
+                "",
+                "  task  Review the parser.",
+                "        Report findings.",
+                "   40s  Checking the reader.",
+                "   20s  No bugs.",
+                "        - checked the reader",
+                "        - and the writer",
+            ],
             "{text}"
         );
         // With keys, how to go back.
         assert!(view.task_frame("t1", NOW, None, true)[0].ends_with(" ago  Esc back"));
-        assert_eq!(
-            frame[1],
-            "spawned 10m00s ago in ., model gpt-5.5, by claude session s1"
-        );
-        assert!(
-            text.contains("\nTask\n  Review the parser.\n  Report findings.\n"),
-            "{text}"
-        );
-        // The result is not repeated under Now.
-        assert!(!text.contains("\nNow\n"), "{text}");
-        // Sub-tasks on lines like the list's.
-        assert!(text.contains("\nSub-tasks\n  tests  "), "{text}");
-        assert_eq!(
-            cells(&frame, "tests"),
-            ["tests", "running", "Running them."]
-        );
-        assert!(
-            text.contains("\nResult of turn 2\n  No bugs.\n  - checked the reader\n"),
-            "{text}"
-        );
-        let events = &text[text.find("\nEvents\n").unwrap()..];
-        for line in [
-            "says: Checking the reader.",
-            "Read: src/reader.rs",
-            "turn 2 finished",
-        ] {
-            assert!(events.contains(line), "{events}");
-        }
 
-        // Fitted to the window, without blank lines once not all fits, the events last and
-        // the first to go.
+        // Fitted to the window, the latest messages whole, and the end of the one before.
         let fitted: Vec<String> = view
-            .task_frame("t1", NOW, Some((60, 14)), false)
+            .task_frame("t1", NOW, Some((60, 6)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
-        assert_eq!(fitted.len(), 14, "{fitted:#?}");
-        assert!(fitted.iter().all(|l| !l.is_empty()), "{fitted:#?}");
-        assert!(fitted[13].contains("turn 2 finished"), "{fitted:#?}");
-        assert!(fitted.iter().all(|l| columns(l) <= 59));
+        assert_eq!(fitted[2..], frame[4..], "{fitted:#?}");
+        assert_eq!(fitted[1], "  task  …Report findings.");
+        // With room for all, a blank line under the title.
+        let roomy = view.task_frame("t1", NOW, Some((60, 20)), false);
+        assert_eq!(roomy.len(), frame.len(), "{roomy:#?}");
+        // When the latest alone does not fit, its start, and how much more there is and where.
         let short: Vec<String> = view
-            .task_frame("t1", NOW, Some((60, 10)), false)
+            .task_frame("t1", NOW, Some((60, 3)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
-        assert_eq!(
-            short[2..],
-            [
-                "Task",
-                "  Review the parser.",
-                "  Report findings.",
-                "Sub-tasks",
-                line_of(&short, "tests "),
-                "Result of turn 2",
-                "  No bugs.",
-                "  - checked the reader"
-            ],
+        assert_eq!(short[1], "   20s  No bugs.", "{short:#?}");
+        assert!(
+            short[2].starts_with("        …2 more line(s); all in "),
             "{short:#?}"
         );
-
-        // A task elsewhere does not move its sub-tasks' lines.
-        store
-            .save(&task(
-                "t9",
-                "user",
-                "idle",
-                NOW,
-                json!({"name": "a long name elsewhere"}),
-            ))
-            .unwrap();
-        view.refresh();
-        assert_eq!(
-            line_of(&view.task_frame("t1", NOW, None, false), "tests "),
-            line_of(&frame, "tests ")
-        );
+        assert!(short.iter().all(|l| columns(l) <= 59), "{short:#?}");
 
         std::fs::remove_dir_all(h.0.join("tasks").join("t1")).unwrap();
         view.refresh();
@@ -2058,8 +1855,12 @@ mod tests {
         assert_eq!(waits.1, ["needs approval r9: push"]);
         state(event(3, 7_000, "t1", "denied", json!({"id": "r9"})));
         assert_eq!(
-            state(event(4, 7_000, "t1", "said", json!({"text": "Done."}))).1,
-            ["says Done."]
+            state(event(4, 7_000, "t1", "said", json!({"text": "Done."}))),
+            (
+                "turn 1, 9s, 0 tool call(s)".to_string(),
+                vec![],
+                "Done.".to_string()
+            )
         );
         // The process stays for background work, which may start a turn of its own.
         save(1);
@@ -2092,10 +1893,7 @@ mod tests {
             )),
             (
                 "turn 2, 3s, 1 tool call(s)".to_string(),
-                vec![
-                    "says The build finished.".to_string(),
-                    "doing monitor".to_string()
-                ],
+                vec![],
                 "The build finished.".to_string()
             )
         );
@@ -2108,7 +1906,8 @@ mod tests {
             json!({"name": "Read", "detail": "x"}),
         ));
         assert_eq!(next.2, "The build finished.");
-        assert_eq!(
+        // A failed turn of a task still running is not told: the task goes on.
+        assert!(
             state(event(
                 9,
                 1_000,
@@ -2116,11 +1915,10 @@ mod tests {
                 "turn_ended",
                 json!({"turn": 2, "ok": false, "error": "boom"})
             ))
-            .1,
-            ["says The build finished."]
+            .1
+            .is_empty()
         );
-        // A new turn's view forgets what was said in the last; its line keeps it until the
-        // agent says more, and does not show its tool calls.
+        // Its line keeps what was said in the last turn until the agent says more.
         state(event(10, 900, "t1", "turn_started", json!({"turn": 3})));
         let (_, lines, text) = state(event(
             11,
@@ -2129,10 +1927,7 @@ mod tests {
             "tool",
             json!({"name": "Read", "detail": "y"}),
         ));
-        assert_eq!(
-            (&lines[..], &text[..]),
-            (&["doing Read: y".to_string()][..], "The build finished.")
-        );
+        assert_eq!((lines.len(), &text[..]), (0, "The build finished."));
         store
             .save(&task("t1", "codex:s", "failed", NOW, json!({"turns": 3})))
             .unwrap();
@@ -2148,6 +1943,17 @@ mod tests {
         view.refresh();
         let t = &view.tasks["t1"];
         assert_eq!(details(t, view.tail("t1"))[0].text, "boom");
+        // The last message of each turn, said in it, is its result.
+        let turns: Vec<_> = view
+            .tail("t1")
+            .log
+            .iter()
+            .map(|s| (s.text.as_str(), s.turn))
+            .collect();
+        assert_eq!(
+            turns,
+            [("Done.", Some(1)), ("The build finished.", Some(2))]
+        );
     }
 
     #[test]
@@ -2420,13 +2226,6 @@ mod tests {
             ],
             "{frame:#?}"
         );
-        // A task's view tells its session whole.
-        let one = view.task_frame("b1", NOW, None, false);
-        assert!(
-            one[1].ends_with(", by codex session 019a2b3c-2222"),
-            "{one:#?}"
-        );
-
         // Nor does A move when gc removes its first task, or the columns when a task with a
         // long name and deep under others comes and goes.
         let before = view.frame(NOW, None, None);
@@ -2488,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn a_task_text_too_long_for_the_window_says_where_it_all_is() {
+    fn a_message_too_long_for_the_window_says_where_it_all_is() {
         let h = home();
         let store = Store::new(&h.0);
         let prompt: Vec<String> = (1..=30).map(|i| format!("line {i}")).collect();
@@ -2506,186 +2305,119 @@ mod tests {
         // Without a window, all of it.
         let plain = view.task_frame("t1", NOW, None, false).join("\n");
         assert!(
-            plain.contains(&format!("\n  {long}\n  line 1\n")) && plain.ends_with("\n  line 30"),
+            plain.contains(&format!("\n  task  {long}\n        line 1\n"))
+                && plain.ends_with("\n        line 30"),
             "{plain}"
         );
 
+        // In a window, its start, broken between words, and how much more there is and where.
         let frame: Vec<String> = view
-            .task_frame("t1", NOW, Some((40, 20)), false)
+            .task_frame("t1", NOW, Some((40, 8)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
         let text = frame.join("\n");
-        assert_eq!(frame.len(), 20, "{text}");
-        // How much is shown is on the title's line; the path, whole, on lines of its own after
-        // it when it does not fit there.
-        let title = frame
-            .iter()
-            .position(|l| l.starts_with("Task  "))
-            .unwrap_or_else(|| panic!("{text}"));
-        assert!(frame[title].ends_with(" lines; all in:"), "{text}");
-        let path = store.prompt_path("t1").display().to_string();
-        let pieces = path.chars().count().div_ceil(37);
-        let shown: String = frame[title + 1..=title + pieces]
-            .iter()
-            .map(|l| l.strip_prefix("  ").unwrap())
-            .collect();
-        assert_eq!(shown, path, "{text}");
-        // Long lines are broken between words.
-        let task = &frame[title + pieces + 1..];
-        assert_eq!(task[0], format!("  {}word", "word ".repeat(6)), "{text}");
-        assert!(task[1].starts_with("  word "), "{text}");
-        assert!(frame[19].starts_with("  line "), "{text}");
-
-        let lines = |n| vec![vec![("  a".to_string(), "")]; n];
-        let plain = |lines: Vec<Vec<Seg>>| -> Vec<String> {
-            lines
-                .iter()
-                .map(|l| l.iter().map(|(s, _)| s.as_str()).collect())
-                .collect()
-        };
-        let file = Some((PathBuf::from("dir/x.md"), true));
-        let full = Wrapped {
-            lines: lines(5),
-            file: file.clone(),
-            width: None,
-        };
-        assert_eq!(plain(full.titled("T", 5)), ["T"]);
-        assert_eq!(
-            plain(Section::Text("T".into(), full).lines(4)),
-            ["T  3 of 5 lines; all in dir/x.md", "  a", "  a", "  a"]
+        assert_eq!(frame.len(), 8, "{text}");
+        assert_eq!(frame[1], format!("  task  {}word", "word ".repeat(5)));
+        assert!(frame[2].starts_with("        word "), "{text}");
+        assert!(
+            frame[7].starts_with("        …28 more line(s); all in "),
+            "{text}"
         );
-        let narrow = Wrapped {
-            lines: lines(5),
-            file,
-            width: Some(7),
-        };
-        assert_eq!(
-            plain(Section::Text("T".into(), narrow).lines(4)),
-            ["T  1 of 5 lines; all in:", "  dir/", "  x.md", "  a"]
-        );
-        let partial = Wrapped {
-            lines: lines(1),
-            file: Some((PathBuf::from("x.md"), false)),
-            width: None,
-        };
-        assert_eq!(
-            plain(Section::Text("T".into(), partial).lines(5)),
-            ["T  first 1 lines; all in x.md", "  a"]
-        );
+        assert!(frame.iter().all(|l| columns(l) <= 39), "{text}");
     }
 
     #[test]
-    fn sub_tasks_that_matter_take_the_room_the_texts_leave() {
+    fn the_latest_messages_fill_the_window() {
         let h = home();
         let store = Store::new(&h.0);
-        store.save_prompt("tp", "Fix the parser.").unwrap();
+        store.save_prompt("t1", "Fix the parser.").unwrap();
         store
-            .save(&task("tp", "user", "idle", NOW - 60_000, json!({})))
+            .save(&task("t1", "user", "running", NOW, json!({"turns": 0})))
             .unwrap();
-        store.save_turn("tp", 1, "Fixed.").unwrap();
-        for i in 0..13 {
-            let id = format!("k{i:02}");
-            store.save_prompt(&id, &format!("Part {i}.")).unwrap();
-            let (status, more) = match i {
-                0 => ("failed", json!({})),
-                12 => (
-                    "waiting",
-                    json!({"questions": [
-                        {"id": "q1", "text": "Which port?", "answer": null, "asked_ms": NOW}
-                    ]}),
-                ),
-                _ => ("idle", json!({})),
-            };
-            store
-                .save(&task(&id, "task:tp", status, NOW - 50_000 + i, more))
-                .unwrap();
-        }
-        store
-            .append(&event(1, 1_000, "k00", "failed", json!({"error": "429"})))
-            .unwrap();
-        for i in 0..5 {
-            store
-                .append(&event(2 + i, 1_000, "tp", "tool", json!({"name": "Read"})))
-                .unwrap();
-        }
-        let mut view = View::new(&h.0, false);
-        view.refresh();
-        let frame: Vec<String> = view
-            .task_frame("tp", NOW, Some((100, 16)), false)
-            .iter()
-            .map(|l| strip_sgr(l))
-            .collect();
-        let text = frame.join("\n");
-        assert_eq!(frame.len(), 16, "{text}");
-        assert!(text.contains("\nResult of turn 1\n  Fixed.\n"), "{text}");
-        // One-line texts and the least of the events leave 5 lines: what waits for someone
-        // and what went wrong first, then the latest. The title says how many there are.
-        assert!(text.contains("\nSub-tasks  5 of 13 shown\n"), "{text}");
-        assert_eq!(
-            cells(&frame, "k12"),
-            ["k12", "waiting", "Which port?"],
-            "{text}"
-        );
-        assert_eq!(cells(&frame, "k00"), ["k00", "failed"], "{text}");
-        assert_eq!(cells(&frame, "k11"), ["k11", "idle"], "{text}");
-        assert!(!text.contains("k08 "), "{text}");
-        assert!(text.ends_with("[tp codex] Read"), "{text}");
-
-        // A running task with long texts and many sub-tasks still says where its texts are.
-        let long: Vec<String> = (1..=20).map(|i| format!("line {i}")).collect();
-        let long = long.join("\n");
-        store.save_prompt("tr", &long).unwrap();
-        store
-            .save(&task("tr", "user", "running", NOW, json!({})))
-            .unwrap();
-        store.save_turn("tr", 1, &long).unwrap();
-        for i in 0..7 {
-            store
-                .save(&task(&format!("c{i}"), "task:tr", "idle", NOW, json!({})))
-                .unwrap();
-        }
         for e in [
-            event(20, 9_000, "tr", "turn_started", json!({"turn": 2})),
-            event(21, 8_000, "tr", "said", json!({"text": "Checking."})),
+            event(1, 60_000, "t1", "turn_started", json!({"turn": 1})),
             event(
-                22,
-                7_000,
-                "tr",
-                "tool",
-                json!({"name": "Read", "detail": "a"}),
+                2,
+                50_000,
+                "t1",
+                "said",
+                json!({"text": "Reading. ↵ Then **fixing**."}),
+            ),
+            event(3, 40_000, "t1", "tool", json!({"name": "Read"})),
+            event(
+                4,
+                30_000,
+                "t1",
+                "said",
+                json!({"text": "Fixed the reader."}),
             ),
             event(
-                23,
-                6_000,
-                "tr",
-                "tool",
-                json!({"name": "Read", "detail": "b"}),
+                5,
+                10_000,
+                "t1",
+                "said",
+                json!({"text": "**Done**: all tests pass."}),
+            ),
+            event(
+                6,
+                5_000,
+                "t1",
+                "approval_request",
+                json!({"id": "r1", "summary": "push"}),
             ),
         ] {
             store.append(&e).unwrap();
         }
+        let mut view = View::new(&h.0, false);
         view.refresh();
-        let frame: Vec<String> = view
-            .task_frame("tr", NOW, Some((80, 24)), false)
+        // Its lines as the agent wrote them, without markdown's bold marks; what waits for
+        // someone under the title, in its state's color.
+        let frame = view.task_frame("t1", NOW, Some((60, 9)), false);
+        let plain: Vec<String> = frame.iter().map(|l| strip_sgr(l)).collect();
+        assert_eq!(
+            plain[1..],
+            [
+                " needs  approval r1: push",
+                "",
+                "  task  Fix the parser.",
+                "   50s  Reading.",
+                "        Then fixing.",
+                "   30s  Fixed the reader.",
+                "   10s  Done: all tests pass.",
+            ],
+            "{plain:#?}"
+        );
+        assert!(
+            frame[1].starts_with("\x1b[33m needs  \x1b[0m"),
+            "{frame:#?}"
+        );
+        assert_eq!(
+            cells(&view.frame(NOW, None, None), "t1"),
+            ["t1", "approval", "Done: all tests pass."]
+        );
+        // On a short window, the latest whole, and the end of the one before.
+        let short: Vec<String> = view
+            .task_frame("t1", NOW, Some((60, 5)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
-        let text = frame.join("\n");
-        assert_eq!(frame.len(), 24, "{text}");
-        let turn = store.turn_path("tr", 1).display().to_string();
-        let result = &text[text.find("\nResult of turn 1  ").unwrap()..];
-        assert!(result.contains(" of 20 lines; all in:\n"), "{text}");
-        assert!(result.replace("\n  ", "").contains(&turn), "{text}");
-        assert!(text.contains("\nSub-tasks  2 of 7 shown\n"), "{text}");
-        assert!(text.ends_with("[tr codex] Read: b"), "{text}");
+        assert_eq!(
+            short[2..],
+            [
+                "   50s  …Then fixing.",
+                "   30s  Fixed the reader.",
+                "   10s  Done: all tests pass.",
+            ],
+            "{short:#?}"
+        );
     }
 
     #[test]
     fn a_task_view_counts_what_waits_past_the_window_and_skips_what_is_not_there() {
         let h = home();
         let store = Store::new(&h.0);
-        let questions: Vec<Value> = (0..23)
+        let questions: Vec<Value> = (0..25)
             .map(|i| json!({"id": format!("q{i}"), "text": "Which?", "answer": null, "asked_ms": NOW}))
             .collect();
         store
@@ -2705,12 +2437,15 @@ mod tests {
             .map(|l| strip_sgr(l))
             .collect();
         assert_eq!(frame.len(), 24, "{frame:#?}");
-        assert!(frame[22].contains("q20: Which?"), "{frame:#?}");
-        assert_eq!(frame[23], "  …and 2 more");
+        assert!(frame[22].contains("q21: Which?"), "{frame:#?}");
+        assert_eq!(frame[23], "        …and 3 more");
 
-        // Without events yet, no title for them.
+        // Without a task text kept or anything said, it says so.
         let frame = view.task_frame("t1", NOW, None, false).join("\n");
-        assert!(!frame.contains("Events"), "{frame}");
+        assert!(
+            frame.ends_with("\n\n  task  not recorded: spawned before axiopera kept it"),
+            "{frame}"
+        );
     }
 
     #[test]
@@ -2803,7 +2538,9 @@ mod tests {
         // Enter opens it; up and down do nothing there, and Esc goes back to it in the list.
         ui.press(Open, &view, NOW);
         let one = plain(&mut ui, &view);
-        assert!(one[0].starts_with("axiopera top tw  ask") && one[0].ends_with("  Esc back"));
+        assert!(
+            one[0].starts_with("ask  tw codex/work  waiting") && one[0].ends_with("  Esc back")
+        );
         ui.press(Down, &view, NOW);
         assert_eq!(ui.open.as_deref(), Some("tw"));
         ui.press(Back, &view, NOW);
@@ -2840,6 +2577,9 @@ mod tests {
         assert_eq!(wrap("aaa bbb ccc", 7), ["aaa bbb", "ccc"]);
         assert_eq!(wrap("aaaaaaaaaa", 4), ["aaaa", "aaaa", "aa"]);
         assert_eq!(wrap("审查审查审查", 5), ["审查", "审查", "审查"]);
+        // Chinese breaks between its characters, but not before closing punctuation.
+        assert_eq!(wrap("审查 abc 审查审查", 6), ["审查", "abc 审", "查审查"]);
+        assert_eq!(wrap("审查。审查", 4), ["审", "查。", "审查"]);
         assert_eq!(wrap("", 5), [""]);
     }
 }
