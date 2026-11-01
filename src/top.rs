@@ -35,6 +35,9 @@ const MIN_EVENTS: usize = 3;
 const READ_BYTES: u64 = 64 * 1024;
 /// The rank of a line that goes only with the lines of its tasks: a session's line.
 const WITH_TASKS: u8 = u8::MAX;
+/// How long the rest of an escape sequence is waited for before an escape alone is the Esc
+/// key.
+const ESC_WAIT: Duration = Duration::from_millis(100);
 /// Assumed when the terminal does not tell its size.
 const FALLBACK_SIZE: (usize, usize) = (100, 30);
 /// Columns of a task's name shown in its line.
@@ -71,24 +74,25 @@ pub async fn run(home: &Path, task: Option<&str>, all: bool) -> Result<i32> {
         }
         return Ok(0);
     }
-    // The handler is installed on the first poll. Until then Ctrl-C ends the process at once,
-    // which would leave the terminal as changed below.
-    let mut stop = std::pin::pin!(tokio::signal::ctrl_c());
+    // The signal handlers are installed on the first poll. Until then a signal ends the process
+    // at once, which would leave the terminal as changed below.
+    let mut stop = std::pin::pin!(stopped());
     tokio::select! {
         biased;
-        _ = &mut stop => return Ok(0),
+        () = &mut stop => return Ok(0),
         () = std::future::ready(()) => {}
     }
     // Without a terminal to read keys from, such as mintty without ConPTY, the view only
     // shows, and Ctrl-C is a signal as before.
-    let keys = match std::io::stdin().is_terminal() {
+    let mut keys = match std::io::stdin().is_terminal() {
         true => platform::Keys::enable(),
         false => None,
     };
-    let (send, mut pressed) = tokio::sync::mpsc::unbounded_channel();
+    let (send, mut read) = tokio::sync::mpsc::unbounded_channel();
     if keys.is_some() {
         std::thread::spawn(move || read_keys(send));
     }
+    let mut input = Input::default();
     let mut ui = Ui {
         open: focus.clone(),
         chosen: focus,
@@ -111,21 +115,54 @@ pub async fn run(home: &Path, task: Option<&str>, all: bool) -> Result<i32> {
         if let Err(e) = show(&format!("\x1b[H{}\x1b[K\x1b[J", lines.join("\x1b[K\r\n"))) {
             break Err(e);
         }
-        // A key is followed at once; the files are read again each second.
-        tokio::select! {
-            _ = &mut stop => break Ok(()),
-            Some(key) = pressed.recv() => {
-                if !ui.press(key, &view, store::now_ms()) {
-                    break Ok(());
+        // Keys are followed at once; the files are read again each second.
+        let pressed = tokio::select! {
+            () = &mut stop => break Ok(()),
+            bytes = read.recv(), if ui.keys => match bytes {
+                Some(bytes) => input.feed(&bytes),
+                // Keys can no longer be read: the terminal is given back its own handling of
+                // Ctrl-C, and the view only shows.
+                None => {
+                    keys = None;
+                    ui.keys = false;
+                    Vec::new()
                 }
+            },
+            () = tokio::time::sleep(ESC_WAIT), if input.waiting() => input.flush(),
+            _ = tick.tick() => {
+                view.refresh();
+                Vec::new()
             }
-            _ = tick.tick() => view.refresh(),
+        };
+        let now = store::now_ms();
+        if !pressed.into_iter().all(|key| ui.press(key, &view, now)) {
+            break Ok(());
         }
     };
     show("\x1b[?7h\x1b[?25h\x1b[?1049l")?;
     drop(keys);
     drawn?;
     Ok(0)
+}
+
+/// Resolves when `top` is told to stop: by Ctrl-C as a signal, or on Unix by a request to
+/// terminate, which would otherwise end it without giving the terminal back as it was. Its
+/// handlers are installed on its first poll.
+async fn stopped() {
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => drop(s.recv().await),
+            Err(_) => std::future::pending().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        () = terminate => {}
+    }
 }
 
 /// A key that does something in `top`.
@@ -140,36 +177,63 @@ enum Key {
     Quit,
 }
 
-/// The keys in what one read of the terminal gave. Terminals send an escape sequence whole, so
-/// an escape that ends a read is the Esc key.
-fn keys(bytes: &[u8]) -> Vec<Key> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let rest = &bytes[i..];
-        let (key, used) = match rest {
-            // CSI: parameters, then a final byte. SS3: one byte.
-            [0x1b, b'[', tail @ ..] => {
-                let params = tail
-                    .iter()
-                    .take_while(|b| (0x20..0x40).contains(*b))
-                    .count();
-                (tail.get(params).and_then(|b| arrow(*b)), 2 + params + 1)
-            }
-            [0x1b, b'O', b, ..] => (arrow(*b), 3),
-            [0x1b, ..] => (Some(Key::Back), 1),
-            [b'\r' | b'\n', ..] => (Some(Key::Open), 1),
-            [b'k', ..] => (Some(Key::Up), 1),
-            [b'j', ..] => (Some(Key::Down), 1),
-            [b'q', ..] => (Some(Key::Q), 1),
-            [0x7f | 0x08, ..] => (Some(Key::Back), 1),
-            [0x03, ..] => (Some(Key::Quit), 1),
-            _ => (None, 1),
-        };
-        out.extend(key);
-        i += used;
+/// Keys from the bytes a terminal sends, which may split an escape sequence between reads.
+#[derive(Default)]
+struct Input {
+    /// The start of an escape sequence whose end has not come yet.
+    pending: Vec<u8>,
+}
+
+impl Input {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<Key> {
+        self.pending.extend_from_slice(bytes);
+        let mut out = Vec::new();
+        let mut i = 0;
+        while let Some((key, used)) = key_at(&self.pending[i..]) {
+            out.extend(key);
+            i += used;
+        }
+        self.pending.drain(..i);
+        out
     }
-    out
+
+    /// Whether an escape sequence waits for its end.
+    fn waiting(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// What is left once no more bytes came for `ESC_WAIT`: an escape alone is the Esc key,
+    /// and the start of a longer sequence is dropped.
+    fn flush(&mut self) -> Vec<Key> {
+        let esc = self.pending == [0x1b];
+        self.pending.clear();
+        esc.then_some(Key::Back).into_iter().collect()
+    }
+}
+
+/// The key at the start of `bytes`, if they are one, and how many bytes it takes; `None` when
+/// there are none, or they start an escape sequence not yet whole.
+fn key_at(bytes: &[u8]) -> Option<(Option<Key>, usize)> {
+    Some(match bytes {
+        [] | [0x1b] | [0x1b, b'[' | b'O'] => return None,
+        // CSI: parameters, then a final byte. SS3: one byte.
+        [0x1b, b'[', tail @ ..] => {
+            let params = tail
+                .iter()
+                .take_while(|b| (0x20..0x40).contains(*b))
+                .count();
+            (arrow(*tail.get(params)?), 2 + params + 1)
+        }
+        [0x1b, b'O', b, ..] => (arrow(*b), 3),
+        [0x1b, ..] => (Some(Key::Back), 1),
+        [b'\r' | b'\n', ..] => (Some(Key::Open), 1),
+        [b'k', ..] => (Some(Key::Up), 1),
+        [b'j', ..] => (Some(Key::Down), 1),
+        [b'q', ..] => (Some(Key::Q), 1),
+        [0x7f | 0x08, ..] => (Some(Key::Back), 1),
+        [0x03, ..] => (Some(Key::Quit), 1),
+        _ => (None, 1),
+    })
 }
 
 /// The key an arrow's last byte stands for: right opens, left goes back.
@@ -183,19 +247,20 @@ fn arrow(b: u8) -> Option<Key> {
     }
 }
 
-/// Reads keys from stdin until `top` ends. Blocks, so it runs on a thread of its own.
-fn read_keys(send: tokio::sync::mpsc::UnboundedSender<Key>) {
+/// Reads stdin until `top` ends or it cannot be read. Blocks, so it runs on a thread of its
+/// own.
+fn read_keys(send: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
     let mut stdin = std::io::stdin().lock();
     let mut bytes = [0; 64];
     loop {
         match stdin.read(&mut bytes) {
-            // A Windows console reads Ctrl-Z as the end of input: nothing to do.
-            Ok(0) => std::thread::sleep(Duration::from_millis(50)),
+            // A Windows console reads Ctrl-Z as the end of input, and reads on.
+            Ok(0) if cfg!(windows) => std::thread::sleep(Duration::from_millis(50)),
+            // Elsewhere each byte is read as it comes: nothing read means the terminal is gone.
+            Ok(0) => return,
             Ok(n) => {
-                for key in keys(&bytes[..n]) {
-                    if send.send(key).is_err() {
-                        return;
-                    }
+                if send.send(bytes[..n].to_vec()).is_err() {
+                    return;
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -434,8 +499,7 @@ impl View {
         }
         if let Some(row) = chosen.and_then(|c| rows.iter_mut().find(|r| r.id.as_deref() == Some(c)))
         {
-            row.rank = 0;
-            row.spawned = u64::MAX;
+            row.chosen = true;
             row.segs.insert(0, (String::new(), CHOSEN));
         }
         match size {
@@ -870,6 +934,8 @@ struct Row {
     with: Vec<usize>,
     /// Its task's, for a task's line.
     id: Option<String>,
+    /// Whether it is the chosen task's line, which is always shown.
+    chosen: bool,
 }
 
 impl Row {
@@ -880,6 +946,7 @@ impl Row {
             spawned: 0,
             with: Vec::new(),
             id: None,
+            chosen: false,
         }
     }
 }
@@ -905,31 +972,38 @@ fn choose(rows: Vec<Row>, room: usize) -> Vec<Vec<Seg>> {
         return rows.into_iter().map(|r| r.segs).collect();
     }
     let (mut out, left) = pick(rows, room.saturating_sub(1));
-    if room > 0 {
+    if out.len() < room {
         out.push(vec![(format!("  …and {left} more task(s)"), DIM)]);
     }
     out
 }
 
-/// No more than `room` rows, in their order, and how many tasks are left out. The lowest ranks
-/// are chosen, the later spawned of the same rank first. Rows are not chosen by when they last
-/// changed: those shown would change every second.
+/// No more than `budget` rows, in their order, and how many tasks are left out. The chosen
+/// task's line comes first, shown even past the budget, then the lowest ranks, the later
+/// spawned of the same rank first. Rows are not chosen by when they last changed: those shown
+/// would change every second.
 fn pick(rows: Vec<Row>, budget: usize) -> (Vec<Vec<Seg>>, usize) {
     let mut order: Vec<usize> = (0..rows.len())
         .filter(|&i| rows[i].rank != WITH_TASKS)
         .collect();
-    order.sort_by_key(|&i| (rows[i].rank, Reverse(rows[i].spawned), Reverse(i)));
+    order.sort_by_key(|&i| {
+        let r = &rows[i];
+        (!r.chosen, r.rank, Reverse(r.spawned), Reverse(i))
+    });
     let mut kept = vec![false; rows.len()];
     let mut used = 0;
     for i in order {
         let cost = usize::from(!kept[i]) + rows[i].with.iter().filter(|&&w| !kept[w]).count();
-        if used + cost > budget {
-            continue;
-        }
-        used += cost;
-        kept[i] = true;
-        for &w in &rows[i].with {
-            kept[w] = true;
+        if used + cost <= budget {
+            used += cost;
+            kept[i] = true;
+            for &w in &rows[i].with {
+                kept[w] = true;
+            }
+        } else if rows[i].chosen {
+            // Alone, when the lines it goes with do not fit.
+            used += 1;
+            kept[i] = true;
         }
     }
     let left = rows
@@ -2366,6 +2440,16 @@ mod tests {
         let wide = view.frame(NOW, None, None);
         let b3 = cells(&wide, "a name");
         assert_eq!(b3[0], "a name longer than …", "{wide:#?}");
+        // Chosen, it is shown however short the window: alone when the lines of its session
+        // and parents do not fit.
+        for (height, more) in [(4, Some("  …and 3 more task(s)")), (3, None)] {
+            let short = view.frame(NOW, Some((100, height)), Some("b3"));
+            assert!(
+                short[2].starts_with("\x1b[7m      a name longer than …"),
+                "{short:#?}"
+            );
+            assert_eq!(short.get(3).map(|l| strip_sgr(l)).as_deref(), more);
+        }
         store.remove("b3").unwrap();
         store.remove("b2").unwrap();
         view.refresh();
@@ -2625,10 +2709,22 @@ mod tests {
     #[test]
     fn keys_choose_a_task_open_it_and_go_back() {
         use Key::*;
+        let mut input = Input::default();
         assert_eq!(
-            keys(b"\x1b[A\x1b[B\x1bOC\x1b[1;5D\x1b[5~\rkjq\x1b\x03\x7fx"),
+            input.feed(b"\x1b[A\x1b[B\x1bOC\x1b[1;5D\x1b[5~\rkjq\x1b\x03\x7fx"),
             [Up, Down, Open, Back, Open, Up, Down, Q, Back, Quit, Back]
         );
+        // An escape sequence split between reads is one key; an escape alone is Esc once no
+        // more comes, and the start of a sequence that never ends is nothing.
+        assert!(input.feed(b"\x1b").is_empty() && input.waiting());
+        assert_eq!(input.feed(b"[B"), [Down]);
+        assert_eq!(input.feed(b"j\x1b[1;"), [Down]);
+        assert_eq!(input.feed(b"5A"), [Up]);
+        assert!(!input.waiting());
+        input.feed(b"\x1b");
+        assert_eq!(input.flush(), [Back]);
+        input.feed(b"\x1bO");
+        assert!(input.flush().is_empty() && !input.waiting());
 
         let h = home();
         let store = Store::new(&h.0);
