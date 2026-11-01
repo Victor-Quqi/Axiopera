@@ -98,7 +98,7 @@ pub(super) fn render(lines: &[String], room: Option<usize>, cwd: &str) -> Vec<Ve
     let flush = |paragraph: &mut Vec<String>, table: &mut Vec<String>, out: &mut Vec<Line>| {
         if !paragraph.is_empty() {
             let text = std::mem::take(paragraph).join("\n");
-            out.extend(split_lines(spans(&text, Style::default(), cwd)));
+            out.extend(split_lines(spans(&text, Style::default(), Some(cwd))));
         }
         if !table.is_empty() {
             out.extend(lined_up(&std::mem::take(table), room, cwd));
@@ -154,9 +154,10 @@ pub(super) fn render(lines: &[String], room: Option<usize>, cwd: &str) -> Vec<Ve
     out.into_iter().flat_map(|l| l.rows(room)).collect()
 }
 
-/// One line of markdown on one row, its marks taken out: for a list of tasks.
+/// One line of markdown on one row, its marks taken out: for a list of tasks. Links show only
+/// their text, to keep the line short.
 pub(super) fn inline(text: &str) -> Vec<Seg> {
-    spans(text, Style::default(), "")
+    spans(text, Style::default(), None)
 }
 
 /// The fence a line opens or closes a code block with: three or more backticks or tildes.
@@ -182,7 +183,7 @@ fn block(line: &str, cwd: &str) -> Option<Line> {
             bold: true,
             ..Style::default()
         };
-        return Some(Line::plain(spans(text, style, cwd)));
+        return Some(Line::plain(spans(text, style, Some(cwd))));
     }
     let rule = |c: char| t.chars().all(|x| x == c || x == ' ') && t.matches(c).count() >= 3;
     if ['-', '*', '_'].into_iter().any(rule) {
@@ -204,7 +205,7 @@ fn block(line: &str, cwd: &str) -> Option<Line> {
         return Some(Line {
             lead: bar.clone(),
             hang: bar,
-            ..Line::plain(spans(t.trim_start_matches(['>', ' ']), style, cwd))
+            ..Line::plain(spans(t.trim_start_matches(['>', ' ']), style, Some(cwd)))
         });
     }
     let (marker, text) = item(t)?;
@@ -212,7 +213,7 @@ fn block(line: &str, cwd: &str) -> Option<Line> {
     Some(Line {
         hang: vec![(" ".repeat(columns(&lead)), "")],
         lead: vec![(lead, FRAME)],
-        ..Line::plain(spans(text, Style::default(), cwd))
+        ..Line::plain(spans(text, Style::default(), Some(cwd)))
     })
 }
 
@@ -256,7 +257,7 @@ fn lined_up(rows: &[String], room: Option<usize>, cwd: &str) -> Vec<Line> {
                 bold: header && i == 0,
                 ..Style::default()
             };
-            r.iter().map(|c| spans(c, style, cwd)).collect()
+            r.iter().map(|c| spans(c, style, Some(cwd))).collect()
         })
         .collect();
     let count = styled.iter().map(Vec::len).max().unwrap_or(0);
@@ -274,7 +275,7 @@ fn lined_up(rows: &[String], room: Option<usize>, cwd: &str) -> Vec<Line> {
                 Line::plain(spans(
                     &format!("| {} |", r.join(" | ")),
                     Style::default(),
-                    cwd,
+                    Some(cwd),
                 ))
             })
             .collect();
@@ -327,7 +328,7 @@ fn cells(row: &str) -> Vec<String> {
 }
 
 /// Text styled as its marks tell, with the marks taken out.
-fn spans(text: &str, style: Style, cwd: &str) -> Vec<Seg> {
+fn spans(text: &str, style: Style, cwd: Option<&str>) -> Vec<Seg> {
     let chars: Vec<char> = text.chars().collect();
     let mut cells = Vec::new();
     styled(&chars, style, cwd, &mut cells);
@@ -527,9 +528,9 @@ fn target_shown(text: &str, target: &str, cwd: &str) -> Option<String> {
     (path != text).then_some(path)
 }
 
-/// `chars` styled, starting from `style`, into `out`. Links to files in `cwd` show their paths
-/// from there.
-fn styled(chars: &[char], style: Style, cwd: &str, out: &mut Vec<(char, &'static str)>) {
+/// `chars` styled, starting from `style`, into `out`. Links show where they go when there is
+/// a `cwd`, files' paths from there.
+fn styled(chars: &[char], style: Style, cwd: Option<&str>, out: &mut Vec<(char, &'static str)>) {
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -595,7 +596,7 @@ fn styled(chars: &[char], style: Style, cwd: &str, out: &mut Vec<(char, &'static
                     );
                     let text: String = out[from..].iter().map(|(c, _)| c).collect();
                     let target: String = chars[target].iter().collect();
-                    if let Some(shown) = target_shown(&text, &target, cwd) {
+                    if let Some(shown) = cwd.and_then(|cwd| target_shown(&text, &target, cwd)) {
                         out.extend(format!(" ({shown})").chars().map(|c| (c, FRAME)));
                     }
                     i = end;
@@ -645,7 +646,7 @@ mod tests {
     const CWD: &str = "D:\\vc-proj\\Axiopera";
 
     fn one(text: &str) -> String {
-        shown(&[spans(text, Style::default(), CWD)]).remove(0)
+        shown(&[spans(text, Style::default(), Some(CWD))]).remove(0)
     }
 
     fn lines(text: &str) -> Vec<String> {
@@ -697,6 +698,11 @@ mod tests {
         ] {
             assert_eq!(one(text), expected, "{text}");
         }
+        // On a list's line, links show only their text.
+        assert_eq!(
+            shown(&[inline("see [a.rs](/x/a.rs) and [d](https://e.com)")]),
+            ["see [36;4|a.rs] and [36;4|d]"]
+        );
     }
 
     #[test]

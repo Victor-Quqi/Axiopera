@@ -5,7 +5,7 @@
 //! result delivered.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -361,6 +361,9 @@ struct View {
     /// new task, when its line moves the others anyway, and does not narrow when one leaves,
     /// which would move every line.
     width: usize,
+    /// Likewise the widest ID of a task with a name: its ID has a column of its own, for the
+    /// commands its agent runs on it. A task without a name has its ID in the name's column.
+    id_width: usize,
     /// When each session first spawned, by its caller, as seen since top started: sessions
     /// keep their order when their oldest tasks are hidden or removed.
     first_spawned: HashMap<String, u64>,
@@ -374,6 +377,7 @@ impl View {
             tasks: HashMap::new(),
             tails: HashMap::new(),
             width: 0,
+            id_width: 0,
             first_spawned: HashMap::new(),
         }
     }
@@ -410,6 +414,9 @@ impl View {
                 *at = (*at).min(t.created_ms);
             }
             self.width = self.width.max(columns(&name_cell(depth, t)));
+            if t.name.is_some() {
+                self.id_width = self.id_width.max(columns(&t.id));
+            }
         }
         let store = &self.store;
         self.tails.retain(|id, _| store.exists(id));
@@ -419,19 +426,42 @@ impl View {
                 prompt: read_text(&self.store.prompt_path(id)),
                 ..Tail::default()
             });
-            // The daemon counts a turn before writing its result, so the file may be missing
-            // or still being written: it is read again until its size stays.
-            if t.turns > 0 {
-                let path = self.store.turn_path(id, t.turns);
-                let read = tail.result.as_ref().is_some_and(|(n, r)| {
-                    *n == t.turns && fs::metadata(&path).is_ok_and(|m| m.len() == r.len)
-                });
-                if !read {
-                    tail.result = read_text(&path).map(|r| (t.turns, r));
-                }
-            }
             for e in tail.read(&self.store.events_path(id)) {
                 tail.absorb(&e);
+            }
+            // The results of the turns whose last messages are kept, and the latest.
+            let ended: Vec<u32> = tail
+                .log
+                .iter()
+                .filter_map(|l| match l.what {
+                    What::Said { turn, .. } => turn,
+                    _ => None,
+                })
+                .collect();
+            tail.results
+                .retain(|n, _| *n == t.turns || ended.contains(n));
+            // The daemon counts a turn before writing its result, so the latest may be missing
+            // or still being written: it is read again until its size stays. One before it is
+            // read once.
+            if t.turns > 0 {
+                let path = self.store.turn_path(id, t.turns);
+                let read = tail
+                    .results
+                    .get(&t.turns)
+                    .is_some_and(|r| fs::metadata(&path).is_ok_and(|m| m.len() == r.len));
+                if !read {
+                    match read_text(&path) {
+                        Some(r) => tail.results.insert(t.turns, r),
+                        None => tail.results.remove(&t.turns),
+                    };
+                }
+            }
+            for n in ended {
+                if !tail.results.contains_key(&n)
+                    && let Some(r) = read_text(&self.store.turn_path(id, n))
+                {
+                    tail.results.insert(n, r);
+                }
             }
         }
     }
@@ -617,11 +647,16 @@ impl View {
         (rows, hidden)
     }
 
-    /// A task on one line: its name, indented by its depth, its state, and what it last said.
+    /// A task on one line: its name, indented by its depth, its ID when it has a name, its
+    /// state, and what it last said.
     fn task_row(&self, cell: &str, t: &Task, width: usize) -> Row {
         let tail = self.tail(&t.id);
         let (state, color) = state(t, tail);
         let mut segs = vec![(format!("{}  ", pad(cell, width)), "")];
+        if self.id_width > 0 {
+            let id = t.name.as_ref().map_or("", |_| t.id.as_str());
+            segs.push((format!("{}  ", pad(id, self.id_width)), DIM));
+        }
         match words(t, tail) {
             Some(text) => {
                 segs.push((pad(state, STATE), color));
@@ -708,20 +743,24 @@ impl View {
         }
         let given = blocks.len();
         let cwd = t.cwd.to_string_lossy();
-        // A turn's last message is its result, whole in its file. A result whose message is
-        // not among them, as of a task from before messages were kept, comes on its own.
-        let result = tail.result.as_ref().filter(|(_, r)| !r.lines.is_empty());
+        // A turn's last message is its result, whole in its file. The latest result whose
+        // message is not among them, as of a task from before messages were kept, comes on its
+        // own.
+        let result = |turn: u32| tail.results.get(&turn).filter(|r| !r.lines.is_empty());
         let as_result =
             |turn: u32, r: &Text| Block::said(r.shown(), Some(self.store.turn_path(id, turn)));
         let mut result_shown = false;
         for l in &tail.log {
             let block = match &l.what {
-                What::Said { text, turn } => match result.filter(|(n, _)| *turn == Some(*n)) {
+                What::Said { text, turn } => match turn.and_then(|n| Some((n, result(n)?))) {
                     Some((n, r)) => {
-                        result_shown = true;
-                        as_result(*n, r)
+                        result_shown |= n == t.turns;
+                        as_result(n, r)
                     }
-                    None => Block::said(text.split(" ↵ ").map(String::from).collect(), None),
+                    None => Block::said(
+                        uncounted(text).split(" ↵ ").map(String::from).collect(),
+                        None,
+                    ),
                 },
                 What::Tool { name, detail } => Block::Tools(vec![tool_call(name, detail, &cwd)]),
                 What::Turn(n) => Block::Turn(format!(
@@ -731,12 +770,12 @@ impl View {
             };
             blocks.push((l.at, block));
         }
-        if let Some((turn, r)) = result.filter(|_| !result_shown) {
+        if let Some(r) = result(t.turns).filter(|_| !result_shown) {
             let at = match tail.ended_ms {
                 0 => t.updated_ms,
                 at => at,
             };
-            blocks.push((at, as_result(*turn, r)));
+            blocks.push((at, as_result(t.turns, r)));
         }
         blocks[given..].sort_by_key(|(at, _)| *at);
         // Tool calls in a row go together.
@@ -911,7 +950,7 @@ fn tool_call(name: &str, detail: &str, cwd: &str) -> (String, String) {
         "webfetch" | "fetch" => "Fetch",
         _ => name,
     };
-    let detail = from_dir(&one_line(&unshelled(detail)), cwd);
+    let detail = from_dir(&one_line(&unshelled(uncounted(detail))), cwd);
     (verb.to_string(), detail)
 }
 
@@ -1216,9 +1255,10 @@ fn words(t: &Task, tail: &Tail) -> Option<String> {
         (Some((said, at)), Some(q)) if *at > q.asked_ms => said.clone(),
         (_, Some(q)) => q.text.clone(),
         (Some((said, _)), None) => said.clone(),
-        (None, None) => tail.result.as_ref()?.1.lines.first()?.clone(),
+        (None, None) => tail.results.get(&t.turns)?.lines.first()?.clone(),
     };
-    Some(one_line(&text))
+    // Its lines are joined by spaces: the daemon's marks between them would only clutter one.
+    Some(one_line(&uncounted(&text).replace(" ↵ ", " ")))
 }
 
 /// A command without the shell its agent ran it in, as Codex reports one:
@@ -1259,6 +1299,23 @@ fn unshelled(command: &str) -> String {
         }
     }
     rest.into()
+}
+
+/// Text the daemon cut short, ending in `…` alone where it was cut, as a row cut to the window
+/// does, instead of with how much was left out.
+fn uncounted(text: &str) -> &str {
+    const MARK: &str = "…(+";
+    match text.rfind(MARK) {
+        Some(i)
+            if text
+                .strip_suffix(" chars)")
+                .and_then(|t| t.get(i + MARK.len()..))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            &text[..i + '…'.len_utf8()]
+        }
+        _ => text,
+    }
 }
 
 /// Text on one line: its lines and runs of spaces joined by single spaces.
@@ -1433,8 +1490,8 @@ struct Tail {
     stop: Option<(&'static str, String)>,
     /// `prompt.md`, read once.
     prompt: Option<Text>,
-    /// The latest result read, and its turn.
-    result: Option<(u32, Text)>,
+    /// Results by turn: the latest, and those of the turns whose last messages are kept.
+    results: BTreeMap<u32, Text>,
 }
 
 impl Tail {
@@ -1450,7 +1507,7 @@ impl Tail {
             approvals: Vec::new(),
             stop: None,
             prompt: None,
-            result: None,
+            results: BTreeMap::new(),
         }
     }
 
@@ -1734,7 +1791,7 @@ mod tests {
     }
 
     #[test]
-    fn each_task_is_one_line_of_its_name_state_and_words() {
+    fn each_task_is_one_line_of_its_name_id_state_and_words() {
         let h = home();
         let store = Store::new(&h.0);
         for (t, prompt) in [
@@ -1841,11 +1898,11 @@ mod tests {
         );
         assert!(!text.contains("t4 "), "{text}");
 
-        // What it last said, on one line, past the tool calls after it; its state tells that
-        // it waits for an approval.
+        // Its ID beside its name, then what it last said, on one line, past the tool calls
+        // after it; its state tells that it waits for an approval.
         assert_eq!(
             cells(&frame, "审查"),
-            ["审查", "approval", "Running the tests."],
+            ["审查", "t1", "approval", "Running the tests."],
             "{text}"
         );
         for child in ["t2", "t3"] {
@@ -1871,7 +1928,7 @@ mod tests {
             1_000,
             "t1",
             "said",
-            json!({"text": "Editing a.rs."}),
+            json!({"text": "Editing ↵  ↵ a.rs…(+12 chars)"}),
         ))
         .unwrap();
         let (head, rest) = more.split_at(20);
@@ -1882,7 +1939,7 @@ mod tests {
         f.write_all(head.as_bytes()).unwrap();
         view.refresh();
         assert_eq!(
-            cells(&view.frame(NOW, None, None), "审查")[2],
+            cells(&view.frame(NOW, None, None), "审查")[3],
             "Running the tests."
         );
         f.write_all(format!("{rest}\n").as_bytes()).unwrap();
@@ -1898,8 +1955,8 @@ mod tests {
             .unwrap();
         view.refresh();
         assert_eq!(
-            cells(&view.frame(NOW, None, None), "审查")[1..],
-            ["running", "Editing a.rs."]
+            cells(&view.frame(NOW, None, None), "审查")[2..],
+            ["running", "Editing a.rs…"]
         );
 
         // Nothing the daemon delivers was changed.
@@ -1953,7 +2010,22 @@ mod tests {
         store
             .save(&task("t3", "user", "idle", NOW, json!({"name": "tests"})))
             .unwrap();
+        store.save_turn("t1", 1, "Read it.\nAll of it.").unwrap();
         for e in [
+            event(
+                0,
+                55_000,
+                "t1",
+                "said",
+                json!({"text": "Read it. ↵ All…(+6 chars)"}),
+            ),
+            event(
+                0,
+                55_000,
+                "t1",
+                "turn_ended",
+                json!({"turn": 1, "ok": true}),
+            ),
             event(1, 50_000, "t1", "turn_started", json!({"turn": 2})),
             event(
                 2,
@@ -2006,7 +2078,7 @@ mod tests {
         );
 
         // A title, then what it was given and what its agent said and did, without its
-        // sub-tasks': a turn's last message whole from its result, and its tool calls under
+        // sub-tasks': each turn's last message whole from its result, and its tool calls under
         // what was said before them, a command without its shell and a path from the task's
         // directory.
         let frame = view.task_frame("t1", NOW, None, false);
@@ -2018,6 +2090,9 @@ mod tests {
                 "",
                 "› Review the parser.",
                 "  Report findings.",
+                "",
+                "• Read it.",
+                "  All of it.",
                 "",
                 "── turn 2, 50s ago",
                 "",
@@ -2042,7 +2117,7 @@ mod tests {
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
-        assert_eq!(fitted[2..], frame[10..], "{fitted:#?}");
+        assert_eq!(fitted[2..], frame[13..], "{fitted:#?}");
         assert_eq!(fitted[1], "…   Run git status --short; echo 'done'");
         // With room for all, a blank line under the title.
         let roomy = view.task_frame("t1", NOW, Some((60, 20)), false);
@@ -2909,7 +2984,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_is_shown_without_its_shell() {
+    fn a_command_is_shown_without_its_shell_and_what_was_cut_is_not_counted() {
         for (command, shown) in [
             (PWSH, "git status  --short; echo 'done'"),
             ("bash -lc 'cargo test'", "cargo test"),
@@ -2918,13 +2993,15 @@ mod tests {
             // Cut short by the daemon: what it has.
             (
                 r#""C:\pwsh.exe" -Command 'git log --oneline…(+20 chars)"#,
-                "git log --oneline…(+20 chars)",
+                "git log --oneline…",
             ),
             ("cargo test", "cargo test"),
+            // What the daemon left out is not counted, as what the window cuts is not.
+            ("git log…(+20 chars)", "git log…"),
             ("sh script.sh", "sh script.sh"),
             ("bash", "bash"),
         ] {
-            assert_eq!(unshelled(command), shown, "{command}");
+            assert_eq!(unshelled(uncounted(command)), shown, "{command}");
         }
     }
 
