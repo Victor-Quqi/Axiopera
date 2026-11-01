@@ -8,6 +8,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -19,15 +20,23 @@ use crate::identity;
 use crate::platform;
 use crate::store::{self, Event, Status, Store, Task};
 
+mod markdown;
+
 const REFRESH: Duration = Duration::from_secs(1);
 /// How long a stopped task stays in view after its last change, without `--all`.
 const RECENT_MS: u64 = 60 * 60 * 1000;
-/// Messages of each task kept for its view.
-const MESSAGES: usize = 100;
+/// Messages, tool calls and turns of each task kept for its view.
+const LOGGED: usize = 300;
 /// Messages shown in a task's view when the output is not a terminal.
 const PLAIN_MESSAGES: usize = 20;
-/// Columns before the text of a message in a task's view: when it was said.
+/// Columns of the label of a line under a task's title in its view: what it waits for, or how
+/// it ended badly.
 const LABEL: usize = 8;
+/// Columns before the text of what was said in a task's view: a mark on its first row.
+const GUTTER: usize = 2;
+/// The marks of the task text and of a message, as Codex marks a prompt and a message.
+const TASK_MARK: (&str, &str) = ("› ", "1;2");
+const SAID_MARK: (&str, &str) = ("• ", DIM);
 /// Bytes read of a task text or a result. Past them, the view points to the file.
 const READ_BYTES: u64 = 64 * 1024;
 /// The rank of a line that goes only with the lines of its tasks: a session's line.
@@ -616,7 +625,8 @@ impl View {
         match words(t, tail) {
             Some(text) => {
                 segs.push((pad(state, STATE), color));
-                segs.push((format!("  {text}"), ""));
+                segs.push(("  ".into(), ""));
+                segs.extend(markdown::inline(&text));
             }
             None => segs.push((state.into(), color)),
         }
@@ -629,8 +639,9 @@ impl View {
     }
 
     /// One task in detail: a title, what it waits for or how it ended badly, then what it was
-    /// given and what its agent said since, the latest last, as many as the window holds. With
-    /// `keys`, its title says how to go back to the list.
+    /// given and what its agent said and did since, laid out as Codex lays out its own, the
+    /// latest last, as much as the window holds. With `keys`, its title says how to go back to
+    /// the list.
     fn task_frame(
         &self,
         id: &str,
@@ -679,83 +690,86 @@ impl View {
         }
         head.extend(waiting);
 
-        // What it was given first, then what was said, in the order it was said.
-        let ago = |at: u64| age(now.saturating_sub(at));
-        let mut said: Vec<(u64, Message)> = Vec::new();
+        // What it was given first, then what its agent said and did, in that order.
+        let mut blocks: Vec<(u64, Block)> = Vec::new();
         match &tail.prompt {
-            Some(text) => said.push((
+            Some(text) => blocks.push((
                 0,
-                Message {
-                    label: "task".into(),
-                    lines: text.shown(),
-                    file: Some(self.store.prompt_path(id)),
-                },
+                Block::task(text.shown(), Some(self.store.prompt_path(id))),
             )),
-            None if tail.log.is_empty() => said.push((
+            None if tail.log.is_empty() => blocks.push((
                 0,
-                Message {
-                    label: "task".into(),
-                    lines: vec!["not recorded: spawned before axiopera kept it".into()],
-                    file: None,
-                },
+                Block::task(
+                    vec!["not recorded: spawned before axiopera kept it".into()],
+                    None,
+                ),
             )),
             None => {}
         }
-        let given = said.len();
+        let given = blocks.len();
+        let cwd = t.cwd.to_string_lossy();
         // A turn's last message is its result, whole in its file. A result whose message is
         // not among them, as of a task from before messages were kept, comes on its own.
         let result = tail.result.as_ref().filter(|(_, r)| !r.lines.is_empty());
-        let as_result = |turn: u32, r: &Text, at: u64| Message {
-            label: ago(at),
-            lines: r.shown(),
-            file: Some(self.store.turn_path(id, turn)),
-        };
+        let as_result =
+            |turn: u32, r: &Text| Block::said(r.shown(), Some(self.store.turn_path(id, turn)));
         let mut result_shown = false;
-        for s in &tail.log {
-            let message = match result.filter(|(turn, _)| s.turn == Some(*turn)) {
-                Some((turn, r)) => {
-                    result_shown = true;
-                    as_result(*turn, r, s.at)
-                }
-                None => Message {
-                    label: ago(s.at),
-                    lines: s
-                        .text
-                        .split(" ↵ ")
-                        .map(str::trim)
-                        .filter(|l| !l.is_empty())
-                        .map(String::from)
-                        .collect(),
-                    file: None,
+        for l in &tail.log {
+            let block = match &l.what {
+                What::Said { text, turn } => match result.filter(|(n, _)| *turn == Some(*n)) {
+                    Some((n, r)) => {
+                        result_shown = true;
+                        as_result(*n, r)
+                    }
+                    None => Block::said(text.split(" ↵ ").map(String::from).collect(), None),
                 },
+                What::Tool { name, detail } => Block::Tools(vec![tool_call(name, detail, &cwd)]),
+                What::Turn(n) => Block::Turn(format!(
+                    "── turn {n}, {} ago",
+                    age(now.saturating_sub(l.at))
+                )),
             };
-            said.push((s.at, message));
+            blocks.push((l.at, block));
         }
         if let Some((turn, r)) = result.filter(|_| !result_shown) {
             let at = match tail.ended_ms {
                 0 => t.updated_ms,
                 at => at,
             };
-            said.push((at, as_result(*turn, r, at)));
+            blocks.push((at, as_result(*turn, r)));
         }
-        said[given..].sort_by_key(|(at, _)| *at);
-        let mut said: Vec<Message> = said.into_iter().map(|(_, m)| m).collect();
+        blocks[given..].sort_by_key(|(at, _)| *at);
+        // Tool calls in a row go together.
+        let mut merged: Vec<Block> = Vec::new();
+        for (_, b) in blocks {
+            match (merged.last_mut(), b) {
+                (Some(Block::Tools(rows)), Block::Tools(more)) => rows.extend(more),
+                (_, b) => merged.push(b),
+            }
+        }
+        let mut blocks = merged;
         if size.is_none() {
-            let extra = (said.len() - given).saturating_sub(PLAIN_MESSAGES);
-            said.drain(given..given + extra);
+            // The latest messages, with the tool calls and turns between them.
+            let said: Vec<usize> = (given..blocks.len())
+                .filter(|&i| matches!(blocks[i], Block::Text { .. }))
+                .collect();
+            if said.len() > PLAIN_MESSAGES {
+                blocks.drain(given..said[said.len() - PLAIN_MESSAGES]);
+            }
         }
         let mut lines = head;
         match size {
             None => {
-                lines.push(vec![]);
-                for m in said {
-                    let text: Vec<String> = m.plain().iter().map(|l| clean(l)).collect();
-                    lines.extend(m.rows(text, false));
+                for b in &blocks {
+                    if !matches!(b, Block::Tools(_)) {
+                        lines.push(vec![]);
+                    }
+                    lines.extend(b.rows(None, &cwd));
                 }
             }
             Some((width, height)) => {
                 let room = height.saturating_sub(lines.len());
-                let rows = transcript(said, width, room);
+                let rows = transcript(&blocks, width, room, &cwd);
                 // A blank line under the head when all fits with it.
                 if rows.len() < room {
                     lines.push(vec![]);
@@ -780,12 +794,12 @@ fn left_out(count: &str, file: Option<&Path>, width: usize) -> Vec<Vec<Seg>> {
     if columns(&one) < width {
         return vec![vec![(one, DIM)]];
     }
-    let pieces = chop(&path, width.saturating_sub(LABEL + 1));
+    let pieces = chop(&path, width.saturating_sub(GUTTER + 1));
     std::iter::once(vec![(format!("{count}; all in:"), DIM)])
         .chain(
             pieces
                 .into_iter()
-                .map(|p| vec![(format!("{:LABEL$}{p}", ""), DIM)]),
+                .map(|p| vec![(format!("{:GUTTER$}{p}", ""), DIM)]),
         )
         .collect()
 }
@@ -807,83 +821,147 @@ fn chop(text: &str, room: usize) -> Vec<String> {
     out
 }
 
-/// What a task was given, or a message of its agent, for its view.
-struct Message {
-    /// When it was said, or `task` for the task text.
-    label: String,
-    lines: Vec<String>,
-    /// Where all of it is, when its lines are not.
-    file: Option<PathBuf>,
+/// A piece of a task's view, set apart from the one before by a blank line, except tool calls,
+/// which go under what was said before them. Each of its rows with text starts with a gutter.
+enum Block {
+    /// Markdown: the task text or a message, after its mark, and the file all of it is in.
+    Text {
+        mark: (&'static str, &'static str),
+        lines: Vec<String>,
+        file: Option<PathBuf>,
+    },
+    /// Tool calls in a row, a row each: the tool and what it was called on.
+    Tools(Vec<(String, String)>),
+    /// The start of a turn after the first.
+    Turn(String),
 }
 
-impl Message {
-    /// Its lines broken to fit a window `width` wide: the label before the first, the others
-    /// under the first's text.
-    fn wrapped(&self, width: usize) -> Vec<String> {
-        // The label's columns, and the last column stays empty.
-        let room = width.saturating_sub(LABEL + 1);
-        self.plain()
-            .iter()
-            .flat_map(|l| wrap(&clean(l), room))
-            .collect()
+impl Block {
+    fn task(lines: Vec<String>, file: Option<PathBuf>) -> Block {
+        Block::Text {
+            mark: TASK_MARK,
+            lines,
+            file,
+        }
     }
 
-    /// Its lines without markdown's bold marks, taken out of all of them at once: code may
-    /// run over several lines.
-    fn plain(&self) -> Vec<String> {
-        unbold(&self.lines.join("\n"))
-            .split('\n')
-            .map(String::from)
-            .collect()
+    fn said(lines: Vec<String>, file: Option<PathBuf>) -> Block {
+        Block::Text {
+            mark: SAID_MARK,
+            lines,
+            file,
+        }
     }
 
-    /// The lines as rows. `cut` marks the first as following lines left out above it, in the
-    /// label's columns, which the text does not use.
-    fn rows(&self, text: Vec<String>, cut: bool) -> Vec<Vec<Seg>> {
-        let mark = if cut { "…" } else { " " };
-        text.into_iter()
-            .enumerate()
-            .map(|(i, line)| match i {
-                0 => vec![
-                    (format!("{:>w$}{mark} ", self.label, w = LABEL - 2), DIM),
-                    (line, ""),
-                ],
-                _ => vec![(format!("{:LABEL$}{line}", ""), "")],
-            })
-            .collect()
+    /// Its rows, broken to fit a window `width` wide, or unbroken without it. Links to files in
+    /// `cwd` show their paths from there.
+    fn rows(&self, width: Option<usize>, cwd: &str) -> Vec<Vec<Seg>> {
+        match self {
+            Block::Text { mark, lines, .. } => {
+                // The gutter's columns, and the last column stays empty.
+                let room = width.map(|w| w.saturating_sub(GUTTER + 1));
+                let mut rows = markdown::render(lines, room, cwd);
+                if rows.is_empty() {
+                    rows.push(Vec::new());
+                }
+                for (i, row) in rows.iter_mut().enumerate() {
+                    match i {
+                        0 => row.insert(0, (mark.0.to_string(), mark.1)),
+                        _ if !row.is_empty() => row.insert(0, (" ".repeat(GUTTER), "")),
+                        _ => {}
+                    }
+                }
+                rows
+            }
+            // One row each, cut to the window when painted.
+            Block::Tools(calls) => calls
+                .iter()
+                .enumerate()
+                .map(|(i, (name, detail))| {
+                    let gutter = if i == 0 { "  └ " } else { "    " };
+                    let mut row = vec![(gutter.to_string(), DIM), (name.clone(), "")];
+                    if !detail.is_empty() {
+                        row.push((format!(" {detail}"), DIM));
+                    }
+                    row
+                })
+                .collect(),
+            Block::Turn(text) => vec![vec![(text.clone(), DIM)]],
+        }
+    }
+
+    fn file(&self) -> Option<&Path> {
+        match self {
+            Block::Text { file, .. } => file.as_deref(),
+            _ => None,
+        }
     }
 }
 
-/// Messages in `room` lines of a window `width` wide, the latest last: whole while they fit,
-/// then the end of the one before. When the latest alone does not fit, its start, and how much
-/// more there is and where.
-fn transcript(said: Vec<Message>, width: usize, room: usize) -> Vec<Vec<Seg>> {
+/// A tool call as its row shows it: what the tool does, as a verb where agents name the same
+/// tool differently, and what it was called on, without the shell it was run in and with paths
+/// in the task's directory from there.
+fn tool_call(name: &str, detail: &str, cwd: &str) -> (String, String) {
+    let verb = match name.to_ascii_lowercase().as_str() {
+        "bash" | "shell" | "execute" => "Run",
+        "read" => "Read",
+        "edit" | "multiedit" => "Edit",
+        "write" => "Write",
+        "grep" | "glob" | "search" => "Search",
+        "webfetch" | "fetch" => "Fetch",
+        _ => name,
+    };
+    let mut detail = one_line(&unshelled(detail));
+    for sep in ['\\', '/'] {
+        detail = detail.replace(&format!("{cwd}{sep}"), "");
+    }
+    (verb.to_string(), detail)
+}
+
+/// Blocks in `room` lines of a window `width` wide, the latest last: whole while they fit, then
+/// the end of the one before. When the latest alone does not fit, its start, and how much more
+/// there is and where.
+fn transcript(blocks: &[Block], width: usize, room: usize, cwd: &str) -> Vec<Vec<Seg>> {
     let mut shown: Vec<Vec<Vec<Seg>>> = Vec::new();
     let mut left = room;
-    for (k, m) in said.iter().rev().enumerate() {
-        let text = m.wrapped(width);
-        if text.len() <= left {
-            left -= text.len();
-            shown.push(m.rows(text, false));
+    for (i, b) in blocks.iter().enumerate().rev() {
+        let mut rows = b.rows(Some(width), cwd);
+        let whole = rows.len();
+        // A blank line between it and the one after it, unless that is tool calls.
+        let next = blocks.get(i + 1);
+        let gap = usize::from(next.is_some_and(|n| !matches!(n, Block::Tools(_))));
+        if gap > 0 {
+            rows.push(Vec::new());
+        }
+        if rows.len() <= left {
+            left -= rows.len();
+            shown.push(rows);
             continue;
         }
-        if k == 0 {
-            // How much is left out, and where all of it is, before any of it: with none of it
-            // shown, the count also tells when it was said.
+        if next.is_none() {
+            // How much is left out, and where all of it is, before any of it.
             let lead = |keep: usize| match keep {
-                0 => format!("{:>w$}  {} line(s)", m.label, text.len(), w = LABEL - 2),
-                _ => format!("{:LABEL$}…{} more line(s)", "", text.len() - keep),
+                0 => format!("{:GUTTER$}{whole} line(s)", ""),
+                _ => format!("{:GUTTER$}…{} more line(s)", "", whole - keep),
             };
-            let file = m.file.as_deref();
+            let file = b.file();
             let keep = left.saturating_sub(left_out(&lead(1), file, width).len());
             let note = left_out(&lead(keep), file, width);
-            let mut rows = m.rows(text[..keep].to_vec(), false);
+            rows.truncate(keep);
             rows.extend(note);
             rows.truncate(left);
             shown.push(rows);
-        } else if left > 0 {
-            let from = text.len() - left;
-            shown.push(m.rows(text.into_iter().skip(from).collect(), true));
+        } else if left > gap {
+            // Its end, the first row marked as following rows left out above it.
+            let mut rows = rows.split_off(rows.len() - left);
+            match rows[0].first_mut() {
+                Some(gutter) => {
+                    let w = columns(&gutter.0);
+                    *gutter = (format!("{:w$}", "…"), DIM);
+                }
+                None => rows[0].push(("…".into(), DIM)),
+            }
+            shown.push(rows);
         }
         break;
     }
@@ -907,12 +985,18 @@ fn hinted(title: Vec<Seg>, hint: &str, width: Option<usize>) -> Vec<Seg> {
     out
 }
 
-/// The lines painted, and no more than the window holds.
+/// The lines painted, and no more than the window holds; without a window, without the spaces
+/// they end in.
 fn finish(lines: &[Vec<Seg>], size: Option<(usize, usize)>) -> Vec<String> {
     let width = size.map(|(w, _)| w);
     let mut out: Vec<String> = lines.iter().map(|l| paint(l, width)).collect();
-    if let Some((_, height)) = size {
-        out.truncate(height);
+    match size {
+        Some((_, height)) => out.truncate(height),
+        None => {
+            for line in &mut out {
+                line.truncate(line.trim_end().len());
+            }
+        }
     }
     out
 }
@@ -1098,8 +1182,9 @@ fn waits(t: &Task, tail: &Tail) -> bool {
         || !t.status.is_final() && t.open_questions().next().is_some()
 }
 
-/// What a task last said, for its line: its latest message, or a question it asks since. A
-/// task whose messages are no longer in its events has the first line of its latest result.
+/// What a task last said, for its line, on one line: its latest message, or a question it asks
+/// since. A task whose messages are no longer in its events has the first line of its latest
+/// result.
 fn words(t: &Task, tail: &Tail) -> Option<String> {
     let asked = match t.status.is_final() {
         true => None,
@@ -1111,7 +1196,47 @@ fn words(t: &Task, tail: &Tail) -> Option<String> {
         (Some((said, _)), None) => said.clone(),
         (None, None) => tail.result.as_ref()?.1.lines.first()?.clone(),
     };
-    Some(unbold(&one_line(&text)))
+    Some(one_line(&text))
+}
+
+/// A command without the shell its agent ran it in, as Codex reports one:
+/// `"C:\…\pwsh.exe" -NoProfile -Command 'git status'` is `git status`. A command cut short
+/// keeps what it has.
+fn unshelled(command: &str) -> String {
+    let whole = command.trim();
+    let (shell, mut rest) = match whole.strip_prefix('"') {
+        Some(quoted) => match quoted.split_once('"') {
+            Some(split) => split,
+            None => return whole.into(),
+        },
+        None => whole.split_once(' ').unwrap_or((whole, "")),
+    };
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    let name = name.to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    if !["pwsh", "powershell", "bash", "sh", "zsh", "cmd"].contains(&name) {
+        return whole.into();
+    }
+    // Its options, up to the one the command follows.
+    loop {
+        let (option, after) = rest.trim_start().split_once(' ').unwrap_or((rest, ""));
+        rest = after.trim_start();
+        let option = option.to_ascii_lowercase();
+        if ["-command", "-c", "-lc", "/c"].contains(&option.as_str()) {
+            break;
+        }
+        if rest.is_empty() || !option.starts_with(['-', '/']) {
+            return whole.into();
+        }
+    }
+    // The command without the quotes around it, and what they escaped.
+    for (quote, escaped) in [('\'', "''"), ('"', "\\\"")] {
+        if let Some(inner) = rest.strip_prefix(quote) {
+            let inner = inner.strip_suffix(quote).unwrap_or(inner);
+            return inner.replace(escaped, &quote.to_string());
+        }
+    }
+    rest.into()
 }
 
 /// Text on one line: its lines and runs of spaces joined by single spaces.
@@ -1164,7 +1289,7 @@ fn caller_label(caller: &str, session_chars: usize) -> String {
     }
 }
 
-/// The lines with text of a task text or a result.
+/// The lines of a task text or a result, from the first with text to the last.
 struct Text {
     lines: Vec<String>,
     /// The file's size when read.
@@ -1173,7 +1298,7 @@ struct Text {
     whole: bool,
 }
 
-/// A file's lines with text, or `None` without the file.
+/// A file's lines, or `None` without the file.
 fn read_text(path: &Path) -> Option<Text> {
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -1182,11 +1307,18 @@ fn read_text(path: &Path) -> Option<Text> {
         .take(READ_BYTES)
         .read_to_end(&mut bytes)
         .ok()?;
-    let lines = String::from_utf8_lossy(&bytes)
+    let mut lines: Vec<String> = String::from_utf8_lossy(&bytes)
         .lines()
-        .filter(|l| !l.trim().is_empty())
         .map(|l| l.trim_end().to_string())
         .collect();
+    let first = lines
+        .iter()
+        .position(|l| !l.is_empty())
+        .unwrap_or(lines.len());
+    lines.drain(..first);
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
     Some(Text {
         lines,
         len,
@@ -1205,132 +1337,59 @@ impl Text {
     }
 }
 
-/// A line broken into pieces of up to `room` columns, where `break_at` finds a place.
-fn wrap(line: &str, room: usize) -> Vec<String> {
+/// Where a line of `chars` is broken into pieces of up to `room` columns: the range of each
+/// piece. The spaces where it breaks are left out.
+fn breaks(chars: &[char], room: usize) -> Vec<Range<usize>> {
     let room = room.max(2);
     let mut out = Vec::new();
-    let mut piece = String::new();
+    let mut start = 0;
     let mut used = 0;
-    for c in line.chars() {
+    for (i, &c) in chars.iter().enumerate() {
         let w = char_columns(c);
         if used + w > room {
             if c == ' ' {
-                out.push(std::mem::take(&mut piece));
+                out.push(start..i);
+                start = i + 1;
                 used = 0;
                 continue;
             }
-            match break_at(&piece, c) {
-                Some(i) => {
-                    let rest = piece.split_off(i);
-                    out.push(piece.trim_end().to_string());
-                    piece = rest;
+            match break_at(&chars[start..i], c) {
+                Some(k) => {
+                    let mut end = start + k;
+                    while end > start && chars[end - 1] == ' ' {
+                        end -= 1;
+                    }
+                    out.push(start..end);
+                    start += k;
                 }
-                None => out.push(std::mem::take(&mut piece)),
+                None => {
+                    out.push(start..i);
+                    start = i;
+                }
             }
-            used = columns(&piece);
+            used = chars[start..i].iter().map(|c| char_columns(*c)).sum();
         }
-        piece.push(c);
         used += w;
     }
-    out.push(piece);
+    out.push(start..chars.len());
     out
 }
 
 /// The latest place in `piece` where a line may end, with `next` to follow: after a space, or
 /// next to a wide character, as between Chinese characters, though not before closing
 /// punctuation nor after opening punctuation.
-fn break_at(piece: &str, next: char) -> Option<usize> {
+fn break_at(piece: &[char], next: char) -> Option<usize> {
     let mut after = next;
-    for (i, before) in piece.char_indices().rev() {
-        let at = i + before.len_utf8();
+    for (i, &before) in piece.iter().enumerate().rev() {
         let wide = char_columns(before) == 2 || char_columns(after) == 2;
         let held =
             "，。、；：？！）」』】》,.;:?!)".contains(after) || "（「『【《(".contains(before);
         if before == ' ' || wide && !held {
-            return Some(at);
+            return Some(i + 1);
         }
         after = before;
     }
     None
-}
-
-/// Text without markdown's bold marks, outside fenced code blocks: a block opens on a line
-/// that starts with three or more backticks or tildes, and closes on a line of no fewer of the
-/// same and nothing else.
-fn unbold(text: &str) -> String {
-    let mut fence: Option<(char, usize)> = None;
-    // A code span may go on over lines.
-    let mut code = 0;
-    let lines: Vec<String> = text
-        .split('\n')
-        .map(|line| {
-            let t = line.trim();
-            let marker = ['`', '~']
-                .into_iter()
-                .map(|c| (c, t.chars().take_while(|x| *x == c).count()))
-                .find(|(_, n)| *n >= 3);
-            match (fence, marker) {
-                (None, Some(m)) => {
-                    fence = Some(m);
-                    code = 0;
-                }
-                (Some((c, n)), Some((m, k))) if m == c && k >= n && t.chars().all(|x| x == c) => {
-                    fence = None
-                }
-                (Some(_), _) => {}
-                (None, None) => return unbold_line(line, &mut code),
-            }
-            line.to_string()
-        })
-        .collect();
-    lines.join("\n")
-}
-
-/// A line without markdown's bold marks: `**` pairs around text, outside code spans, and not
-/// part of a path, a glob or an expression such as `src/**/*.rs` or `2**10`. A code span is
-/// between runs of as many backticks; `code` is the run that opened the span the line starts
-/// in, 0 outside one, and what it ends in.
-fn unbold_line(line: &str, code: &mut usize) -> String {
-    let chars: Vec<char> = line.chars().collect();
-    // Outside the marks: not a letter, digit or what joins a path or expression.
-    let outside =
-        |c: Option<&char>| c.is_none_or(|c| !c.is_ascii_alphanumeric() && !"/*\\_".contains(*c));
-    // Inside the marks: text.
-    let inside = |c: Option<&char>| c.is_some_and(|c| !c.is_whitespace() && !"*/".contains(*c));
-    let mut marks = Vec::new();
-    let mut open = None;
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == '`' {
-            let run = chars[i..].iter().take_while(|c| **c == '`').count();
-            *code = match *code {
-                0 => run,
-                n if n == run => 0,
-                n => n,
-            };
-            i += run;
-            continue;
-        } else if *code == 0 && chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
-            let (before, after) = (i.checked_sub(1).map(|j| &chars[j]), chars.get(i + 2));
-            match open {
-                Some(at) if inside(before) && outside(after) => {
-                    marks.extend([at, i]);
-                    open = None;
-                }
-                _ if outside(before) && inside(after) => open = Some(i),
-                _ => {}
-            }
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-    chars
-        .iter()
-        .enumerate()
-        .filter(|(j, _)| !marks.iter().any(|m| (*m..m + 2).contains(j)))
-        .map(|(_, c)| c)
-        .collect()
 }
 
 /// What a task's files tell beyond its `task.json`.
@@ -1344,8 +1403,8 @@ struct Tail {
     tool_calls: u64,
     /// The agent's latest message in any turn.
     words: Option<(String, u64)>,
-    /// The agent's latest messages, oldest first.
-    log: VecDeque<Said>,
+    /// What the agent said and did lately, oldest first.
+    log: VecDeque<Logged>,
     /// Approval requests of the current turn without a decision, with their summaries.
     approvals: Vec<(String, String)>,
     /// How the last turn or the task ended badly: a label and the text.
@@ -1394,19 +1453,28 @@ impl Tail {
     /// Follows the daemon's own account of turns in `Daemon::emit`.
     fn absorb(&mut self, e: &Event) {
         let text = |k: &str| e.data.get(k).and_then(Value::as_str).unwrap_or("");
+        let turn = || e.data.get("turn").and_then(Value::as_u64).map(|n| n as u32);
         match e.kind.as_str() {
             "turn_started" => {
                 self.start(e.ts);
                 self.approvals.clear();
                 self.stop = None;
+                match turn() {
+                    Some(n) if n > 1 => self.log(e.ts, What::Turn(n)),
+                    _ => {}
+                }
             }
             "turn_ended" => {
                 self.in_turn = false;
                 self.ended_ms = e.ts;
                 // Its last message, if said in it, is its result.
                 let since = self.started_ms;
-                if let Some(last) = self.log.back_mut().filter(|s| s.at >= since) {
-                    last.turn = e.data.get("turn").and_then(Value::as_u64).map(|n| n as u32);
+                let last = self.log.iter_mut().rev().take_while(|l| l.at >= since);
+                if let Some(What::Said { turn: of, .. }) = last
+                    .map(|l| &mut l.what)
+                    .find(|w| matches!(w, What::Said { .. }))
+                {
+                    *of = turn();
                 }
                 if e.data.get("ok") == Some(&Value::Bool(false)) {
                     self.stop = Some(("error", text("error").into()));
@@ -1419,20 +1487,16 @@ impl Tail {
                     self.start(e.ts);
                 }
                 self.words = Some((text("text").into(), e.ts));
-                if self.log.len() == MESSAGES {
-                    self.log.pop_front();
-                }
-                self.log.push_back(Said {
-                    at: e.ts,
-                    text: text("text").into(),
-                    turn: None,
-                });
+                let text = text("text").into();
+                self.log(e.ts, What::Said { text, turn: None });
             }
             "tool" => {
                 if !self.in_turn {
                     self.start(e.ts);
                 }
                 self.tool_calls += 1;
+                let (name, detail) = (text("name").into(), text("detail").into());
+                self.log(e.ts, What::Tool { name, detail });
             }
             "approval_request" => self
                 .approvals
@@ -1451,15 +1515,29 @@ impl Tail {
         self.started_ms = at;
         self.tool_calls = 0;
     }
+
+    fn log(&mut self, at: u64, what: What) {
+        if self.log.len() == LOGGED {
+            self.log.pop_front();
+        }
+        self.log.push_back(Logged { at, what });
+    }
 }
 
-/// A message of a task's agent.
-struct Said {
+/// What a task's agent said or did, or a turn it began, as its events tell.
+struct Logged {
     at: u64,
-    /// As the daemon recorded it: lines joined by ` ↵ `, and cut when long.
-    text: String,
-    /// The turn it ended, for the last message of a turn: its result.
-    turn: Option<u32>,
+    what: What,
+}
+
+enum What {
+    /// A message, as the daemon recorded it: lines joined by ` ↵ `, and cut when long. `turn`
+    /// is the turn it ended, for the last message of a turn: its result.
+    Said { text: String, turn: Option<u32> },
+    /// A tool call: the tool's name, and what it was called on as the agent's adapter tells it.
+    Tool { name: String, detail: String },
+    /// The start of a turn after the first.
+    Turn(u32),
 }
 
 /// One line from its pieces. Given a width, it is cut to fit and colored, and a line whose
@@ -1571,6 +1649,9 @@ mod tests {
     use std::path::PathBuf;
 
     const NOW: u64 = 100_000_000;
+    /// A command as Codex reports it on Windows.
+    const PWSH: &str = "\"C:\\\\Program Files\\\\PowerShell\\\\7\\\\pwsh.exe\" -NoProfile -Command \
+                        'git status  --short; echo ''done'''";
     const HOUR: u64 = 60 * 60 * 1000;
 
     struct Home(PathBuf);
@@ -1824,7 +1905,7 @@ mod tests {
             "claude:s1",
             "idle",
             NOW - 600_000,
-            json!({"name": "review"}),
+            json!({"name": "review", "cwd": "/w"}),
         );
         t1.turns = 2;
         store
@@ -1864,7 +1945,14 @@ mod tests {
                 30_000,
                 "t1",
                 "tool",
-                json!({"name": "Read", "detail": "src/reader.rs"}),
+                json!({"name": "Read", "detail": "/w/src/reader.rs"}),
+            ),
+            event(
+                3,
+                30_000,
+                "t1",
+                "tool",
+                json!({"name": "shell", "detail": PWSH}),
             ),
             // The daemon keeps a message on one line, and cut when long.
             event(
@@ -1895,8 +1983,10 @@ mod tests {
             "2 tasks are named tests; give one of their IDs: t2, t3"
         );
 
-        // A title, then what it was given and what its agent said, without its tool calls
-        // or its sub-tasks'; a turn's last message whole from its result.
+        // A title, then what it was given and what its agent said and did, without its
+        // sub-tasks': a turn's last message whole from its result, and its tool calls under
+        // what was said before them, a command without its shell and a path from the task's
+        // directory.
         let frame = view.task_frame("t1", NOW, None, false);
         let text = frame.join("\n");
         assert_eq!(
@@ -1904,26 +1994,34 @@ mod tests {
             [
                 "review  t1 codex/work  idle  2 turn(s), last change 10m00s ago",
                 "",
-                "  task  Review the parser.",
-                "        Report findings.",
-                "   40s  Checking the reader.",
-                "   20s  No bugs.",
-                "        - checked the reader",
-                "        - and the writer",
+                "› Review the parser.",
+                "  Report findings.",
+                "",
+                "── turn 2, 50s ago",
+                "",
+                "• Checking the reader.",
+                "  └ Read src/reader.rs",
+                "    Run git status --short; echo 'done'",
+                "",
+                "• No bugs.",
+                "",
+                "  • checked the reader",
+                "  • and the writer",
             ],
             "{text}"
         );
         // With keys, how to go back.
         assert!(view.task_frame("t1", NOW, None, true)[0].ends_with(" ago  Esc back"));
 
-        // Fitted to the window, the latest messages whole, and the end of the one before.
+        // Fitted to the window, the latest messages whole, and the end of what came before,
+        // marked as following what is left out.
         let fitted: Vec<String> = view
-            .task_frame("t1", NOW, Some((60, 6)), false)
+            .task_frame("t1", NOW, Some((60, 7)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
-        assert_eq!(fitted[2..], frame[4..], "{fitted:#?}");
-        assert_eq!(fitted[1], "  task… Report findings.");
+        assert_eq!(fitted[2..], frame[10..], "{fitted:#?}");
+        assert_eq!(fitted[1], "…   Run git status --short; echo 'done'");
         // With room for all, a blank line under the title.
         let roomy = view.task_frame("t1", NOW, Some((60, 20)), false);
         assert_eq!(roomy.len(), frame.len(), "{roomy:#?}");
@@ -1933,9 +2031,9 @@ mod tests {
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
-        // With no room for both, where all of it is before any of it, with when it was said.
+        // With no room for both, where all of it is before any of it.
         let path = store.turn_path("t1", 2).display().to_string();
-        assert_eq!(short[1], "   20s  3 line(s); all in:", "{short:#?}");
+        assert_eq!(short[1], "  4 line(s); all in:", "{short:#?}");
         assert!(path.starts_with(short[2].trim_start()), "{short:#?}");
         assert!(short.iter().all(|l| columns(l) <= 59), "{short:#?}");
 
@@ -2094,7 +2192,10 @@ mod tests {
             .tail("t1")
             .log
             .iter()
-            .map(|s| (s.text.as_str(), s.turn))
+            .filter_map(|l| match &l.what {
+                What::Said { text, turn } => Some((text.as_str(), *turn)),
+                _ => None,
+            })
             .collect();
         assert_eq!(
             turns,
@@ -2451,8 +2552,7 @@ mod tests {
         // Without a window, all of it.
         let plain = view.task_frame("t1", NOW, None, false).join("\n");
         assert!(
-            plain.contains(&format!("\n  task  {long}\n        line 1\n"))
-                && plain.ends_with("\n        line 30"),
+            plain.contains(&format!("\n› {long}\n  line 1\n")) && plain.ends_with("\n  line 30"),
             "{plain}"
         );
 
@@ -2464,20 +2564,20 @@ mod tests {
             .collect();
         let text = frame.join("\n");
         assert_eq!(frame.len(), 8, "{text}");
-        assert_eq!(frame[1], format!("  task  {}word", "word ".repeat(5)));
-        assert!(frame[2].starts_with("        word "), "{text}");
+        assert_eq!(frame[1], format!("› {}word", "word ".repeat(6)));
+        assert!(frame[2].starts_with("  word "), "{text}");
         // The path whole, on lines of its own when it does not fit after the count.
         let path = store.prompt_path("t1").display().to_string();
-        let pieces = path.chars().count().div_ceil(31);
+        let pieces = path.chars().count().div_ceil(37);
         let note = frame.len() - 1 - pieces;
         assert_eq!(
             frame[note],
-            format!("        …{} more line(s); all in:", 34 - (note - 1)),
+            format!("  …{} more line(s); all in:", 33 - (note - 1)),
             "{text}"
         );
         let shown: String = frame[note + 1..]
             .iter()
-            .map(|l| l.strip_prefix("        ").unwrap())
+            .map(|l| l.strip_prefix("  ").unwrap())
             .collect();
         assert_eq!(shown, path, "{text}");
         assert!(frame.iter().all(|l| columns(l) <= 39), "{text}");
@@ -2527,20 +2627,23 @@ mod tests {
         }
         let mut view = View::new(&h.0, false);
         view.refresh();
-        // Its lines as the agent wrote them, without markdown's bold marks; what waits for
+        // Its lines as the agent wrote them, markdown's marks shown as styles; what waits for
         // someone under the title, in its state's color.
-        let frame = view.task_frame("t1", NOW, Some((60, 9)), false);
+        let frame = view.task_frame("t1", NOW, Some((60, 11)), false);
         let plain: Vec<String> = frame.iter().map(|l| strip_sgr(l)).collect();
         assert_eq!(
             plain[1..],
             [
                 " needs  approval r1: push",
+                "› Fix the parser.",
                 "",
-                "  task  Fix the parser.",
-                "   50s  Reading.",
-                "        Then fixing.",
-                "   30s  Fixed the reader.",
-                "   10s  Done: all tests pass.",
+                "• Reading.",
+                "  Then fixing.",
+                "  └ Read",
+                "",
+                "• Fixed the reader.",
+                "",
+                "• Done: all tests pass.",
             ],
             "{plain:#?}"
         );
@@ -2548,58 +2651,29 @@ mod tests {
             frame[1].starts_with("\x1b[33m needs  \x1b[0m"),
             "{frame:#?}"
         );
+        assert_eq!(frame[5], "  Then \x1b[1mfixing\x1b[0m.");
         assert_eq!(
             cells(&view.frame(NOW, None, None), "t1"),
             ["t1", "approval", "Done: all tests pass."]
         );
-        // On a short window, the latest whole, and the end of the one before.
+        // On a short window, the latest whole, and the end of what came before.
         let short: Vec<String> = view
-            .task_frame("t1", NOW, Some((60, 5)), false)
+            .task_frame("t1", NOW, Some((60, 8)), false)
             .iter()
             .map(|l| strip_sgr(l))
             .collect();
         assert_eq!(
             short[2..],
             [
-                "   50s… Then fixing.",
-                "   30s  Fixed the reader.",
-                "   10s  Done: all tests pass.",
+                "… Then fixing.",
+                "  └ Read",
+                "",
+                "• Fixed the reader.",
+                "",
+                "• Done: all tests pass.",
             ],
             "{short:#?}"
         );
-
-        // Bold marks go; a path, a glob, an expression or code keeps its stars.
-        for (line, plain) in [
-            ("**Done**: all", "Done: all"),
-            ("里加了**断言**，然后", "里加了断言，然后"),
-            ("**`code`** here", "`code` here"),
-            (
-                "src/**/*.rs and tests/**/*.rs",
-                "src/**/*.rs and tests/**/*.rs",
-            ),
-            ("2**10 and 3**2", "2**10 and 3**2"),
-            ("a ** b ** c", "a ** b ** c"),
-            ("`**x**` stays", "`**x**` stays"),
-            ("``a **b** c`` and **d**", "``a **b** c`` and d"),
-            (
-                "```\nprint(\"**hi**\")\n```\n**done**",
-                "```\nprint(\"**hi**\")\n```\ndone",
-            ),
-            // A block ends only on a line of its own fence.
-            (
-                "```rust\nlet s = \"```\";\nprint(\"**hi**\")\n```\n**done**",
-                "```rust\nlet s = \"```\";\nprint(\"**hi**\")\n```\ndone",
-            ),
-            ("~~~\n**x**\n~~~\n**y**", "~~~\n**x**\n~~~\ny"),
-            // A code span over lines.
-            (
-                "`first\n**literal**\nlast` and **x**",
-                "`first\n**literal**\nlast` and x",
-            ),
-            ("````\n```\n**x**\n````\n**y**", "````\n```\n**x**\n````\ny"),
-        ] {
-            assert_eq!(unbold(line), plain);
-        }
 
         // A turn that ended with nothing to say keeps what was said in it.
         store.save_turn("t1", 1, "").unwrap();
@@ -2617,7 +2691,7 @@ mod tests {
             .unwrap();
         view.refresh();
         let ended = view.task_frame("t1", NOW, None, false).join("\n");
-        assert!(ended.ends_with("   10s  Done: all tests pass."), "{ended}");
+        assert!(ended.ends_with("\n• Done: all tests pass."), "{ended}");
         assert!(ended.contains("\n error  max turns\n"), "{ended}");
     }
 
@@ -2636,9 +2710,10 @@ mod tests {
             view.task_frame("t1", NOW, None, false)[1..],
             [
                 "",
-                "  task  not recorded: spawned before axiopera kept it",
-                " 1m00s  All done.",
-                "        No bugs.",
+                "› not recorded: spawned before axiopera kept it",
+                "",
+                "• All done.",
+                "  No bugs.",
             ]
         );
     }
@@ -2673,7 +2748,7 @@ mod tests {
         // Without a task text kept or anything said, it says so.
         let frame = view.task_frame("t1", NOW, None, false).join("\n");
         assert!(
-            frame.ends_with("\n\n  task  not recorded: spawned before axiopera kept it"),
+            frame.ends_with("\n\n› not recorded: spawned before axiopera kept it"),
             "{frame}"
         );
     }
@@ -2800,6 +2875,63 @@ mod tests {
         let shown = plain(&mut ui, &view);
         assert!(!shown[0].contains("choose"), "{shown:#?}");
         assert!(!shown.iter().any(|l| columns(l) == 79), "{shown:#?}");
+    }
+
+    /// A line broken into pieces of up to `room` columns, where `break_at` finds a place.
+    fn wrap(line: &str, room: usize) -> Vec<String> {
+        let chars: Vec<char> = line.chars().collect();
+        breaks(&chars, room)
+            .into_iter()
+            .map(|r| chars[r].iter().collect())
+            .collect()
+    }
+
+    #[test]
+    fn a_command_is_shown_without_its_shell() {
+        for (command, shown) in [
+            (PWSH, "git status  --short; echo 'done'"),
+            ("bash -lc 'cargo test'", "cargo test"),
+            (r#"/bin/zsh -lc "echo \"hi\"""#, r#"echo "hi""#),
+            ("cmd.exe /c dir", "dir"),
+            // Cut short by the daemon: what it has.
+            (
+                r#""C:\pwsh.exe" -Command 'git log --oneline…(+20 chars)"#,
+                "git log --oneline…(+20 chars)",
+            ),
+            ("cargo test", "cargo test"),
+            ("sh script.sh", "sh script.sh"),
+            ("bash", "bash"),
+        ] {
+            assert_eq!(unshelled(command), shown, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_task_view_without_a_window_keeps_the_latest_messages_and_what_came_between() {
+        let h = home();
+        let store = Store::new(&h.0);
+        store.save_prompt("t1", "Go.").unwrap();
+        store
+            .save(&task("t1", "user", "running", NOW, json!({"turns": 0})))
+            .unwrap();
+        for i in 1..=25 {
+            let at = 100_000 - i * 1_000;
+            let said = json!({"text": format!("m{i}")});
+            store.append(&event(2 * i, at, "t1", "said", said)).unwrap();
+            let tool = json!({"name": "Bash", "detail": format!("c{i}")});
+            store
+                .append(&event(2 * i + 1, at, "t1", "tool", tool))
+                .unwrap();
+        }
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let text = view.task_frame("t1", NOW, None, false).join("\n");
+        assert!(
+            text.contains("\n\n› Go.\n\n• m6\n  └ Run c6\n\n• m7\n"),
+            "{text}"
+        );
+        assert!(text.ends_with("\n\n• m25\n  └ Run c25"), "{text}");
+        assert!(!text.contains("c5"), "{text}");
     }
 
     #[test]
