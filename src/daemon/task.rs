@@ -1330,7 +1330,8 @@ mod request_tests {
             // SYNCHRONIZE permits checking termination without inspecting the child.
             let handle = OpenProcess(0x00100000, 0, pid);
             if !handle.is_null() {
-                let status = WaitForSingleObject(handle, 0);
+                // TerminateJobObject returns before its processes have exited.
+                let status = WaitForSingleObject(handle, 2000);
                 CloseHandle(handle);
                 assert_eq!(status, 0, "fake peer is still running");
             }
