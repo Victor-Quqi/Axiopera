@@ -312,13 +312,20 @@ struct Ui {
     keys: bool,
     list_top: usize,
     page: usize,
+    detail: Scroll,
 }
 
 impl Ui {
     fn draw(&mut self, view: &View, now: u64, size: (usize, usize)) -> Vec<String> {
         self.page = size.1.saturating_sub(3).max(1);
         if let Some(id) = &self.open {
-            return view.task_frame(id, now, Some(size), self.keys);
+            return view.task_view(
+                id,
+                now,
+                Some(size),
+                self.keys,
+                self.keys.then_some(&mut self.detail),
+            );
         }
         if !self.keys {
             return view.frame(now, Some(size), None);
@@ -341,7 +348,13 @@ impl Ui {
         match (key, &self.open) {
             (Key::Quit, _) | (Key::Q, None) => return false,
             (Key::Back | Key::Q, Some(_)) => self.open = None,
-            (Key::Open, None) => self.open = self.chosen.clone(),
+            (Key::Open, None) => {
+                self.open = self.chosen.clone();
+                self.detail = Scroll::default();
+            }
+            (Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End, Some(_)) => {
+                self.detail.press(key);
+            }
             (Key::Up | Key::Down, None) => {
                 let ids = view.order(now);
                 let at = self
@@ -390,6 +403,65 @@ impl Ui {
             _ => {}
         }
         true
+    }
+}
+
+/// A task follows new output until the reader moves up. Its offset is from the start so
+/// appended output leaves the page in place.
+#[derive(Default)]
+struct Scroll {
+    top: Option<usize>,
+    end: usize,
+    page: usize,
+}
+
+impl Scroll {
+    fn press(&mut self, key: Key) {
+        let at = self.top.unwrap_or(self.end);
+        let step = if matches!(key, Key::PageUp | Key::PageDown) {
+            self.page.max(1)
+        } else {
+            1
+        };
+        self.top = match key {
+            Key::Home => Some(0),
+            Key::End => None,
+            Key::Up | Key::PageUp => Some(at.saturating_sub(step)),
+            Key::Down | Key::PageDown => {
+                let next = at.saturating_add(step);
+                (next < self.end).then_some(next)
+            }
+            _ => self.top,
+        };
+    }
+
+    fn rows(&mut self, rows: Vec<Vec<Seg>>, height: usize) -> Vec<Vec<Seg>> {
+        let total = rows.len();
+        // Leave one line for position and navigation; a one-line body still shows content.
+        let footer = height > 1;
+        let room = height.saturating_sub(usize::from(footer));
+        self.page = room.max(1);
+        self.end = total.saturating_sub(room);
+        if let Some(top) = &mut self.top {
+            *top = (*top).min(self.end);
+        }
+        let top = self.top.unwrap_or(self.end);
+        let mut shown: Vec<_> = rows.into_iter().skip(top).take(room).collect();
+        if footer {
+            // Keep the footer at the bottom even when the conversation is short.
+            shown.resize(room, Vec::new());
+            let mode = if self.top.is_none() { "live" } else { "paused" };
+            shown.push(vec![(
+                format!(
+                    "  {}–{}/{} {mode}  ↑↓ scroll  PgUp/PgDn page  Home/End",
+                    (top + 1).min(total),
+                    (top + room).min(total),
+                    total
+                ),
+                DIM,
+            )]);
+        }
+        shown
     }
 }
 
@@ -800,6 +872,17 @@ impl View {
         size: Option<(usize, usize)>,
         keys: bool,
     ) -> Vec<String> {
+        self.task_view(id, now, size, keys, None)
+    }
+
+    fn task_view(
+        &self,
+        id: &str,
+        now: u64,
+        size: Option<(usize, usize)>,
+        keys: bool,
+        scroll: Option<&mut Scroll>,
+    ) -> Vec<String> {
         // The way back is told however narrow the window: the title gives way to it.
         let width = size.map(|(w, _)| w);
         let back = |title: Vec<Seg>| match keys {
@@ -832,6 +915,7 @@ impl View {
         // Approvals and questions may be more than the window holds: as many as fit, and how
         // many more there are.
         if let Some((_, height)) = size
+            && scroll.is_none()
             && waiting.len() > height.saturating_sub(head.len())
         {
             let kept = height.saturating_sub(head.len() + 1);
@@ -918,6 +1002,17 @@ impl View {
             }
         }
         let mut lines = head;
+        if let (Some((width, height)), Some(scroll)) = (size, scroll) {
+            let mut body = lines.split_off(1);
+            for b in &blocks {
+                if !matches!(b, Block::Tools(_)) {
+                    body.push(vec![]);
+                }
+                body.extend(b.rows(Some(width), &cwd));
+            }
+            lines.extend(scroll.rows(body, height.saturating_sub(1)));
+            return finish(&lines, size);
+        }
         match size {
             None => {
                 for b in &blocks {
@@ -3459,7 +3554,7 @@ mod tests {
         }
         assert_eq!(ui.chosen.as_deref(), Some("tw"));
 
-        // Enter opens it; up and down do nothing there, and Esc goes back to it in the list.
+        // Enter opens it; scrolling keeps it open, and Esc returns to the selected task.
         ui.press(Open, &view, NOW);
         let one = plain(&mut ui, &view);
         assert!(
@@ -3551,6 +3646,131 @@ mod tests {
                 ui.draw(&view, NOW, (80, 5))
                     .iter()
                     .any(|s| s.contains("no tasks"))
+            );
+        }
+    }
+
+    #[test]
+    fn task_pages_pause_on_old_output_and_resume_at_the_end() {
+        let h = home();
+        let store = Store::new(&h.0);
+        let prompt = format!(
+            "```\n{}\n```",
+            (0..40)
+                .map(|i| format!("prompt-{i:02}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        store.save_prompt("t1", &prompt).unwrap();
+        store
+            .save(&task("t1", "user", "running", NOW, json!({"turns": 0})))
+            .unwrap();
+        store
+            .append(&event(
+                1,
+                1000,
+                "t1",
+                "said",
+                json!({"text": "latest before"}),
+            ))
+            .unwrap();
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let mut ui = Ui {
+            open: Some("t1".into()),
+            chosen: Some("t1".into()),
+            keys: true,
+            ..Ui::default()
+        };
+        let draw = |ui: &mut Ui, view: &View| {
+            ui.draw(view, NOW, (80, 8))
+                .iter()
+                .map(|s| strip_sgr(s))
+                .collect::<Vec<_>>()
+        };
+        let live = draw(&mut ui, &view);
+        assert!(live.iter().any(|s| s.contains("latest before")));
+        assert!(live[7].contains("live"));
+
+        ui.press(Key::PageUp, &view, NOW);
+        let paused = draw(&mut ui, &view);
+        assert!(!paused.iter().any(|s| s.contains("latest before")));
+        assert!(paused[7].contains("paused"));
+        store
+            .append(&event(2, 0, "t1", "said", json!({"text": "latest after"})))
+            .unwrap();
+        view.refresh();
+        let refreshed = draw(&mut ui, &view);
+        assert_eq!(paused[1..7], refreshed[1..7]);
+
+        // Every rendered line is reachable, including the middle of a single long message.
+        ui.press(Key::Home, &view, NOW);
+        let mut read = String::new();
+        for _ in 0..10 {
+            read.push_str(&draw(&mut ui, &view).join("\n"));
+            ui.press(Key::PageDown, &view, NOW);
+        }
+        for i in 0..40 {
+            assert!(read.contains(&format!("prompt-{i:02}")), "missing line {i}");
+        }
+        assert!(ui.detail.top.is_none());
+        assert!(
+            draw(&mut ui, &view)
+                .iter()
+                .any(|s| s.contains("latest after"))
+        );
+        ui.press(Key::Home, &view, NOW);
+        for height in [1, 2, 3, 8, 80] {
+            let frame = ui.draw(&view, NOW, (24, height));
+            assert!(frame.len() <= height);
+            assert!(frame.iter().all(|s| columns(&strip_sgr(s)) < 24));
+            assert_eq!(ui.detail.top, Some(0));
+        }
+        ui.press(Key::End, &view, NOW);
+        assert!(ui.detail.top.is_none());
+        ui.press(Key::Home, &view, NOW);
+        ui.press(Key::Back, &view, NOW);
+        ui.press(Key::Open, &view, NOW);
+        assert!(ui.detail.top.is_none());
+        store.remove("t1").unwrap();
+        view.refresh();
+        assert!(draw(&mut ui, &view)[0].contains("is gone"));
+        ui.press(Key::Back, &view, NOW);
+        assert!(ui.open.is_none());
+    }
+
+    #[test]
+    fn task_pages_include_all_waiting_requests() {
+        let h = home();
+        let store = Store::new(&h.0);
+        let questions: Vec<_> = (0..20).map(|i| json!({"id": format!("q{i}"), "text": format!("question-{i:02}"), "answer": null, "asked_ms": NOW})).collect();
+        store
+            .save(&task(
+                "t1",
+                "user",
+                "waiting",
+                NOW,
+                json!({"questions": questions}),
+            ))
+            .unwrap();
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let mut ui = Ui {
+            open: Some("t1".into()),
+            keys: true,
+            ..Ui::default()
+        };
+        ui.draw(&view, NOW, (80, 6));
+        ui.press(Key::Home, &view, NOW);
+        let mut read = String::new();
+        for _ in 0..10 {
+            read.push_str(&ui.draw(&view, NOW, (80, 6)).join("\n"));
+            ui.press(Key::PageDown, &view, NOW);
+        }
+        for i in 0..20 {
+            assert!(
+                read.contains(&format!("question-{i:02}")),
+                "missing question {i}"
             );
         }
     }
