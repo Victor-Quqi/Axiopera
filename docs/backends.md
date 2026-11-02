@@ -4,6 +4,10 @@
 
 ## 权限
 
+接入遵循用户对 harness 及其权限机制的选择。用户使用未加载权限插件的 Pi 时，托管任务沿用该原生行为。Axiopera 不为统一后端能力额外实现权限门控、安装权限插件、增加 reviewer，或启用用户未选择的自动审查组件。原生后端发出的审批请求由 Axiopera 转交，裁决只作用于本次请求。
+
+`read/work/full` 映射各后端已有的权限模式和工具开关，具体行为随后端而异；没有原生对应能力的档位标为不支持。缺少自动审查是原生能力差异，不作为接入缺口。消息通知、steer 所需的扩展另行评估，不承担新增权限控制。以下为现有三个适配器的映射。
+
 | 档位 | Claude Code | Codex | Grok Build |
 |---|---|---|---|
 | read | `default`，移除 Edit、Write、NotebookEdit、Agent；通过 stdio 接审批 | `read-only`，`never`，reviewer 为 `user` | ask 模式，移除写入、子 agent、工作流、定时任务、媒体生成和 MCP 入口 |
