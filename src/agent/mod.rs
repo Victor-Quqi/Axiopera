@@ -316,7 +316,7 @@ impl Backend {
 // ---- process plumbing ----
 
 #[derive(Clone, Default)]
-pub struct Trace(Option<Arc<Mutex<std::fs::File>>>);
+pub struct Trace(Option<Arc<Mutex<(std::fs::File, PathBuf)>>>);
 
 impl Trace {
     fn open(path: Option<&Path>) -> std::io::Result<Self> {
@@ -325,15 +325,21 @@ impl Trace {
                 .create(true)
                 .append(true)
                 .open(path)
-                .map(|file| Self(Some(Arc::new(Mutex::new(file)))))
+                .map(|file| Self(Some(Arc::new(Mutex::new((file, path.to_owned()))))))
         })
         .unwrap_or_else(|| Ok(Self::default()))
     }
 
     pub fn line(&self, direction: &str, line: &str) {
-        use std::io::Write;
         if let Some(file) = &self.0 {
-            let _ = writeln!(file.lock().unwrap(), "{direction} {line}");
+            let mut guard = file.lock().unwrap();
+            let (file, path) = &mut *guard;
+            let _ = crate::diagnostics::append(
+                file,
+                path,
+                &format!("{direction} {line}\n"),
+                crate::diagnostics::PROTOCOL_BYTES,
+            );
         }
     }
 }

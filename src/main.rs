@@ -2,6 +2,7 @@ mod agent;
 mod client;
 mod config;
 mod daemon;
+mod diagnostics;
 mod identity;
 mod ipc;
 mod mcp;

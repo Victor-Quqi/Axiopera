@@ -15,6 +15,7 @@
 | `plugins/axiopera/`、`.agents/plugins/` | skill、Codex 插件和 marketplace |
 | `src/platform/` | 进程树、IPC 和 sandbox 检测 |
 | `src/store.rs` | 任务存储 |
+| `src/diagnostics.rs` | 诊断日志轮转与流式裁剪 |
 | `src/top.rs` | 供人查看的 `top` 界面 |
 | `src/config.rs`、`paths.rs`、`identity.rs` | 配置、路径和调用方身份 |
 

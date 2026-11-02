@@ -180,7 +180,6 @@ pub async fn run(opts: Options) -> Result<()> {
         return Ok(()); // another daemon owns this home
     }
     let log_path = daemon_dir.join("daemon.log");
-    // Trimmed only here: the daemon keeps the file open while it runs.
     let trimmed = trim_log(
         &log_path,
         store::now_ms().saturating_sub(AUTO_GC_DAYS * DAY_MS),
@@ -318,8 +317,31 @@ impl Daemon {
 
     fn log(&self, msg: &str) {
         if let Some(f) = self.log.lock().unwrap().as_mut() {
-            let _ = writeln!(f, "{} {msg}", store::now_ms());
+            let path = self.opts.home.join("daemon/daemon.log");
+            let _ = crate::diagnostics::append(
+                f,
+                &path,
+                &format!("{} {msg}\n", store::now_ms()),
+                crate::diagnostics::DAEMON_BYTES,
+            );
         }
+    }
+
+    fn trim_daemon_log(&self, cutoff_ms: u64) -> Result<()> {
+        let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.opts.home.join("daemon/daemon.log");
+        let reopen = log.take().is_some();
+        let result = trim_log(&path, cutoff_ms)
+            .and_then(|()| trim_log(&path.with_extension("log.1"), cutoff_ms));
+        if reopen {
+            *log = Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)?,
+            );
+        }
+        result
     }
 
     /// Append an event and wake waiters. `data` must be a JSON object.
@@ -619,22 +641,12 @@ impl Daemon {
     fn trim_requests(&self, cutoff_ms: u64) -> Result<()> {
         let _held = self.requests.lock().unwrap_or_else(PoisonError::into_inner);
         let path = self.opts.home.join("daemon").join("requests.jsonl");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Ok(());
-        };
-        let kept: String = text
-            .lines()
-            .filter(|l| {
-                serde_json::from_str::<Value>(l)
-                    .ok()
-                    .and_then(|v| v["ts"].as_u64())
-                    .is_some_and(|ts| ts >= cutoff_ms)
-            })
-            .map(|l| format!("{l}\n"))
-            .collect();
-        let tmp = path.with_extension("jsonl.tmp");
-        std::fs::write(&tmp, kept)?;
-        std::fs::rename(tmp, path)?;
+        crate::diagnostics::retain_lines(&path, |line| {
+            serde_json::from_slice::<Value>(line)
+                .ok()
+                .and_then(|v| v["ts"].as_u64())
+                .is_some_and(|ts| ts >= cutoff_ms)
+        })?;
         Ok(())
     }
 
@@ -1464,7 +1476,11 @@ impl Daemon {
 
     /// `gc` by itself, for what nobody touched in `AUTO_GC_DAYS`.
     fn auto_gc(&self) {
-        match self.collect(store::now_ms().saturating_sub(AUTO_GC_DAYS * DAY_MS)) {
+        let cutoff = store::now_ms().saturating_sub(AUTO_GC_DAYS * DAY_MS);
+        if let Err(e) = self.trim_daemon_log(cutoff) {
+            self.log(&format!("trimming daemon.log: {e:#}"));
+        }
+        match self.collect(cutoff) {
             Ok(0) => {}
             Ok(n) => self.log(&format!("gc: removed {n} task(s)")),
             Err(e) => self.log(&format!("gc: {e:#}")),
@@ -2551,26 +2567,16 @@ pub fn agent_env(
 /// Drop the start of `daemon.log` up to its first entry from `cutoff_ms` on. Each entry starts
 /// with its time; lines without one belong to the entry above.
 fn trim_log(path: &Path, cutoff_ms: u64) -> Result<()> {
-    let text = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut at = 0;
-    let mut start = text.len();
-    for line in text.split_inclusive('\n') {
-        let time = line.split(' ').next().and_then(|t| t.parse::<u64>().ok());
-        if time.is_some_and(|t| t >= cutoff_ms) {
-            start = at;
-            break;
-        }
-        at += line.len();
-    }
-    if start > 0 {
-        let tmp = path.with_extension("log.tmp");
-        std::fs::write(&tmp, &text[start..])?;
-        std::fs::rename(tmp, path)?;
-    }
+    let mut keeping = false;
+    crate::diagnostics::retain_lines(path, |line| {
+        let time = line
+            .split(|b| *b == b' ')
+            .next()
+            .and_then(|t| std::str::from_utf8(t).ok())
+            .and_then(|t| t.parse::<u64>().ok());
+        keeping |= time.is_some_and(|t| t >= cutoff_ms);
+        keeping
+    })?;
     Ok(())
 }
 

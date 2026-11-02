@@ -1052,3 +1052,26 @@ fn the_daemon_log_drops_entries_before_the_cutoff_with_their_extra_lines() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn a_running_daemon_trims_logs_and_keeps_writing() {
+    let f = fixture();
+    let path = f.d.opts.home.join("daemon/daemon.log");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "1000 old\n2000 retained\n").unwrap();
+    std::fs::write(path.with_extension("log.1"), "1000 previous\n").unwrap();
+    *f.d.log.lock().unwrap() = Some(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap(),
+    );
+    f.d.trim_daemon_log(1500).unwrap();
+    f.d.log("after trim");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.starts_with("2000 retained\n") && text.ends_with("after trim\n"));
+    assert_eq!(
+        std::fs::read_to_string(path.with_extension("log.1")).unwrap(),
+        ""
+    );
+}

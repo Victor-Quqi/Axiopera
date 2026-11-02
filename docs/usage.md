@@ -113,4 +113,6 @@ CLI 按需启动 daemon。没有运行中的 agent 和客户端连接时，daemo
 
 Axiopera 自动删除 30 天未活动且已停止的任务，以及请求日志 `daemon/requests.jsonl` 和 daemon 日志 `daemon/daemon.log` 中 30 天前的行。`axiopera gc` 立即删除所有已停止的任务和请求日志，`--days N` 保留最近 N 天有活动的。运行中或即将开始运行的任务，以及仍有子任务的父任务，都不会被删除；收到兄弟任务的留言也算一次活动。任务删除后不能再对它 `send`、`result` 或 `log`。
 
+`daemon.log` 在启动及每 24 小时裁剪旧记录，并按 4 MiB 轮转；可选的 `protocol.log` 按 16 MiB 轮转，各保留一个 `.log.1` 备份。超过单文件上限的诊断行截断并注明。任务事件、输入和结果不按容量截断，随任务一起清理。
+
 卸载前先停止 daemon。通过 Cargo 安装的执行 `cargo uninstall axiopera`；通过 Release 压缩包安装的删除可执行文件。数据目录按需删除，原生 agent 的会话仍由各自 CLI 管理。
