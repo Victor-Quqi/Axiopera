@@ -203,7 +203,7 @@ pub async fn run(opts: Options) -> Result<()> {
         }))?,
     )?;
 
-    let d = Arc::new(Daemon::load(opts, log));
+    let d = Arc::new(Daemon::load(opts, log)?);
     d.log(&format!("started, pid {}", std::process::id()));
     if let Err(e) = trimmed {
         d.log(&format!("trimming daemon.log: {e:#}"));
@@ -241,9 +241,9 @@ pub async fn run(opts: Options) -> Result<()> {
 }
 
 impl Daemon {
-    fn load(opts: Options, log: Option<File>) -> Daemon {
+    fn load(opts: Options, log: Option<File>) -> Result<Daemon> {
         let store = Store::new(&opts.home);
-        let mut ledger = Ledger::load(&opts.home);
+        let mut ledger = Ledger::load(&opts.home)?;
         let mut tasks = HashMap::new();
         let mut recovered_timeouts = Vec::new();
         let mut seq = 0;
@@ -367,7 +367,7 @@ impl Daemon {
                 json!({"reason": "the daemon stopped while this task was running"}),
             );
         }
-        d
+        Ok(d)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {

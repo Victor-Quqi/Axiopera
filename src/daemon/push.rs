@@ -735,7 +735,7 @@ mod tests {
                     .insert("codex:host".into(), pending);
                 st.ledger.save(&f.d.opts.home).unwrap();
             }
-            let loaded = crate::store::Ledger::load(&f.d.opts.home);
+            let loaded = crate::store::Ledger::load(&f.d.opts.home).unwrap();
             let pending = loaded.pending_pushes["codex:host"].clone();
             assert_eq!(pending.marker, "[axiopera:receipt]");
             f.d.settle_push("codex:host", pending, found).unwrap();
@@ -791,6 +791,7 @@ mod tests {
         assert!(f.d.lock().ledger.doorbells.is_empty());
         assert!(
             crate::store::Ledger::load(&f.d.opts.home)
+                .unwrap()
                 .doorbells
                 .is_empty()
         );
@@ -906,7 +907,7 @@ mod capability_cache_tests {
             assert!(probed);
             // Transport cannot start the deliberately absent executable.
             assert!(outcome.is_err());
-            let ledger = crate::store::Ledger::load(&f.d.opts.home);
+            let ledger = crate::store::Ledger::load(&f.d.opts.home).unwrap();
             assert_eq!(ledger.codex_hosts["codex:host"].doorbell, !doorbell);
             assert!(ledger.cursors.is_empty());
             assert_eq!(f.d.unseen(&f.d.lock(), "codex:host", &[]).len(), 1);
@@ -971,7 +972,7 @@ mod capability_cache_tests {
             f.d.push_to_host("codex:host", &host, async { (Reach::Doorbell, None) })
                 .await;
         assert!(outcome.is_err());
-        let ledger = crate::store::Ledger::load(&f.d.opts.home);
+        let ledger = crate::store::Ledger::load(&f.d.opts.home).unwrap();
         assert!(ledger.codex_hosts["codex:host"].doorbell);
         // Unavailable read-back follows the existing assumption that a written batch arrived.
         assert!(ledger.pending_pushes.is_empty());
@@ -1011,7 +1012,7 @@ mod capability_cache_tests {
             st.ledger.pending_pushes["codex:host"].marker,
             "keep-for-read-back"
         );
-        let disk = crate::store::Ledger::load(&f.d.opts.home);
+        let disk = crate::store::Ledger::load(&f.d.opts.home).unwrap();
         assert_eq!(
             serde_json::to_value(&st.ledger).unwrap(),
             serde_json::to_value(disk).unwrap()

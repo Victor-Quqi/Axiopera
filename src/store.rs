@@ -474,11 +474,19 @@ pub struct CodexHost {
 }
 
 impl Ledger {
-    pub fn load(home: &Path) -> Ledger {
-        fs::read(home.join("ledger.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+    pub fn load(home: &Path) -> Result<Ledger> {
+        let path = home.join("ledger.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "invalid {}; restore the ledger before starting the daemon",
+                path.display()
+            )
+        })
     }
 
     pub fn save(&self, home: &Path) -> Result<()> {

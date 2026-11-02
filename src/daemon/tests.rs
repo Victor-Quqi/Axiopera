@@ -43,7 +43,7 @@ pub(super) fn fixture_with(more: &[Value]) -> Fixture {
         Store::new(&home).save(&task).unwrap();
     }
     Fixture {
-        d: Arc::new(Daemon::load(options(&home), None)),
+        d: Arc::new(Daemon::load(options(&home), None).unwrap()),
         home,
     }
 }
@@ -119,7 +119,7 @@ async fn send_changes_tier_and_preserves_the_session_across_reload() {
             .await
             .unwrap();
             assert!(replies(&buf).contains("queued for a new turn"));
-            let again = Daemon::load(options(&f.home), None);
+            let again = Daemon::load(options(&f.home), None).unwrap();
             let saved = again.lock().tasks["test"].task.clone();
             assert_eq!(saved.tier, tier);
             assert_eq!(saved.session.as_deref(), Some("native-session"));
@@ -357,7 +357,7 @@ async fn native_child_inboxes_are_separate_and_the_task_session_keeps_its_identi
             let text = replies(&buf);
             assert!(text.contains(own) && !text.contains(other), "{text}");
         }
-        let again = Daemon::load(options(&f.home), None);
+        let again = Daemon::load(options(&f.home), None).unwrap();
         assert_eq!(again.resolve_caller(&root), "task:test");
         assert_eq!(again.resolve_caller(&native), native);
         assert!(again.unseen(&again.lock(), &native, &[]).is_empty());
@@ -975,7 +975,8 @@ fn top_level_spawns_stop_at_the_limit_while_nested_ones_go_on() {
             ..options(&f.home)
         },
         None,
-    );
+    )
+    .unwrap();
     {
         let mut st = d.lock();
         for id in ["a", "kid"] {
@@ -999,7 +1000,7 @@ fn sequence_numbers_go_on_after_gc_removed_every_task() {
     f.d.emit("test", "turn_ended", json!({"turn": 1}));
     let before = f.d.lock().seq;
     assert_eq!(f.d.collect(u64::MAX).unwrap(), 1);
-    let again = Daemon::load(options(&f.home), None);
+    let again = Daemon::load(options(&f.home), None).unwrap();
     assert_eq!(again.lock().seq, before);
 }
 
@@ -1152,7 +1153,7 @@ fn indexed_delivery_preserves_historical_routes_filters_and_cursors_after_reload
             }
         }
     }
-    let reloaded = Daemon::load(options(&f.home), None);
+    let reloaded = Daemon::load(options(&f.home), None).unwrap();
     for d in [f.d.as_ref(), &reloaded] {
         let mut st = d.lock();
         for caller in [
@@ -1363,7 +1364,7 @@ fn invalid_tasks_are_quarantined_and_valid_events_after_corruption_recover() {
     let path = f.d.store.events_path("test");
     let data = b"{\"seq\":1,\"ts\":0,\"task\":\"test\",\"kind\":\"tool\"}\n\xff\n{\"seq\":2,\"ts\":0,\"task\":\"test\",\"kind\":\"turn_ended\",\"turn\":1}\n";
     std::fs::write(&path, data).unwrap();
-    let again = Daemon::load(options(&f.home), None);
+    let again = Daemon::load(options(&f.home), None).unwrap();
     assert_eq!(again.lock().tasks.len(), 1);
     assert_eq!(again.lock().tasks["test"].deliverable[0].kind, "turn_ended");
     assert_eq!(again.lock().seq, 2);
@@ -1388,7 +1389,7 @@ fn torn_event_tail_is_backed_up_and_next_append_stays_readable() {
             .unwrap()
             .write_all(tail)
             .unwrap();
-        let again = Daemon::load(options(&f.home), None);
+        let again = Daemon::load(options(&f.home), None).unwrap();
         again
             .try_emit("test", "failed", json!({"error":"second"}))
             .unwrap();
@@ -1417,7 +1418,7 @@ fn complete_event_without_newline_is_recovered_once() {
         br#"{"seq":42,"ts":0,"task":"test","kind":"failed"}"#,
     )
     .unwrap();
-    let again = Daemon::load(options(&f.home), None);
+    let again = Daemon::load(options(&f.home), None).unwrap();
     assert_eq!(again.lock().seq, 42);
     again.try_emit("test", "failed", json!({})).unwrap();
     assert_eq!(
@@ -1446,9 +1447,46 @@ fn restart_removes_missing_malformed_and_future_cursors() {
         ledger.cursors.insert(key.into(), seq);
     }
     ledger.save(&f.home).unwrap();
-    let again = Daemon::load(options(&f.home), None);
+    let again = Daemon::load(options(&f.home), None).unwrap();
     assert_eq!(again.lock().ledger.cursors.len(), 1);
-    assert_eq!(Ledger::load(&f.home).cursors.len(), 1);
+    assert_eq!(Ledger::load(&f.home).unwrap().cursors.len(), 1);
+}
+
+#[test]
+fn a_damaged_ledger_stops_recovery_without_overwriting_it() {
+    let f = fixture();
+    let path = f.home.join("ledger.json");
+    for data in [b"{\"cursors\":".as_slice(), b"\xff".as_slice()] {
+        std::fs::write(&path, data).unwrap();
+        let error = Daemon::load(options(&f.home), None).err().unwrap();
+        assert!(format!("{error:#}").contains("ledger.json"));
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn an_unreadable_ledger_is_preserved_for_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = fixture();
+    f.d.try_emit("test", "failed", json!({})).unwrap();
+    let events = f.d.lock().tasks["test"].deliverable.clone();
+    f.d.mark_seen("codex:host", &events, &[], &[]).unwrap();
+    let path = f.home.join("ledger.json");
+    let before = std::fs::read(&path).unwrap();
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+    assert!(Daemon::load(options(&f.home), None).is_err());
+    drop(held);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let again = Daemon::load(options(&f.home), None).unwrap();
+    assert_eq!(
+        again.lock().ledger.cursors["codex:host|test"],
+        events[0].seq
+    );
 }
 
 #[tokio::test]
@@ -1471,7 +1509,7 @@ async fn accepted_input_and_mail_survive_restart_without_starting_an_agent() {
     .unwrap();
     let mut opts = options(&f.home);
     opts.concurrency = 1;
-    let again = Arc::new(Daemon::load(opts, None));
+    let again = Arc::new(Daemon::load(opts, None).unwrap());
     {
         let st = again.lock();
         assert!(st.tasks["test"].pending.is_empty());
@@ -1581,7 +1619,7 @@ async fn answers_and_their_input_are_committed_together() {
         )
     );
     assert_ne!(first.is_ok(), second.is_ok());
-    let again = Daemon::load(options(&f.home), None);
+    let again = Daemon::load(options(&f.home), None).unwrap();
     let st = again.lock();
     let task = &st.tasks["test"].task;
     assert_eq!(task.pending_inputs.len(), 1);
@@ -1642,7 +1680,7 @@ fn failed_ledger_save_does_not_advance_in_memory_cursors() {
     std::fs::remove_dir(f.home.join("ledger.json.tmp")).unwrap();
     f.d.mark_seen("codex:host", &events, &[], &[]).unwrap();
     assert_eq!(
-        Ledger::load(&f.home).cursors["codex:host|test"],
+        Ledger::load(&f.home).unwrap().cursors["codex:host|test"],
         events[0].seq
     );
 }
@@ -1658,11 +1696,11 @@ fn only_legacy_timeouts_are_migrated_to_resumable_tasks() {
         .unwrap();
     f.d.try_emit("manual", "cancelled", json!({"by":"user"}))
         .unwrap();
-    let again = Daemon::load(options(&f.home), None);
+    let again = Daemon::load(options(&f.home), None).unwrap();
     assert_eq!(again.lock().tasks["test"].task.status, Status::Interrupted);
     assert_eq!(again.lock().tasks["manual"].task.status, Status::Cancelled);
     assert_eq!(again.lock().tasks["unknown"].task.status, Status::Cancelled);
-    let twice = Daemon::load(options(&f.home), None);
+    let twice = Daemon::load(options(&f.home), None).unwrap();
     assert_eq!(twice.lock().tasks["test"].deliverable.len(), 2);
 }
 
@@ -1677,12 +1715,12 @@ fn transient_task_read_failure_keeps_the_directory_for_retry() {
         .share_mode(0)
         .open(&path)
         .unwrap();
-    let again = Daemon::load(options(&f.home), None);
+    let again = Daemon::load(options(&f.home), None).unwrap();
     assert!(again.lock().tasks.is_empty());
     assert!(path.exists());
     assert!(!f.home.join("quarantine").exists());
     drop(held);
-    let again = Daemon::load(options(&f.home), None);
+    let again = Daemon::load(options(&f.home), None).unwrap();
     assert!(again.lock().tasks.contains_key("test"));
 }
 
