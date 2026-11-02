@@ -50,6 +50,8 @@ impl Daemon {
         let Some(thread) = caller.strip_prefix("codex:") else {
             return (Reach::Wait, None);
         };
+        // Keep registration from replacing a route while its push is in flight.
+        let _delivering = self.delivery(caller).lock_owned().await;
         let configured = self.opts.agents.get(Agent::Codex).path.as_deref();
         let Ok(exe) = agent::resolve_exe(Agent::Codex, configured, env) else {
             return (Reach::Wait, Some("Codex was not found"));
@@ -67,12 +69,27 @@ impl Daemon {
         if let Some(reach) = self.cached_host(caller, &host) {
             return (reach, None);
         }
+        let (reach, why) = self.probe_host(caller, &host).await;
+        if why.is_some() {
+            return (reach, why);
+        }
+        host.doorbell = reach == Reach::Doorbell;
+        let mut st = self.lock();
+        st.ledger.codex_hosts.insert(caller.to_string(), host);
+        Self::cache_host_check(&mut st, caller);
+        if let Err(e) = st.ledger.save(&self.opts.home) {
+            self.log(&format!("saving the ledger: {e:#}"));
+        }
+        (reach, None)
+    }
+
+    async fn probe_host(&self, caller: &str, host: &CodexHost) -> (Reach, Option<&'static str>) {
         let home = host.codex_home.as_deref();
         let shared = self
             .probe(caller, "is not on the shared Codex daemon", async {
                 Remote::connect(&host.exe, home)
                     .await?
-                    .is_open(thread)
+                    .is_open(&host.thread)
                     .await
             })
             .await;
@@ -83,7 +100,7 @@ impl Daemon {
                 .probe(caller, "has no Codex queue", async {
                     Remote::private(&host.exe, home)
                         .await?
-                        .serves_queue(thread)
+                        .serves_queue(&host.thread)
                         .await
                 })
                 .await;
@@ -99,19 +116,16 @@ impl Daemon {
             }
             Reach::Doorbell
         };
-        host.doorbell = reach == Reach::Doorbell;
-        let mut st = self.lock();
-        st.ledger.codex_hosts.insert(caller.to_string(), host);
+        (reach, None)
+    }
+
+    fn cache_host_check(st: &mut super::State, caller: &str) {
         st.host_checked.retain(|_, at| at.elapsed() < HOST_TTL);
         if st.host_checked.len() >= HOST_CAPACITY {
             st.host_checked.clear();
         }
         st.host_checked
             .insert(caller.to_string(), std::time::Instant::now());
-        if let Err(e) = st.ledger.save(&self.opts.home) {
-            self.log(&format!("saving the ledger: {e:#}"));
-        }
-        (reach, None)
     }
 
     fn cached_host(&self, caller: &str, candidate: &CodexHost) -> Option<Reach> {
@@ -352,11 +366,9 @@ impl Daemon {
         let Some(host) = host else {
             return;
         };
-        let outcome = if host.doorbell {
-            self.ring(caller, &host).await.map(|how| (how, false))
-        } else {
-            self.send_events(caller, &host).await
-        };
+        let outcome = self
+            .push_to_host(caller, &host, self.probe_host(caller, &host))
+            .await;
         match outcome {
             Ok((how, more)) => {
                 self.lock().push_failures.remove(caller);
@@ -384,6 +396,42 @@ impl Daemon {
                 drop(delivering);
                 self.schedule_push(caller.to_string(), delay);
             }
+        }
+    }
+
+    async fn push_to_host(
+        &self,
+        caller: &str,
+        host: &CodexHost,
+        probe: impl Future<Output = (Reach, Option<&'static str>)>,
+    ) -> Result<(String, bool), String> {
+        let mut host = host.clone();
+        if self.cached_host(caller, &host).is_none() {
+            let (reach, why) = probe.await;
+            if reach == Reach::Wait {
+                return Err(why.unwrap_or("the host is unavailable").to_string());
+            }
+            host.doorbell = reach == Reach::Doorbell;
+            let mut st = self.lock();
+            let Some(saved) = st.ledger.codex_hosts.get_mut(caller) else {
+                return Ok(("the host was removed".to_string(), false));
+            };
+            let previous = std::mem::replace(saved, host.clone());
+            if let Err(e) = st.ledger.save(&self.opts.home) {
+                st.ledger.codex_hosts.insert(caller.to_string(), previous);
+                st.host_checked.remove(caller);
+                return Err(format!("saving the host route: {e:#}"));
+            }
+            Self::cache_host_check(&mut st, caller);
+        }
+        if host.doorbell {
+            // A previous push may have reached the host before its route changed.
+            self.reconcile_before_take(caller)
+                .await
+                .map_err(|e| format!("{e:#}"))?;
+            self.ring(caller, &host).await.map(|how| (how, false))
+        } else {
+            self.send_events(caller, &host).await
         }
     }
 
@@ -815,6 +863,191 @@ command: {summary}"
 #[cfg(test)]
 mod capability_cache_tests {
     use super::*;
+
+    fn registered_host(f: &crate::daemon::tests::Fixture, doorbell: bool) -> CodexHost {
+        let host = CodexHost {
+            exe: f.d.opts.home.join("missing-codex"),
+            codex_home: Some(f.d.opts.home.clone()),
+            thread: "host".into(),
+            doorbell,
+        };
+        let mut st = f.d.lock();
+        st.ledger
+            .codex_hosts
+            .insert("codex:host".into(), host.clone());
+        st.ledger.save(&f.d.opts.home).unwrap();
+        Daemon::cache_host_check(&mut st, "codex:host");
+        host
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn invalidated_pushes_probe_again_and_persist_either_route() {
+        for doorbell in [false, true] {
+            let f = crate::daemon::tests::fixture();
+            let host = registered_host(&f, doorbell);
+            f.d.emit("test", "stalled", serde_json::json!({"quiet_secs": 60}));
+            f.d.push("codex:host").await;
+            assert!(!f.d.lock().host_checked.contains_key("codex:host"));
+            assert_eq!(f.d.lock().push_failures["codex:host"], 1);
+            let mut probed = false;
+            let outcome =
+                f.d.push_to_host("codex:host", &host, async {
+                    probed = true;
+                    (
+                        if doorbell {
+                            Reach::Push
+                        } else {
+                            Reach::Doorbell
+                        },
+                        None,
+                    )
+                })
+                .await;
+            assert!(probed);
+            // Transport cannot start the deliberately absent executable.
+            assert!(outcome.is_err());
+            let ledger = crate::store::Ledger::load(&f.d.opts.home);
+            assert_eq!(ledger.codex_hosts["codex:host"].doorbell, !doorbell);
+            assert!(ledger.cursors.is_empty());
+            assert_eq!(f.d.unseen(&f.d.lock(), "codex:host", &[]).len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_valid_cached_route_does_not_probe_again() {
+        let f = crate::daemon::tests::fixture();
+        let host = registered_host(&f, false);
+        let outcome =
+            f.d.push_to_host("codex:host", &host, async {
+                panic!("a valid cache must skip the probe");
+            })
+            .await;
+        assert!(outcome.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_reprobes_preserve_the_route_and_exponential_retry() {
+        let f = crate::daemon::tests::fixture();
+        registered_host(&f, false);
+        f.d.emit("test", "stalled", serde_json::json!({"quiet_secs": 60}));
+        f.d.push("codex:host").await;
+        assert_eq!(f.d.lock().pushing["codex:host"], Instant::now() + RETRY);
+        tokio::task::yield_now().await;
+        tokio::time::advance(RETRY).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let st = f.d.lock();
+        assert_eq!(st.push_failures["codex:host"], 2);
+        assert_eq!(st.pushing["codex:host"], Instant::now() + RETRY * 2);
+        assert!(!st.host_checked.contains_key("codex:host"));
+        assert!(!st.ledger.codex_hosts["codex:host"].doorbell);
+        assert!(st.ledger.cursors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn switching_to_doorbell_reconciles_the_written_batch_before_ringing() {
+        let f = crate::daemon::tests::fixture();
+        let host = registered_host(&f, false);
+        f.d.emit("test", "stalled", serde_json::json!({"quiet_secs": 60}));
+        {
+            let mut st = f.d.lock();
+            st.host_checked.clear();
+            st.ledger.pending_pushes.insert(
+                "codex:host".into(),
+                PendingPush {
+                    marker: "already-written".into(),
+                    events: vec![("test".into(), 1)],
+                    turns: vec![("test".into(), 1)],
+                    approvals: vec![],
+                },
+            );
+            st.ledger
+                .doorbells
+                .insert("codex:host".into(), "existing-reminder".into());
+            st.ledger.save(&f.d.opts.home).unwrap();
+        }
+        let outcome =
+            f.d.push_to_host("codex:host", &host, async { (Reach::Doorbell, None) })
+                .await;
+        assert!(outcome.is_err());
+        let ledger = crate::store::Ledger::load(&f.d.opts.home);
+        assert!(ledger.codex_hosts["codex:host"].doorbell);
+        // Unavailable read-back follows the existing assumption that a written batch arrived.
+        assert!(ledger.pending_pushes.is_empty());
+        assert_eq!(ledger.cursors["codex:host|test"], 1);
+        assert_eq!(ledger.doorbells["codex:host"], "existing-reminder");
+        assert_eq!(f.d.lock().tasks["test"].task.delivered, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_route_save_preserves_the_old_route_and_pending_batch() {
+        let f = crate::daemon::tests::fixture();
+        let host = registered_host(&f, false);
+        {
+            let mut st = f.d.lock();
+            st.host_checked.clear();
+            st.ledger.pending_pushes.insert(
+                "codex:host".into(),
+                PendingPush {
+                    marker: "keep-for-read-back".into(),
+                    events: vec![("test".into(), 1)],
+                    turns: vec![],
+                    approvals: vec![],
+                },
+            );
+            st.ledger.save(&f.d.opts.home).unwrap();
+        }
+        std::fs::create_dir(f.d.opts.home.join("ledger.json.tmp")).unwrap();
+        let error =
+            f.d.push_to_host("codex:host", &host, async { (Reach::Doorbell, None) })
+                .await
+                .unwrap_err();
+        assert!(error.starts_with("saving the host route:"));
+        let st = f.d.lock();
+        assert!(!st.ledger.codex_hosts["codex:host"].doorbell);
+        assert!(!st.host_checked.contains_key("codex:host"));
+        assert_eq!(
+            st.ledger.pending_pushes["codex:host"].marker,
+            "keep-for-read-back"
+        );
+        let disk = crate::store::Ledger::load(&f.d.opts.home);
+        assert_eq!(
+            serde_json::to_value(&st.ledger).unwrap(),
+            serde_json::to_value(disk).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn host_registration_waits_for_an_in_progress_delivery() {
+        let f = crate::daemon::tests::fixture();
+        let held = f.d.delivery("codex:host").lock_owned().await;
+        let d = f.d.clone();
+        let registering = tokio::spawn(async move { d.register_host("codex:host", &[]).await });
+        tokio::task::yield_now().await;
+        assert!(!registering.is_finished());
+        drop(held);
+        assert_eq!(registering.await.unwrap().0, Reach::Wait);
+    }
+
+    #[tokio::test]
+    async fn a_reprobe_does_not_restore_a_host_removed_while_awaiting_it() {
+        let f = crate::daemon::tests::fixture();
+        let host = registered_host(&f, false);
+        f.d.lock().host_checked.clear();
+        let outcome =
+            f.d.push_to_host("codex:host", &host, async {
+                f.d.lock().ledger.codex_hosts.remove("codex:host");
+                (Reach::Doorbell, None)
+            })
+            .await;
+        assert_eq!(
+            outcome.unwrap(),
+            ("the host was removed".to_string(), false)
+        );
+        assert!(!f.d.lock().ledger.codex_hosts.contains_key("codex:host"));
+        assert!(!f.d.lock().host_checked.contains_key("codex:host"));
+    }
 
     #[test]
     fn only_recent_successes_with_matching_launch_identity_are_reused() {
