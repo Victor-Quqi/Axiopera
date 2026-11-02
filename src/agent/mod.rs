@@ -538,13 +538,21 @@ pub fn arguments(input: &Value) -> String {
 /// One line for summaries: line breaks shown as ↵, cut to `max` characters with a count of
 /// what was left out.
 pub fn clip(s: &str, max: usize) -> String {
-    let line = s.trim().lines().collect::<Vec<_>>().join(" ↵ ");
-    let total = line.chars().count();
-    if total <= max {
-        return line;
+    let mut kept = String::new();
+    let mut total = 0;
+    for (i, line) in s.trim().lines().enumerate() {
+        let separator = if i == 0 { "" } else { " ↵ " };
+        for c in separator.chars().chain(line.chars()) {
+            if total < max {
+                kept.push(c);
+            }
+            total += 1;
+        }
     }
-    let kept: String = line.chars().take(max).collect();
-    format!("{kept}…(+{} chars)", total - max)
+    if total > max {
+        kept.push_str(&format!("…(+{} chars)", total - max));
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -560,6 +568,9 @@ mod tests {
             "cd crates ↵ cargo test"
         );
         assert_eq!(clip("审查意见很长", 2), "审查…(+4 chars)");
+        assert_eq!(clip(" \r\n  ", 0), "");
+        assert_eq!(clip("a\r\nb", 3), "a ↵…(+2 chars)");
+        assert_eq!(clip(&"中\n".repeat(100_000), 1), "中…(+399996 chars)");
     }
 
     #[test]
