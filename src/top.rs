@@ -319,6 +319,8 @@ struct Ui {
     /// Whether keys can be read: without them nothing is chosen.
     keys: bool,
     list_top: usize,
+    /// Selected task and its screen row, retained across refreshes and group reordering.
+    list_anchor: Option<(String, usize)>,
     page: usize,
     detail: Scroll,
 }
@@ -339,20 +341,43 @@ impl Ui {
             return view.frame(now, Some(size), None);
         }
         // The first task when the chosen one is gone or none was.
-        let ids = view.order(now);
-        if !self.chosen.as_ref().is_some_and(|c| ids.contains(c)) {
-            self.chosen = ids.into_iter().next();
+        let rows = view.table(now).0;
+        if !self
+            .chosen
+            .as_ref()
+            .is_some_and(|c| rows.iter().any(|r| r.id.as_ref() == Some(c)))
+        {
+            self.chosen = rows.iter().find_map(|r| r.id.clone());
         }
-        view.list_frame(
+        let at = rows
+            .iter()
+            .position(|r| r.id.is_some() && r.id == self.chosen);
+        if let (Some(at), Some((id, offset))) = (at, &self.list_anchor)
+            && self.chosen.as_ref() == Some(id)
+        {
+            self.list_top = at.saturating_sub(*offset);
+        }
+        let frame = view.list_frame(
             now,
             Some(size),
             self.chosen.as_deref(),
             Some(&mut self.list_top),
-        )
+        );
+        self.list_anchor =
+            at.and_then(|at| Some((self.chosen.clone()?, at.saturating_sub(self.list_top))));
+        frame
     }
 
     /// Follows a key. Returns false when it quits.
     fn press(&mut self, key: Key, view: &View, now: u64) -> bool {
+        if self.open.is_none()
+            && matches!(
+                key,
+                Key::Up | Key::Down | Key::PageUp | Key::PageDown | Key::Home | Key::End
+            )
+        {
+            self.list_anchor = None;
+        }
         match (key, &self.open) {
             (Key::Quit, _) | (Key::Q, None) => return false,
             (Key::Back | Key::Q, Some(_)) => self.open = None,
@@ -523,9 +548,8 @@ struct View {
     /// Likewise the widest ID of a task with a name: its ID has a column of its own, for the
     /// commands its agent runs on it. A task without a name has its ID in the name's column.
     id_width: usize,
-    /// When each session first spawned, by its caller, as seen since top started: sessions
-    /// keep their order when their oldest tasks are hidden or removed.
-    first_spawned: HashMap<String, u64>,
+    /// Latest spawn in each session tree, retained when tasks are hidden or removed.
+    last_spawned: HashMap<String, u64>,
     /// The project of each working directory of a task, found once.
     projects: HashMap<PathBuf, Option<String>>,
 }
@@ -539,7 +563,7 @@ impl View {
             tails: HashMap::new(),
             width: 0,
             id_width: 0,
-            first_spawned: HashMap::new(),
+            last_spawned: HashMap::new(),
             projects: HashMap::new(),
         }
     }
@@ -562,19 +586,17 @@ impl View {
         self.tasks = tasks;
         for t in self.tasks.values() {
             let mut depth = 1;
+            let mut root = t;
             let mut up = self.parent(t);
             // A bound, should parents ever form a loop.
             while let Some(p) = up.filter(|_| depth <= self.tasks.len()) {
                 depth += 1;
+                root = p;
                 up = self.parent(p);
             }
-            if depth == 1 {
-                let at = self
-                    .first_spawned
-                    .entry(t.parent.clone())
-                    .or_insert(u64::MAX);
-                *at = (*at).min(t.created_ms);
-            }
+            let caller = root.parent.clone();
+            let at = self.last_spawned.entry(caller).or_default();
+            *at = (*at).max(t.created_ms);
             self.projects
                 .entry(t.cwd.clone())
                 .or_insert_with(|| project(&t.cwd));
@@ -775,7 +797,7 @@ impl View {
         }
         let hidden = self.tasks.len() - shown.len();
         let mut sorted: Vec<&Task> = shown.iter().map(|id| &self.tasks[*id]).collect();
-        sorted.sort_by_key(|t| (t.created_ms, t.id.as_str()));
+        sorted.sort_by_key(|t| (Reverse(t.created_ms), t.id.as_str()));
         let mut groups: Vec<(&str, Vec<&Task>)> = Vec::new();
         let mut children: HashMap<&str, Vec<&Task>> = HashMap::new();
         for t in sorted {
@@ -787,7 +809,8 @@ impl View {
                 },
             }
         }
-        groups.sort_by_key(|(caller, _)| (self.first_spawned.get(*caller).copied(), *caller));
+        groups
+            .sort_by_key(|(caller, _)| (Reverse(self.last_spawned.get(*caller).copied()), *caller));
         // Session IDs are cut unless that leaves two alike.
         let short: Vec<String> = groups
             .iter()
@@ -2799,7 +2822,7 @@ mod tests {
     fn a_short_window_keeps_what_waits_for_someone_and_what_works() {
         let h = home();
         let store = Store::new(&h.0);
-        // Older idle tasks come first in the list.
+        // Recent idle tasks follow the active task trees.
         for i in 0..8 {
             let id = format!("t{i}");
             store
@@ -2855,10 +2878,10 @@ mod tests {
             "{text}"
         );
         assert_eq!(plain[9], "  …and 6 more task(s)", "{text}");
-        // Order is kept: sessions in the order they first spawned, sub-tasks under parents.
+        // Recent sessions and siblings come first; sub-tasks stay under parents.
         let at = |s: &str| text.find(s).unwrap();
-        assert!(at("\n  t7 ") < at("\n  tp ") && at("\n  tp ") < at("\n    tr "));
-        assert!(at("\n    tr ") < at("codex session s"), "{text}");
+        assert!(at("\n  tp ") < at("\n    tr ") && at("\n    tr ") < at("\n  t7 "));
+        assert!(at("codex session s") < at("\n    tr "), "{text}");
         // Only the color tells what waits for someone and what works.
         assert!(line_of(&frame, "tw ").contains("\x1b[33mwaiting"));
         assert!(line_of(&frame, "tr ").contains("\x1b[33mapproval"));
@@ -3123,7 +3146,7 @@ mod tests {
     }
 
     #[test]
-    fn sessions_keep_their_place_and_can_be_told_apart() {
+    fn sessions_follow_latest_spawns_and_can_be_told_apart() {
         let h = home();
         let store = Store::new(&h.0);
         let a = "codex:019a2b3c-1111";
@@ -3141,7 +3164,7 @@ mod tests {
         let mut view = View::new(&h.0, false);
         view.refresh();
         let text = view.frame(NOW, None, None).join("\n");
-        // A stays first though its first task is hidden; their IDs are whole, being alike cut.
+        // A is first because it spawned most recently; colliding short IDs stay whole.
         assert!(!text.contains("a1 "), "{text}");
         let at = |s: &str| text.find(s).unwrap_or_else(|| panic!("{s} in {text}"));
         assert!(
@@ -3163,8 +3186,7 @@ mod tests {
             ],
             "{frame:#?}"
         );
-        // Nor does A move when gc removes its first task, or the columns when a task with a
-        // long name and deep under others comes and goes.
+        // A new descendant moves B first; column widths survive its later removal.
         let before = view.frame(NOW, None, None);
         store.remove("a1").unwrap();
         store
@@ -3200,7 +3222,104 @@ mod tests {
         assert_eq!(after.len(), before.len());
         assert_eq!(line_of(&after, "a2 "), line_of(&wide, "a2 "));
         assert_ne!(line_of(&after, "a2 "), line_of(&before, "a2 "));
-        assert!(after[2].ends_with("019a2b3c-1111"), "{after:#?}");
+        assert!(after[2].ends_with("019a2b3c-2222"), "{after:#?}");
+    }
+
+    #[test]
+    fn recent_spawns_order_sessions_and_siblings_without_detaching_children() {
+        let h = home();
+        let store = Store::new(&h.0);
+        for (id, parent, at) in [
+            ("a-old", "codex:a", NOW - 3 * HOUR),
+            ("a-new", "codex:a", NOW - 100),
+            ("b", "codex:b", NOW - 50),
+            ("child-old", "task:a-old", NOW - 20),
+            ("child-new", "task:a-old", NOW - 10),
+            ("grandchild", "task:child-old", NOW),
+        ] {
+            store
+                .save(&task(id, parent, "idle", at, json!({})))
+                .unwrap();
+        }
+        let expected = [
+            "a-new",
+            "a-old",
+            "child-new",
+            "child-old",
+            "grandchild",
+            "b",
+        ];
+        for all in [false, true] {
+            let mut view = View::new(&h.0, all);
+            view.refresh();
+            assert_eq!(view.order(NOW), expected);
+            // Output and status changes do not move the older session above new spawns.
+            store
+                .append(&event(1, 0, "b", "said", json!({"text": "Working"})))
+                .unwrap();
+            let mut b = view.tasks["b"].clone();
+            b.updated_ms = NOW + 1;
+            b.status = Status::Running;
+            store.save(&b).unwrap();
+            view.refresh();
+            assert_eq!(view.order(NOW), expected);
+        }
+    }
+
+    #[test]
+    fn new_spawns_keep_the_selected_task_on_its_screen_row() {
+        let h = home();
+        let store = Store::new(&h.0);
+        for i in 0..12 {
+            store
+                .save(&task(
+                    &format!("t{i}"),
+                    "user",
+                    "idle",
+                    NOW - 100 + i,
+                    json!({}),
+                ))
+                .unwrap();
+        }
+        store
+            .save(&task("old", "codex:old", "idle", NOW - 3 * HOUR, json!({})))
+            .unwrap();
+        let mut view = View::new(&h.0, true);
+        view.refresh();
+        let mut ui = Ui {
+            keys: true,
+            ..Ui::default()
+        };
+        let selected_row = |ui: &mut Ui, view: &View| {
+            ui.draw(view, NOW, (80, 9))
+                .iter()
+                .position(|line| line.contains("\x1b[7m"))
+                .unwrap()
+        };
+        selected_row(&mut ui, &view);
+        for _ in 0..3 {
+            ui.press(Key::Down, &view, NOW);
+            selected_row(&mut ui, &view);
+        }
+        assert_eq!(ui.chosen.as_deref(), Some("t8"));
+        let before = selected_row(&mut ui, &view);
+        for (id, parent, at) in [("new", "user", NOW), ("revived", "codex:old", NOW + 1)] {
+            store
+                .save(&task(id, parent, "idle", at, json!({})))
+                .unwrap();
+            view.refresh();
+            assert_eq!(selected_row(&mut ui, &view), before);
+            assert_eq!(ui.chosen.as_deref(), Some("t8"));
+        }
+        assert_eq!(view.order(NOW)[0], "revived");
+        ui.press(Key::Home, &view, NOW);
+        selected_row(&mut ui, &view);
+        assert_eq!(ui.chosen.as_deref(), Some("revived"));
+        assert_eq!(ui.list_top, 0);
+        store.remove("revived").unwrap();
+        view.refresh();
+        selected_row(&mut ui, &view);
+        assert_eq!(ui.chosen.as_deref(), Some("old"));
     }
 
     #[test]
@@ -3610,14 +3729,14 @@ mod tests {
 
         let h = home();
         let store = Store::new(&h.0);
-        // Older idle tasks first, then one that waits.
+        // Newer idle tasks first, then an older task that waits.
         for i in 0..6 {
             store
                 .save(&task(
                     &format!("t{i}"),
                     "user",
                     "idle",
-                    NOW - 50_000 + i,
+                    NOW - 1_000 - i,
                     json!({}),
                 ))
                 .unwrap();
@@ -3627,7 +3746,7 @@ mod tests {
                 "tw",
                 "user",
                 "waiting",
-                NOW - 1_000,
+                NOW - 50_000,
                 json!({"name": "ask"}),
             ))
             .unwrap();
@@ -3733,7 +3852,7 @@ mod tests {
                     id,
                     if i < 4 { "codex:a" } else { "codex:b" },
                     "idle",
-                    NOW - 100 + i as u64,
+                    NOW - 100 - i as u64,
                     json!({}),
                 ))
                 .unwrap();
