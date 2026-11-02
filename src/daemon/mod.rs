@@ -247,17 +247,20 @@ impl Daemon {
         let mut tasks = HashMap::new();
         let mut recovered_timeouts = Vec::new();
         let mut seq = 0;
-        let (loaded, mut errors) = store.recover_tasks();
+        let (loaded, mut errors) = store.recover_tasks()?;
         for mut task in loaded {
             let mut deliverable = Vec::new();
-            if let Err(e) = store.recover_events(&task.id, |event| {
-                seq = seq.max(event.seq);
-                if store::deliverable(&event.kind) {
-                    deliverable.push(event);
-                }
-            }) {
+            if let Some(warning) = store
+                .recover_events(&task.id, |event| {
+                    seq = seq.max(event.seq);
+                    if store::deliverable(&event.kind) {
+                        deliverable.push(event);
+                    }
+                })
+                .with_context(|| format!("recovering events for {}", task.id))?
+            {
                 errors.push(format!(
-                    "recovering {}: {e:#}; original event log retained",
+                    "recovering {}: {warning}; original event log retained",
                     task.id
                 ));
             }
@@ -1242,7 +1245,10 @@ impl Daemon {
                 if identity::task_of(caller).is_some() && entry.task.parent != caller {
                     return refuse(ErrorCode::Invalid, format!("{id} is not your sub-task"));
                 }
-                if entry.actor.is_some() || !entry.pending.is_empty() {
+                if entry.actor.is_some()
+                    || !entry.pending.is_empty()
+                    || !entry.task.pending_inputs.is_empty()
+                {
                     return refuse(
                         ErrorCode::Invalid,
                         format!(
@@ -1297,7 +1303,9 @@ impl Daemon {
             task.pending_inputs.push(input.text.clone());
             task.updated_ms = store::now_ms();
             self.store.save_durable(&task)?;
-            if entry.actor.is_none() {
+            if entry.actor.is_none()
+                || (entry.releasing && entry.task.status == Status::Interrupted)
+            {
                 entry.pending = entry.task.pending_inputs.clone();
             }
             entry.task = task;
@@ -2370,10 +2378,16 @@ impl Daemon {
         turns: &[(String, u32)],
         approvals: &[String],
     ) -> Result<()> {
-        for (task, turn) in turns {
-            self.try_update(task, |t| t.delivered = t.delivered.max(*turn))?;
-        }
         let mut st = self.lock();
+        for (task, turn) in turns {
+            if let Some(entry) = st.tasks.get_mut(task) {
+                let mut task = entry.task.clone();
+                task.delivered = task.delivered.max(*turn);
+                task.updated_ms = store::now_ms();
+                self.store.save_durable(&task)?;
+                entry.task = task;
+            }
+        }
         let mut ledger = st.ledger.clone();
         for e in seen {
             // A task gc removed meanwhile took its cursors along.

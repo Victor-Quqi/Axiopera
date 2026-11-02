@@ -313,14 +313,14 @@ impl Store {
     }
 
     /// Startup scans records once without retaining non-deliverable events.
-    pub fn recover_events(&self, id: &str, mut visit: impl FnMut(Event)) -> Result<()> {
+    pub fn recover_events(&self, id: &str, mut visit: impl FnMut(Event)) -> Result<Option<String>> {
         let mut f = match OpenOptions::new()
             .read(true)
             .append(true)
             .open(self.events_path(id))
         {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         self.repair_tail(id, &mut f)?;
@@ -345,10 +345,7 @@ impl Store {
                 }
             }
         }
-        match error {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        Ok(error.map(|e| format!("{e:#}")))
     }
 
     pub fn quarantine(&self, path: &Path) -> Result<PathBuf> {
@@ -378,25 +375,16 @@ impl Store {
             .collect()
     }
 
-    pub fn recover_tasks(&self) -> (Vec<Task>, Vec<String>) {
+    pub fn recover_tasks(&self) -> Result<(Vec<Task>, Vec<String>)> {
         let mut tasks = Vec::new();
         let mut errors = Vec::new();
         let entries = match fs::read_dir(&self.root) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (tasks, errors),
-            Err(e) => {
-                errors.push(format!("reading task directories: {e:#}"));
-                return (tasks, errors);
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((tasks, errors)),
+            Err(e) => return Err(e).context("reading task directories"),
         };
         for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    errors.push(e.to_string());
-                    continue;
-                }
-            };
+            let entry = entry.context("reading task directory entry")?;
             let read = || -> Result<Task> {
                 if !entry.file_type()?.is_dir() {
                     bail!("task directory is not a real directory");
@@ -414,13 +402,12 @@ impl Store {
                     if e.downcast_ref::<std::io::Error>()
                         .is_some_and(|e| e.kind() != std::io::ErrorKind::NotFound) =>
                 {
-                    errors.push(format!(
-                        "reading task directory {}: {e:#}; directory kept for retry",
-                        entry.path().display()
-                    ));
+                    return Err(e).with_context(|| {
+                        format!("reading task directory {}", entry.path().display())
+                    });
                 }
                 Err(e) => {
-                    let isolated = self.quarantine(&entry.path());
+                    let isolated = self.quarantine(&entry.path())?;
                     errors.push(format!(
                         "invalid task directory {}: {e:#}; quarantine: {isolated:?}",
                         entry.path().display()
@@ -428,7 +415,7 @@ impl Store {
                 }
             }
         }
-        (tasks, errors)
+        Ok((tasks, errors))
     }
 }
 

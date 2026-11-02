@@ -218,6 +218,8 @@ async fn tier_changes_respect_task_ownership_and_parent_child_limits() {
     .await
     .unwrap();
     f.d.lock().tasks.get_mut("test").unwrap().pending.clear();
+    f.d.try_update("test", |t| t.pending_inputs.clear())
+        .unwrap();
     f.d.input(
         native,
         "kid",
@@ -242,6 +244,7 @@ async fn tier_changes_respect_task_ownership_and_parent_child_limits() {
     assert_eq!(f.d.lock().tasks["test"].task.tier, ipc::Tier::Full);
     // Idle children can still resume at their saved tier and also prevent a downgrade.
     f.d.lock().tasks.get_mut("kid").unwrap().pending.clear();
+    f.d.try_update("kid", |t| t.pending_inputs.clear()).unwrap();
     assert!(
         f.d.input(
             "user",
@@ -1017,7 +1020,15 @@ fn a_reply_passes_over_news_of_a_task_gc_removed_meanwhile() {
     assert_eq!(b.seen.len(), 2);
     assert_eq!(b.items.len(), 1);
     assert_eq!(b.items[0].0.task, "test");
-    f.d.mark_seen("codex:host", &b.seen, &[], &[]).unwrap();
+    f.d.mark_seen(
+        "codex:host",
+        &b.seen,
+        &[("gone".into(), 1), ("test".into(), 2)],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(f.d.lock().tasks["test"].task.delivered, 2);
+    assert_eq!(f.d.lock().ledger.cursors["codex:host|test"], 2);
     assert!(
         !f.d.lock()
             .ledger
@@ -1517,6 +1528,22 @@ async fn accepted_input_and_mail_survive_restart_without_starting_an_agent() {
         assert!(again.at_limit(&st, "codex:other").is_none());
         assert!(!again.live(&st, "codex:host", &[]));
     }
+    assert!(
+        again
+            .input(
+                "codex:host",
+                "test",
+                "change tier".into(),
+                Some(ipc::Tier::Work),
+                Some(Vec::new())
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        again.lock().tasks["test"].task.pending_inputs,
+        ["first", "second"]
+    );
     assert_eq!(again.lock().tasks["test"].mail.len(), 1);
     again.schedule("test");
     assert!(again.lock().tasks["test"].actor.is_none());
@@ -1544,6 +1571,7 @@ async fn input_during_interrupted_release_schedules_a_fresh_actor() {
         entry.actor = Some(tx);
         entry.releasing = true;
         entry.task.status = Status::Running;
+        entry.task.pending_inputs.push("earlier".into());
     }
     f.d.stop_tree("test", "parent timed out", "timeout", true)
         .unwrap();
@@ -1560,7 +1588,7 @@ async fn input_during_interrupted_release_schedules_a_fresh_actor() {
     f.d.actor_done("test");
     let mut st = f.d.lock();
     assert!(st.tasks["test"].actor.is_some());
-    assert_eq!(st.tasks["test"].pending, ["continue"]);
+    assert_eq!(st.tasks["test"].pending, ["earlier", "continue"]);
     assert_eq!(st.running, 1);
     // The current-thread runtime has not polled the actor; prevent any CLI startup.
     st.tasks.get_mut("test").unwrap().env = None;
@@ -1706,22 +1734,29 @@ fn only_legacy_timeouts_are_migrated_to_resumable_tasks() {
 
 #[cfg(windows)]
 #[test]
-fn transient_task_read_failure_keeps_the_directory_for_retry() {
+fn transient_task_or_event_read_failure_preserves_cursors_for_retry() {
     use std::os::windows::fs::OpenOptionsExt;
     let f = fixture();
-    let path = f.home.join("tasks/test/task.json");
-    let held = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(0)
-        .open(&path)
-        .unwrap();
-    let again = Daemon::load(options(&f.home), None).unwrap();
-    assert!(again.lock().tasks.is_empty());
-    assert!(path.exists());
-    assert!(!f.home.join("quarantine").exists());
-    drop(held);
-    let again = Daemon::load(options(&f.home), None).unwrap();
-    assert!(again.lock().tasks.contains_key("test"));
+    f.d.try_emit("test", "failed", json!({})).unwrap();
+    let events = f.d.lock().tasks["test"].deliverable.clone();
+    f.d.mark_seen("codex:host", &events, &[], &[]).unwrap();
+    let ledger = std::fs::read(f.home.join("ledger.json")).unwrap();
+    for file in ["task.json", "events.jsonl"] {
+        let path = f.home.join("tasks/test").join(file);
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(Daemon::load(options(&f.home), None).is_err());
+        assert!(path.exists());
+        assert!(!f.home.join("quarantine").exists());
+        assert_eq!(std::fs::read(f.home.join("ledger.json")).unwrap(), ledger);
+        drop(held);
+        let again = Daemon::load(options(&f.home), None).unwrap();
+        assert!(again.unseen(&again.lock(), "codex:host", &[]).is_empty());
+        assert_eq!(again.lock().seq, events[0].seq);
+    }
 }
 
 #[test]
