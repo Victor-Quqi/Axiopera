@@ -15,6 +15,26 @@ use crate::agent::{self, AgentEvent, Backend, StartSpec, Steer};
 use crate::ipc::Agent;
 use crate::store::{Fingerprint, Status};
 
+impl Daemon {
+    pub(super) fn file_changed(&self, id: &str, path: &str) {
+        let mut st = self.lock();
+        let Some(entry) = st.tasks.get_mut(id) else {
+            return;
+        };
+        if entry.task.changed_files.iter().any(|p| p == path) {
+            return;
+        }
+        let updated = entry.task.updated_ms;
+        entry.task.changed_files.push(path.to_string());
+        entry.task.updated_ms = crate::store::now_ms();
+        if let Err(e) = self.store.save(&entry.task) {
+            entry.task.changed_files.pop();
+            entry.task.updated_ms = updated;
+            self.log(&format!("saving {id}: {e:#}"));
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum Cmd {
     /// A message from the parent: steer the running turn, or start the next one.
@@ -279,11 +299,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                     AgentEvent::ToolUpdated { id: call, name, detail } => d.emit(id, "tool_updated", json!({"id": call, "name": name, "detail": detail})),
                     AgentEvent::Said(text) => d.emit(id, "said", json!({"text": agent::clip(&text, SAID)})),
                     AgentEvent::FileChanged(path) => {
-                        d.update(id, |t| {
-                            if !t.changed_files.contains(&path) {
-                                t.changed_files.push(path.clone());
-                            }
-                        });
+                        d.file_changed(id, &path);
                         d.emit(id, "file_changed", json!({"path": path}));
                     }
                     AgentEvent::InputRead(message) => {

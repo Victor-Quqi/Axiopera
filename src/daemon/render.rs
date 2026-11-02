@@ -26,14 +26,14 @@ pub const LINE_BYTES: usize = 400;
 const SUMMARY_LINES: usize = 10;
 
 /// News lines as a reminder lists them, ending with how to take the news.
-pub fn summary(lines: &[String]) -> String {
+pub fn summary(lines: impl ExactSizeIterator<Item = String>) -> String {
+    let total = lines.len();
     let mut text: Vec<String> = lines
-        .iter()
         .take(SUMMARY_LINES)
         .map(|l| format!("- {l}"))
         .collect();
-    if lines.len() > SUMMARY_LINES {
-        text.push(format!("- …and {} more", lines.len() - SUMMARY_LINES));
+    if total > SUMMARY_LINES {
+        text.push(format!("- …and {} more", total - SUMMARY_LINES));
     }
     text.push("Take them with `axiopera inbox`.".into());
     text.join("\n")
@@ -372,7 +372,7 @@ mod tests {
         let lines: Vec<String> = (0..12)
             .map(|i| format!("t{i} (claude) finished turn 1"))
             .collect();
-        let text = summary(&lines);
+        let text = summary(lines.into_iter());
         assert_eq!(text.lines().count(), 12);
         assert!(text.contains("- …and 2 more\nTake them with `axiopera inbox`."));
         let long = fit_bytes(&"审".repeat(200), LINE_BYTES);

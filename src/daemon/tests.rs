@@ -1075,3 +1075,231 @@ fn a_running_daemon_trims_logs_and_keeps_writing() {
         ""
     );
 }
+
+// Retained as a differential oracle and benchmark baseline for delivery queries.
+fn scanned_unseen(d: &Daemon, st: &State, caller: &str, only: &[String]) -> Vec<Event> {
+    let ids = d.children(st, caller, only);
+    let mut ready = Vec::new();
+    for (id, entry) in &st.tasks {
+        let child = ids.contains(id);
+        let below = only.is_empty() || only.iter().any(|root| within(st, &entry.task, root));
+        if !child && !below {
+            continue;
+        }
+        let cursor = st
+            .ledger
+            .cursors
+            .get(&cursor_key(caller, id))
+            .copied()
+            .unwrap_or(0);
+        ready.extend(
+            entry
+                .deliverable
+                .iter()
+                .filter(|e| {
+                    e.seq > cursor
+                        && if e.kind == "approval_request" {
+                            e.data.get("approver").and_then(Value::as_str) == Some(caller)
+                        } else {
+                            child
+                        }
+                })
+                .cloned(),
+        );
+    }
+    ready.sort_by_key(|e| e.seq);
+    ready
+}
+
+#[test]
+fn indexed_delivery_preserves_historical_routes_filters_and_cursors_after_reload() {
+    let f = fixture_with(&[
+        json!({"id": "child", "parent": "task:test"}),
+        json!({"id": "native", "parent": "task:child/grok:native"}),
+        json!({"id": "other", "parent": "codex:elsewhere"}),
+    ]);
+    for _ in 0..3 {
+        for task in ["test", "child", "native", "other"] {
+            f.d.emit(task, "question", json!({"id": "q", "text": "hi"}));
+            for approver in ["codex:host", "task:test", "codex:elsewhere"] {
+                f.d.emit(
+                    task,
+                    "approval_request",
+                    json!({"id": "historic", "approver": approver}),
+                );
+            }
+        }
+    }
+    let reloaded = Daemon::load(options(&f.home), None);
+    for d in [f.d.as_ref(), &reloaded] {
+        let mut st = d.lock();
+        for caller in [
+            "codex:host",
+            "task:test",
+            "codex:elsewhere",
+            "task:child/grok:native",
+        ] {
+            for only in [
+                vec![],
+                vec!["test".to_string()],
+                vec!["child".into(), "other".into()],
+            ] {
+                for cursor in [0, 1, 8, 24, 48, 100] {
+                    for task in ["test", "child", "native", "other"] {
+                        st.ledger.cursors.insert(cursor_key(caller, task), cursor);
+                    }
+                    assert_eq!(
+                        serde_json::to_value(d.unseen(&st, caller, &only)).unwrap(),
+                        serde_json::to_value(scanned_unseen(d, &st, caller, &only)).unwrap()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "small repeatable performance measurement; run with --release --ignored --nocapture"]
+fn delivery_performance() {
+    use std::hint::black_box;
+    use std::io::{BufWriter, Write};
+    let f = fixture_with(
+        &(0..80)
+            .map(|i| {
+                json!({"id": format!("t{i}"),
+        "parent": if i < 40 { "codex:host" } else { "codex:other" }})
+            })
+            .collect::<Vec<_>>(),
+    );
+    {
+        let mut st = f.d.lock();
+        for entry in st.tasks.values_mut() {
+            entry.deliverable = (1..=1000)
+                .map(|seq| Event {
+                    seq,
+                    ts: 0,
+                    task: entry.task.id.clone(),
+                    kind: "question".into(),
+                    data: Map::new(),
+                })
+                .collect();
+            entry.approval_events = delivery::approval_index(&entry.deliverable);
+        }
+        for id in st.tasks.keys().cloned().collect::<Vec<_>>() {
+            st.ledger
+                .cursors
+                .insert(cursor_key("codex:host", &id), 1000);
+        }
+        let at = Instant::now();
+        for _ in 0..200 {
+            black_box(scanned_unseen(&f.d, &st, "codex:host", &[]));
+        }
+        let before = at.elapsed();
+        let at = Instant::now();
+        for _ in 0..200 {
+            black_box(f.d.unseen(&st, "codex:host", &[]));
+        }
+        println!(
+            "unseen: 81 tasks x 1000 consumed events, 200 queries: scan={before:?}, indexed={:?}",
+            at.elapsed()
+        );
+    }
+    f.d.file_changed("test", "repeat.rs");
+    let at = Instant::now();
+    for _ in 0..200 {
+        f.d.update("test", |t| {
+            if !t.changed_files.iter().any(|p| p == "repeat.rs") {
+                t.changed_files.push("repeat.rs".into());
+            }
+        });
+    }
+    let before = at.elapsed();
+    let at = Instant::now();
+    for _ in 0..200 {
+        f.d.file_changed("test", "repeat.rs");
+    }
+    println!(
+        "FileChanged: 200 duplicate updates: saved={before:?}, skipped={:?}",
+        at.elapsed()
+    );
+    let path = f.d.store.events_path("test");
+    {
+        let mut file = BufWriter::new(File::create(&path).unwrap());
+        for seq in 1..=20_000 {
+            let event = Event {
+                seq,
+                ts: 0,
+                task: "test".into(),
+                kind: "said".into(),
+                data: json!({"text": "x".repeat(128)})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            };
+            serde_json::to_writer(&mut file, &event).unwrap();
+            writeln!(file).unwrap();
+        }
+    }
+    let at = Instant::now();
+    for _ in 0..20 {
+        black_box(
+            f.d.store
+                .events("test")
+                .into_iter()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>(),
+        );
+    }
+    let before = at.elapsed();
+    let at = Instant::now();
+    for _ in 0..20 {
+        black_box(delivery::tail_events(&path, 10).unwrap());
+    }
+    println!(
+        "log: 20000 events, 20 tail(10) reads: full={before:?}, tail={:?}",
+        at.elapsed()
+    );
+    for turn in 1..=20 {
+        f.d.store
+            .save_turn("test", turn, &"x".repeat(128 * 1024))
+            .unwrap();
+    }
+    let news: Vec<_> = (1..=20)
+        .map(|turn| Event {
+            seq: turn,
+            ts: 0,
+            task: "test".into(),
+            kind: "turn_ended".into(),
+            data: json!({"turn": turn, "ok": true})
+                .as_object()
+                .unwrap()
+                .clone(),
+        })
+        .collect();
+    let at = Instant::now();
+    for _ in 0..20 {
+        let lines = news
+            .iter()
+            .map(|e| {
+                let body =
+                    std::fs::read_to_string(f.d.store.turn_path("test", e.seq as u32)).unwrap();
+                format!(
+                    "test finished turn {}: {}",
+                    e.seq,
+                    agent::clip(&body, render::PREVIEW)
+                )
+            })
+            .collect::<Vec<_>>();
+        black_box(render::summary(lines.into_iter()));
+    }
+    let before = at.elapsed();
+    let at = Instant::now();
+    for _ in 0..20 {
+        black_box(f.d.news_text(&f.d.lock(), &news));
+    }
+    println!(
+        "reminder: 20 results x 128KiB, 20 renders (including cold cache): full={before:?}, limited_cached={:?}",
+        at.elapsed()
+    );
+}

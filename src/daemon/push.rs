@@ -26,6 +26,8 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// Retries after a failed push start here and double up to the maximum.
 const RETRY: Duration = Duration::from_secs(30);
 const RETRY_MAX: Duration = Duration::from_secs(600);
+const HOST_TTL: Duration = Duration::from_secs(60);
+const HOST_CAPACITY: usize = 128;
 
 /// How a host learns of its sub-tasks' events.
 #[derive(Clone, Copy, PartialEq, Debug, serde::Serialize)]
@@ -62,6 +64,9 @@ impl Daemon {
             thread: thread.to_string(),
             doorbell: false,
         };
+        if let Some(reach) = self.cached_host(caller, &host) {
+            return (reach, None);
+        }
         let home = host.codex_home.as_deref();
         let shared = self
             .probe(caller, "is not on the shared Codex daemon", async {
@@ -97,10 +102,34 @@ impl Daemon {
         host.doorbell = reach == Reach::Doorbell;
         let mut st = self.lock();
         st.ledger.codex_hosts.insert(caller.to_string(), host);
+        st.host_checked.retain(|_, at| at.elapsed() < HOST_TTL);
+        if st.host_checked.len() >= HOST_CAPACITY {
+            st.host_checked.clear();
+        }
+        st.host_checked
+            .insert(caller.to_string(), std::time::Instant::now());
         if let Err(e) = st.ledger.save(&self.opts.home) {
             self.log(&format!("saving the ledger: {e:#}"));
         }
         (reach, None)
+    }
+
+    fn cached_host(&self, caller: &str, candidate: &CodexHost) -> Option<Reach> {
+        let st = self.lock();
+        let at = st.host_checked.get(caller)?;
+        let host = st.ledger.codex_hosts.get(caller)?;
+        if at.elapsed() >= HOST_TTL
+            || host.exe != candidate.exe
+            || host.codex_home != candidate.codex_home
+            || host.thread != candidate.thread
+        {
+            return None;
+        }
+        Some(if host.doorbell {
+            Reach::Doorbell
+        } else {
+            Reach::Push
+        })
     }
 
     /// The check's answer, or None when Codex gave none in time. A failed check counts as no
@@ -327,6 +356,7 @@ impl Daemon {
             Err(e) => {
                 let failures = {
                     let mut st = self.lock();
+                    st.host_checked.remove(caller);
                     let n = st.push_failures.entry(caller.to_string()).or_default();
                     *n += 1;
                     *n
@@ -745,5 +775,47 @@ command: {summary}"
             .unwrap();
         inbox().await;
         assert!(f.d.lock().ledger.doorbells.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod capability_cache_tests {
+    use super::*;
+
+    #[test]
+    fn only_recent_successes_with_matching_launch_identity_are_reused() {
+        let f = crate::daemon::tests::fixture();
+        let mut host = CodexHost {
+            exe: "fake-codex".into(),
+            codex_home: None,
+            thread: "host".into(),
+            doorbell: false,
+        };
+        f.d.lock()
+            .ledger
+            .codex_hosts
+            .insert("codex:host".into(), host.clone());
+        assert_eq!(f.d.cached_host("codex:host", &host), None);
+        f.d.lock()
+            .host_checked
+            .insert("codex:host".into(), std::time::Instant::now());
+        assert_eq!(f.d.cached_host("codex:host", &host), Some(Reach::Push));
+        f.d.lock()
+            .ledger
+            .codex_hosts
+            .get_mut("codex:host")
+            .unwrap()
+            .doorbell = true;
+        assert_eq!(f.d.cached_host("codex:host", &host), Some(Reach::Doorbell));
+        host.codex_home = Some("different-home".into());
+        assert_eq!(f.d.cached_host("codex:host", &host), None);
+        host.codex_home = None;
+        host.exe = "changed-executable".into();
+        assert_eq!(f.d.cached_host("codex:host", &host), None);
+        host.exe = "fake-codex".into();
+        f.d.lock()
+            .host_checked
+            .insert("codex:host".into(), std::time::Instant::now() - HOST_TTL);
+        assert_eq!(f.d.cached_host("codex:host", &host), None);
     }
 }

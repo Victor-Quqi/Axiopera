@@ -1,5 +1,6 @@
 //! The per-user daemon: owns every sub-agent process and all task state.
 
+mod delivery;
 mod push;
 pub mod render;
 mod task;
@@ -65,6 +66,7 @@ pub struct Daemon {
     log: Mutex<Option<File>>,
     /// Held while appending to or trimming `daemon/requests.jsonl`.
     requests: Mutex<()>,
+    previews: Mutex<delivery::Previews>,
 }
 
 struct State {
@@ -84,6 +86,7 @@ struct State {
     pushing: HashMap<String, tokio::time::Instant>,
     /// Failed pushes in a row, per host.
     push_failures: HashMap<String, u32>,
+    host_checked: HashMap<String, Instant>,
 }
 
 struct Pending {
@@ -109,6 +112,7 @@ struct Entry {
     mail: Vec<String>,
     /// Events for `inbox`, in order.
     deliverable: Vec<Event>,
+    approval_events: HashMap<String, Vec<usize>>,
     blocked: usize,
     /// Notices from the adapter, for the end of the turn.
     notices: Vec<String>,
@@ -245,7 +249,7 @@ impl Daemon {
         for task in store.load_all() {
             let events = store.events(&task.id);
             seq = seq.max(events.last().map_or(0, |e| e.seq));
-            let deliverable = events
+            let deliverable: Vec<Event> = events
                 .into_iter()
                 .filter(|e| store::deliverable(&e.kind))
                 .collect();
@@ -263,6 +267,7 @@ impl Daemon {
                 env: None,
                 pending: Vec::new(),
                 mail: Vec::new(),
+                approval_events: delivery::approval_index(&deliverable),
                 deliverable,
             };
             tasks.insert(entry.task.id.clone(), entry);
@@ -283,12 +288,14 @@ impl Daemon {
                 deliveries: HashMap::new(),
                 pushing: HashMap::new(),
                 push_failures: HashMap::new(),
+                host_checked: HashMap::new(),
             }),
             events,
             shutdown: Notify::new(),
             conns: AtomicUsize::new(0),
             log: Mutex::new(log),
             requests: Mutex::new(()),
+            previews: Mutex::new(delivery::Previews::default()),
         };
         // Whatever was running when the last daemon died has lost its process.
         let ids: Vec<String> = {
@@ -428,7 +435,18 @@ impl Daemon {
                 _ => {}
             }
             if store::deliverable(kind) {
+                delivery::index_approval(
+                    &mut entry.approval_events,
+                    &event,
+                    entry.deliverable.len(),
+                );
                 entry.deliverable.push(event.clone());
+                if entry.deliverable.len() > 1
+                    && entry.deliverable[entry.deliverable.len() - 2].seq > event.seq
+                {
+                    entry.deliverable.sort_by_key(|e| e.seq);
+                    entry.approval_events = delivery::approval_index(&entry.deliverable);
+                }
             }
         }
         let _ = self.events.send(event);
@@ -955,6 +973,7 @@ impl Daemon {
                 pending: vec![s.task.clone()],
                 mail: Vec::new(),
                 deliverable: Vec::new(),
+                approval_events: HashMap::new(),
             };
             st.tasks.insert(id.clone(), entry);
         }
@@ -1983,8 +2002,7 @@ impl Daemon {
 
     /// News as reminders show it: a line each, at most ten, and how to take it.
     fn news_text(&self, st: &State, news: &[Event]) -> String {
-        let lines: Vec<String> = news.iter().map(|e| self.news_line(st, e)).collect();
-        render::summary(&lines)
+        render::summary(news.iter().map(|e| self.news_line(st, e)))
     }
 
     /// One line on a piece of news: which task, what happened, and a preview.
@@ -1996,9 +2014,11 @@ impl Daemon {
         let line = match e.kind.as_str() {
             "turn_ended" => {
                 let turn = n("turn") as u32;
-                let result = std::fs::read_to_string(self.store.turn_path(&e.task, turn))
-                    .unwrap_or_default();
-                let preview = agent::clip(&result, render::PREVIEW);
+                let preview = self
+                    .previews
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&self.store.turn_path(&e.task, turn));
                 if e.data.get("ok") == Some(&Value::Bool(true)) {
                     format!("{who} finished turn {turn}: {preview}")
                 } else {
@@ -2070,8 +2090,10 @@ impl Daemon {
                 if !only.is_empty() && !only.iter().any(|root| within(st, &task.task, root)) {
                     return None;
                 }
-                task.deliverable
+                task.approval_events
+                    .get(caller)?
                     .iter()
+                    .map(|&at| &task.deliverable[at])
                     .find(|e| {
                         e.kind == "approval_request"
                             && e.data.get("id").and_then(Value::as_str) == Some(rid)
@@ -2081,45 +2103,6 @@ impl Daemon {
             .collect();
         found.sort_by_key(|e| e.seq);
         found
-    }
-
-    /// Events the caller has not taken yet, oldest first: from its children (or only the tasks
-    /// in `only`), and approval requests routed to it from further down.
-    fn unseen(&self, st: &State, caller: &str, only: &[String]) -> Vec<Event> {
-        let ids = self.children(st, caller, only);
-        let mut ready = Vec::new();
-        for (id, e) in &st.tasks {
-            let child = ids.contains(id);
-            // Approvals routed here from further down count if they come from what is waited
-            // for.
-            let below = only.is_empty() || only.iter().any(|root| within(st, &e.task, root));
-            if !child && !below {
-                continue;
-            }
-            let cursor = st
-                .ledger
-                .cursors
-                .get(&cursor_key(caller, id))
-                .copied()
-                .unwrap_or(0);
-            // Approval requests reach their approver only, who may be further up than the
-            // parent; everything else reaches the parent.
-            ready.extend(
-                e.deliverable
-                    .iter()
-                    .filter(|ev| {
-                        ev.seq > cursor
-                            && if ev.kind == "approval_request" {
-                                ev.data.get("approver").and_then(Value::as_str) == Some(caller)
-                            } else {
-                                child
-                            }
-                    })
-                    .cloned(),
-            );
-        }
-        ready.sort_by_key(|e| e.seq);
-        ready
     }
 
     /// What one reply hands over: the waiting `approvals` first, then `events` oldest first;
@@ -2391,15 +2374,13 @@ impl Daemon {
         let Some(agent) = self.lock().tasks.get(&id).map(|e| e.task.agent) else {
             return refuse(ErrorCode::NotFound, format!("no task {id}"));
         };
-        let events = self.store.events(&id);
-        let start = events.len().saturating_sub(tail);
-        let text = events[start..]
+        let events = delivery::tail_events(&self.store.events_path(&id), tail)?;
+        let text = events
             .iter()
             .map(|e| render::event_line(e, agent))
             .collect::<Vec<_>>()
             .join("\n");
-        out.text(text, serde_json::to_value(&events[start..])?)
-            .await?;
+        out.text(text, serde_json::to_value(&events)?).await?;
         Ok(ipc::exit::OK)
     }
 
