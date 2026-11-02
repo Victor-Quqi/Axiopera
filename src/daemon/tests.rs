@@ -1076,6 +1076,22 @@ fn a_running_daemon_trims_logs_and_keeps_writing() {
     );
 }
 
+#[test]
+fn daemon_logging_recovers_after_a_temporary_open_failure() {
+    let f = fixture();
+    let path = f.d.opts.home.join("daemon/daemon.log");
+    std::fs::create_dir_all(&path).unwrap();
+    assert!(f.d.trim_daemon_log(0).is_err());
+    f.d.log("cannot open yet");
+    std::fs::remove_dir(&path).unwrap();
+    f.d.log("logging recovered");
+    assert!(
+        std::fs::read_to_string(path)
+            .unwrap()
+            .ends_with("logging recovered\n")
+    );
+}
+
 // Retained as a differential oracle and benchmark baseline for delivery queries.
 fn scanned_unseen(d: &Daemon, st: &State, caller: &str, only: &[String]) -> Vec<Event> {
     let ids = d.children(st, caller, only);

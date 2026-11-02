@@ -7,10 +7,10 @@ mod grok;
 pub mod models;
 mod rpc;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
@@ -316,24 +316,40 @@ impl Backend {
 // ---- process plumbing ----
 
 #[derive(Clone, Default)]
-pub struct Trace(Option<Arc<Mutex<(std::fs::File, PathBuf)>>>);
+pub struct Trace(Option<Arc<Mutex<TraceFile>>>);
+
+struct TraceFile {
+    file: std::fs::File,
+    path: PathBuf,
+}
 
 impl Trace {
     fn open(path: Option<&Path>) -> std::io::Result<Self> {
-        path.map(|path| {
-            std::fs::OpenOptions::new()
+        let Some(path) = path else {
+            return Ok(Self::default());
+        };
+        // A previous process may still be draining stdout when its successor starts.
+        static OPEN: OnceLock<Mutex<HashMap<PathBuf, Weak<Mutex<TraceFile>>>>> = OnceLock::new();
+        let mut open = OPEN.get_or_init(Mutex::default).lock().unwrap();
+        open.retain(|_, file| file.strong_count() > 0);
+        if let Some(file) = open.get(path).and_then(Weak::upgrade) {
+            return Ok(Self(Some(file)));
+        }
+        let file = Arc::new(Mutex::new(TraceFile {
+            file: std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)
-                .map(|file| Self(Some(Arc::new(Mutex::new((file, path.to_owned()))))))
-        })
-        .unwrap_or_else(|| Ok(Self::default()))
+                .open(path)?,
+            path: path.to_owned(),
+        }));
+        open.insert(path.to_owned(), Arc::downgrade(&file));
+        Ok(Self(Some(file)))
     }
 
     pub fn line(&self, direction: &str, line: &str) {
         if let Some(file) = &self.0 {
             let mut guard = file.lock().unwrap();
-            let (file, path) = &mut *guard;
+            let TraceFile { file, path } = &mut *guard;
             let _ = crate::diagnostics::append(
                 file,
                 path,
@@ -559,6 +575,28 @@ pub fn clip(s: &str, max: usize) -> String {
 mod tests {
     use super::clip;
     use super::is_axiopera_command as ok;
+
+    #[test]
+    fn overlapping_protocol_readers_share_the_rotation_lock() {
+        let dir = std::env::temp_dir().join(format!("axiopera-trace-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("protocol.log");
+        let old = super::Trace::open(Some(&path)).unwrap();
+        let new = super::Trace::open(Some(&path)).unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            old.0.as_ref().unwrap(),
+            new.0.as_ref().unwrap()
+        ));
+        old.line("out", "last old record");
+        new.line("in", "first new record");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "out last old record\nin first new record\n"
+        );
+        drop(old);
+        drop(new);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn clipped_lines_keep_every_line_and_count_the_rest() {

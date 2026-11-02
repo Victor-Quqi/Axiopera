@@ -323,8 +323,16 @@ impl Daemon {
     }
 
     fn log(&self, msg: &str) {
-        if let Some(f) = self.log.lock().unwrap().as_mut() {
-            let path = self.opts.home.join("daemon/daemon.log");
+        let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
+        let path = self.opts.home.join("daemon/daemon.log");
+        if log.is_none() {
+            *log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .ok();
+        }
+        if let Some(f) = log.as_mut() {
             let _ = crate::diagnostics::append(
                 f,
                 &path,
@@ -337,7 +345,7 @@ impl Daemon {
     fn trim_daemon_log(&self, cutoff_ms: u64) -> Result<()> {
         let mut log = self.log.lock().unwrap_or_else(PoisonError::into_inner);
         let path = self.opts.home.join("daemon/daemon.log");
-        let reopen = log.take().is_some();
+        let reopen = log.take().is_some() || path.exists();
         let result = trim_log(&path, cutoff_ms)
             .and_then(|()| trim_log(&path.with_extension("log.1"), cutoff_ms));
         if reopen {

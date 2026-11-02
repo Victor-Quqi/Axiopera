@@ -875,8 +875,8 @@ impl View {
         self.table(now).0.into_iter().filter_map(|r| r.id).collect()
     }
 
-    /// A line for each task, sub-tasks under their parent, and with several sessions a line
-    /// for each above the tasks it spawned. Also returns how many stopped tasks are left out.
+    /// A line for each task, sub-tasks under their parent, and a session heading above its
+    /// tasks. Also returns how many stopped tasks are left out.
     fn table(&self, now: u64) -> (Vec<Row>, usize) {
         let shown = self.shown(now);
         let hidden = self.tasks.len() - shown.len();
