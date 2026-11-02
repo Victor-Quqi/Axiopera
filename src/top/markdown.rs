@@ -3,6 +3,7 @@
 //! write: headings, lists, quotes, rules, fenced code, tables, and in a line bold, italic, code,
 //! links and escapes. Anything else stays as written.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use super::{Seg, breaks, columns};
@@ -469,16 +470,25 @@ fn emphasis_close(chars: &[char], i: usize, k: usize) -> Option<usize> {
 }
 
 /// Where the closing bracket or parenthesis of the one at `i` is, past code spans.
-fn bracket_close(chars: &[char], i: usize, open: char, close: char) -> Option<usize> {
-    let mut depth = 0;
+fn bracket_close(
+    chars: &[char],
+    i: usize,
+    open: char,
+    close: char,
+    found: &mut HashMap<usize, Option<usize>>,
+) -> Option<usize> {
+    if let Some(end) = found.get(&i) {
+        return *end;
+    }
+    let mut pending = Vec::new();
     let mut j = i;
     while j < chars.len() {
         match chars[j] {
-            '\n' => return None,
-            c if c == open => depth += 1,
+            '\n' => break,
+            c if c == open => pending.push(j),
             c if c == close => {
-                depth -= 1;
-                if depth == 0 {
+                found.insert(pending.pop().unwrap(), Some(j));
+                if pending.is_empty() {
                     return Some(j);
                 }
             }
@@ -486,16 +496,23 @@ fn bracket_close(chars: &[char], i: usize, open: char, close: char) -> Option<us
         }
         j = skip(chars, j);
     }
+    // A failed outer link may still contain valid inner links. Remember every opener's
+    // outcome so trying those links does not scan the same suffix again.
+    found.extend(pending.into_iter().map(|at| (at, None)));
     None
 }
 
 /// A link at `i`: where its text and its target are, and what follows it.
-fn link(chars: &[char], i: usize) -> Option<(Range<usize>, Range<usize>, usize)> {
-    let label_end = bracket_close(chars, i, '[', ']')?;
+fn link(
+    chars: &[char],
+    i: usize,
+    found: &mut HashMap<usize, Option<usize>>,
+) -> Option<(Range<usize>, Range<usize>, usize)> {
+    let label_end = bracket_close(chars, i, '[', ']', found)?;
     if chars.get(label_end + 1) != Some(&'(') {
         return None;
     }
-    let target_end = bracket_close(chars, label_end + 1, '(', ')')?;
+    let target_end = bracket_close(chars, label_end + 1, '(', ')', found)?;
     Some((i + 1..label_end, label_end + 2..target_end, target_end + 1))
 }
 
@@ -531,6 +548,7 @@ fn target_shown(text: &str, target: &str, cwd: &str) -> Option<String> {
 /// `chars` styled, starting from `style`, into `out`. Links show where they go when there is
 /// a `cwd`, files' paths from there.
 fn styled(chars: &[char], style: Style, cwd: Option<&str>, out: &mut Vec<(char, &'static str)>) {
+    let mut brackets = HashMap::new();
     let mut i = 0;
     while i < chars.len() {
         let c = chars[i];
@@ -582,7 +600,7 @@ fn styled(chars: &[char], style: Style, cwd: Option<&str>, out: &mut Vec<(char, 
             '!' | '[' => {
                 let at = if c == '!' { i + 1 } else { i };
                 if chars.get(at) == Some(&'[')
-                    && let Some((label, target, end)) = link(chars, at)
+                    && let Some((label, target, end)) = link(chars, at, &mut brackets)
                 {
                     let from = out.len();
                     styled(
@@ -702,6 +720,56 @@ mod tests {
         assert_eq!(
             shown(&[inline("see [a.rs](/x/a.rs) and [d](https://e.com)")]),
             ["see [36;4|a.rs] and [36;4|d]"]
+        );
+    }
+
+    #[test]
+    fn links_keep_nested_escaped_and_code_brackets() {
+        for (text, expected) in [
+            ("[[inner](a)", "[[36;4|inner]"),
+            ("[outer [inner](a)](b)", "[36;4|outer inner]"),
+            ("[outer [inner](a)]", "[outer [36;4|inner]]"),
+            (r"[a\]b](x)", "[36;4|a]b]"),
+            (r"[a\[b](x)", "[36;4|a[b]"),
+            (r"\[a](x) [b](y)", "[a](x) [36;4|b]"),
+            ("[a `]` b](x)", "[36;4|a ][36|]][36;4| b]"),
+            ("[a ``] ` [`` b](x)", "[36;4|a ][36|] ` [][36;4| b]"),
+            ("[a `open](x)", "[36;4|a `open]"),
+            ("[a\nb](x)", "[a\nb](x)"),
+            ("[a `\n]` b](x)", "[36;4|a ][36|\n]][36;4| b]"),
+            ("[a](x(y)) tail", "[36;4|a] tail"),
+            (r"[a](x\)y) tail", "[36;4|a] tail"),
+            ("[a](x`)`y) tail", "[36;4|a] tail"),
+            ("[a](open [b](y)", "[a](open [36;4|b]"),
+            ("![a [b]](x)", "[36;4|a [b]]"),
+        ] {
+            assert_eq!(shown(&[inline(text)]), [expected], "{text}");
+        }
+        assert_eq!(
+            one("[outer [inner](a)](b)"),
+            "[36;4|outer inner][2| (a) (b)]"
+        );
+    }
+
+    #[test]
+    fn long_unclosed_links_keep_their_text_and_later_links() {
+        let open = "[".repeat(65_536);
+        assert_eq!(inline(&open), [(open.clone(), "")]);
+        assert_eq!(
+            inline(&format!("{open}[ok](target)")),
+            [(open.clone(), ""), ("ok".into(), LINK)]
+        );
+        // Balanced labels without a destination also reuse the nested matches.
+        let balanced = format!("{open}text{}", "]".repeat(65_536));
+        assert_eq!(inline(&balanced), [(balanced.clone(), "")]);
+        let targets = "[x](".repeat(16_384);
+        assert_eq!(
+            inline(&format!("{targets}[ok](target)")),
+            [(targets, ""), ("ok".into(), LINK)]
+        );
+        assert_eq!(
+            inline(&format!("{open}\n[ok](target)")),
+            [(format!("{open}\n"), ""), ("ok".into(), LINK)]
         );
     }
 

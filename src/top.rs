@@ -101,6 +101,7 @@ pub async fn run(home: &Path, task: Option<&str>, all: bool) -> Result<i32> {
     let mut input = Input::default();
     let mut ui = Ui {
         open: focus.clone(),
+        list_paused: focus.is_some(),
         chosen: focus,
         keys: keys.is_some(),
         ..Ui::default()
@@ -319,6 +320,8 @@ struct Ui {
     /// Whether keys can be read: without them nothing is chosen.
     keys: bool,
     list_top: usize,
+    /// Manual selection holds the reader's place until they return to the first task.
+    list_paused: bool,
     /// Selected task and its screen row, retained across refreshes and group reordering.
     list_anchor: Option<(String, usize)>,
     page: usize,
@@ -342,7 +345,11 @@ impl Ui {
         }
         // The first task when the chosen one is gone or none was.
         let rows = view.table(now).0;
-        if !self
+        if !self.list_paused {
+            self.list_top = 0;
+            self.list_anchor = None;
+            self.chosen = rows.iter().find_map(|r| r.id.clone());
+        } else if !self
             .chosen
             .as_ref()
             .is_some_and(|c| rows.iter().any(|r| r.id.as_ref() == Some(c)))
@@ -377,6 +384,7 @@ impl Ui {
             )
         {
             self.list_anchor = None;
+            self.list_paused = true;
         }
         match (key, &self.open) {
             (Key::Quit, _) | (Key::Q, None) => return false,
@@ -434,6 +442,13 @@ impl Ui {
                 self.chosen = next;
             }
             _ => {}
+        }
+        if self.open.is_none()
+            && matches!(key, Key::Up | Key::PageUp | Key::Home)
+            && self.chosen == view.order(now).first().cloned()
+        {
+            self.list_paused = false;
+            self.list_top = 0;
         }
         true
     }
@@ -750,6 +765,10 @@ impl View {
                     *top = (*top).min(total.saturating_sub(page));
                     if let Some(at) = rows.iter().position(|r| r.chosen) {
                         *top = (*top).min(at).max(at.saturating_sub(page - 1));
+                        // The first task brings its session heading into view.
+                        if page > 1 && at > 0 && rows[at - 1].id.is_none() && *top == at {
+                            *top = at - 1;
+                        }
                     }
                     lines.extend(rows.into_iter().skip(*top).take(page).map(|r| r.segs));
                     if footer {
@@ -847,25 +866,22 @@ impl View {
                 names.push(name);
             }
         }
-        let several = groups.len() > 1;
         let mut rows = Vec::new();
         let mut lines: HashMap<&str, usize> = HashMap::new();
         let mut group = None;
         for (caller, row) in order {
             let Some((depth, t)) = row else {
-                if several {
-                    group = Some(rows.len());
-                    let mut segs = Vec::new();
-                    if let Some(names) = projects.get(caller).filter(|n| !n.is_empty()) {
-                        segs.push((clean(&names.join(", ")), ""));
-                        segs.push((" · ".into(), DIM));
-                    }
-                    segs.push((labels[caller].clone(), DIM));
-                    rows.push(Row {
-                        rank: WITH_TASKS,
-                        ..Row::new(segs)
-                    });
+                group = Some(rows.len());
+                let mut segs = Vec::new();
+                if let Some(names) = projects.get(caller).filter(|n| !n.is_empty()) {
+                    segs.push((clean(&names.join(", ")), ""));
+                    segs.push((" · ".into(), DIM));
                 }
+                segs.push((labels[caller].clone(), DIM));
+                rows.push(Row {
+                    rank: WITH_TASKS,
+                    ..Row::new(segs)
+                });
                 continue;
             };
             // A task is shown with its session and its ancestors, so it is seen where it is.
@@ -1052,14 +1068,28 @@ impl View {
         }
         let mut lines = head;
         if let (Some((width, height)), Some(scroll)) = (size, scroll) {
-            let mut body = lines.split_off(1);
+            // What waits for someone stays under the title while the conversation scrolls:
+            // following the latest output must not push it out of sight. Past half the window,
+            // the rest of it opens the conversation, where paging reaches it.
+            let mut waiting = lines.split_off(1);
+            let room = height.saturating_sub(1) / 2;
+            let pinned = match waiting.len() <= room {
+                true => waiting.len(),
+                false => room.saturating_sub(1),
+            };
+            let mut body = waiting.split_off(pinned);
+            lines.extend(waiting);
+            if !body.is_empty() && room > 0 {
+                let more = format!("{:8}…and {} more above the conversation", "", body.len());
+                lines.push(vec![(more, DIM)]);
+            }
             for b in &blocks {
                 if !matches!(b, Block::Tools(_)) {
                     body.push(vec![]);
                 }
                 body.extend(b.rows(Some(width), &cwd));
             }
-            lines.extend(scroll.rows(body, height.saturating_sub(1)));
+            lines.extend(scroll.rows(body, height.saturating_sub(lines.len())));
             return finish(&lines, size);
         }
         match size {
@@ -2720,9 +2750,10 @@ mod tests {
         let frame = view.frame(NOW, Some((40, 12)), None);
         assert_eq!(frame.len(), 12, "{frame:#?}");
         let plain: Vec<String> = frame.iter().map(|l| strip_sgr(l)).collect();
-        // One session: no line for it. The latest tasks fill the window.
-        assert!(plain[2].starts_with("  t21 "), "{plain:#?}");
-        assert_eq!(plain[11], "  …and 21 more task(s)", "{plain:#?}");
+        // A single session still has a heading. The latest tasks fill the window.
+        assert_eq!(plain[2], "codex session s");
+        assert!(plain[3].starts_with("  t22 "), "{plain:#?}");
+        assert_eq!(plain[11], "  …and 22 more task(s)", "{plain:#?}");
         for (line, plain) in frame.iter().zip(&plain) {
             assert!(!plain.contains('\x1b'), "{line:?}");
             assert!(columns(plain) <= 39, "{plain:?}");
@@ -3267,6 +3298,67 @@ mod tests {
     }
 
     #[test]
+    fn list_follows_new_tasks_until_browsing_and_reveals_session_headers() {
+        let h = home();
+        let store = Store::new(&h.0);
+        for i in 0..8 {
+            store
+                .save(&task(
+                    &format!("t{i}"),
+                    "codex:a",
+                    "idle",
+                    NOW - 100 - i,
+                    json!({}),
+                ))
+                .unwrap();
+        }
+        let mut view = View::new(&h.0, true);
+        view.refresh();
+        let mut ui = Ui {
+            keys: true,
+            ..Ui::default()
+        };
+        let draw = |ui: &mut Ui, view: &View| {
+            ui.draw(view, NOW, (80, 6))
+                .iter()
+                .map(|s| strip_sgr(s))
+                .collect::<Vec<_>>()
+        };
+        assert!(draw(&mut ui, &view)[2].contains("codex session a"));
+        store
+            .save(&task("new", "codex:b", "idle", NOW, json!({})))
+            .unwrap();
+        view.refresh();
+        let frame = draw(&mut ui, &view);
+        assert_eq!(ui.chosen.as_deref(), Some("new"));
+        assert!(frame[2].contains("codex session b"));
+        ui.press(Key::Down, &view, NOW);
+        draw(&mut ui, &view);
+        ui.press(Key::Down, &view, NOW);
+        draw(&mut ui, &view);
+        assert_eq!(ui.chosen.as_deref(), Some("t1"));
+        store
+            .save(&task("newer", "codex:b", "idle", NOW + 1, json!({})))
+            .unwrap();
+        view.refresh();
+        draw(&mut ui, &view);
+        assert_eq!(ui.chosen.as_deref(), Some("t1"));
+        ui.press(Key::Up, &view, NOW);
+        let frame = draw(&mut ui, &view);
+        assert!(frame[2].contains("codex session a"), "{frame:?}");
+        ui.press(Key::Home, &view, NOW);
+        draw(&mut ui, &view);
+        assert!(!ui.list_paused);
+        store
+            .save(&task("latest", "codex:c", "idle", NOW + 2, json!({})))
+            .unwrap();
+        view.refresh();
+        let frame = draw(&mut ui, &view);
+        assert_eq!(ui.chosen.as_deref(), Some("latest"));
+        assert!(frame[2].contains("codex session c"));
+    }
+
+    #[test]
     fn new_spawns_keep_the_selected_task_on_its_screen_row() {
         let h = home();
         let store = Store::new(&h.0);
@@ -3768,20 +3860,21 @@ mod tests {
         // The first task is chosen and marked; the visible rows stay contiguous.
         let frame = ui.draw(&view, NOW, (80, 6));
         assert_eq!(ui.chosen.as_deref(), Some("t0"));
-        assert!(frame[2].starts_with("\x1b[7m  t0 "), "{frame:#?}");
+        assert!(frame[3].starts_with("\x1b[7m  t0 "), "{frame:#?}");
         let shown = plain(&mut ui, &view);
         assert!(
             shown[0].ends_with("  ↑↓ choose  Enter open  q quit"),
             "{shown:#?}"
         );
-        assert_eq!(columns(&shown[2]), 79, "{shown:#?}");
-        assert!(shown[3].starts_with("  t1 ") && shown[4].starts_with("  t2 "));
-        assert!(shown[5].starts_with("  rows 1–3/7"));
+        assert_eq!(columns(&shown[3]), 79, "{shown:#?}");
+        assert_eq!(shown[2], "user: terminals and unrecognized agents");
+        assert!(shown[4].starts_with("  t1 "));
+        assert!(shown[5].starts_with("  rows 1–3/8"));
 
         ui.press(PageDown, &view, NOW);
         let shown = plain(&mut ui, &view);
         assert_eq!(ui.chosen.as_deref(), Some("t3"));
-        assert!(shown[2].starts_with("  t3 ") && shown[4].starts_with("  t5 "));
+        assert!(shown[2].starts_with("  t2 ") && shown[4].starts_with("  t4 "));
         ui.press(End, &view, NOW);
         let shown = plain(&mut ui, &view);
         assert!(shown[2].starts_with("  t4 ") && shown[4].starts_with("  ask "));
@@ -4008,7 +4101,18 @@ mod tests {
             keys: true,
             ..Ui::default()
         };
-        ui.draw(&view, NOW, (80, 6));
+        // Past half the window, the first stay under the title and the rest open the
+        // conversation.
+        let live: Vec<String> = ui
+            .draw(&view, NOW, (80, 6))
+            .iter()
+            .map(|s| strip_sgr(s))
+            .collect();
+        assert!(live[1].contains("q0: question-00"), "{live:#?}");
+        assert_eq!(
+            live[2].trim_end(),
+            "        …and 19 more above the conversation"
+        );
         ui.press(Key::Home, &view, NOW);
         let mut read = String::new();
         for _ in 0..10 {
@@ -4021,6 +4125,67 @@ mod tests {
                 "missing question {i}"
             );
         }
+    }
+
+    #[test]
+    fn a_pending_approval_stays_in_sight_while_the_conversation_scrolls() {
+        let h = home();
+        let store = Store::new(&h.0);
+        let prompt: Vec<String> = (0..40).map(|i| format!("prompt-{i:02}")).collect();
+        store.save_prompt("t1", &prompt.join("\n\n")).unwrap();
+        store
+            .save(&task("t1", "user", "running", NOW, json!({"turns": 0})))
+            .unwrap();
+        for e in [
+            event(1, 60_000, "t1", "turn_started", json!({"turn": 1})),
+            event(2, 30_000, "t1", "said", json!({"text": "Pushing now."})),
+            event(
+                3,
+                5_000,
+                "t1",
+                "approval_request",
+                json!({"id": "r1", "summary": "git push origin main"}),
+            ),
+        ] {
+            store.append(&e).unwrap();
+        }
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let mut ui = Ui {
+            open: Some("t1".into()),
+            keys: true,
+            ..Ui::default()
+        };
+        let draw = |ui: &mut Ui, view: &View| {
+            ui.draw(view, NOW, (80, 10))
+                .iter()
+                .map(|s| strip_sgr(s))
+                .collect::<Vec<_>>()
+        };
+        // Following the latest output, and paged back to the task text.
+        let live = draw(&mut ui, &view);
+        assert!(live[0].contains("approval"), "{live:#?}");
+        assert!(
+            live[1].starts_with(" needs  approval r1: git push origin main"),
+            "{live:#?}"
+        );
+        assert!(live.iter().any(|s| s.contains("Pushing now.")), "{live:#?}");
+        assert!(live[9].contains("live"), "{live:#?}");
+        ui.press(Key::Home, &view, NOW);
+        let top = draw(&mut ui, &view);
+        assert!(top[1].starts_with(" needs  approval r1"), "{top:#?}");
+        assert!(top.iter().any(|s| s.contains("prompt-00")), "{top:#?}");
+
+        // Decided, it leaves, and the conversation takes its row.
+        store
+            .append(&event(4, 0, "t1", "approved", json!({"id": "r1"})))
+            .unwrap();
+        view.refresh();
+        ui.press(Key::End, &view, NOW);
+        let decided = draw(&mut ui, &view);
+        assert!(!decided.iter().any(|s| s.contains("needs")), "{decided:#?}");
+        assert!(decided[0].contains("running"), "{decided:#?}");
+        assert!(decided[9].contains("live"), "{decided:#?}");
     }
 
     /// A line broken into pieces of up to `room` columns, where `break_at` finds a place.
