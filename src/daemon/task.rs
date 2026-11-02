@@ -1,7 +1,7 @@
 //! One actor per task with a live agent process: drives turns, steers, and lets go of the
 //! process as soon as a turn ends with nothing else to do.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -160,6 +160,12 @@ pub async fn run(d: Arc<Daemon>, id: String, mut rx: mpsc::UnboundedReceiver<Cmd
 }
 
 fn finish_exit(d: &Daemon, id: &str, exit: Exit) -> Result<()> {
+    if let Some(entry) = d.lock().tasks.get_mut(id) {
+        // Unhandled Mail commands are still durable. Keep them for an in-process resume;
+        // later tell calls must bypass the receiver that this actor is about to drop.
+        entry.releasing = true;
+        entry.mail = entry.task.pending_mail.clone();
+    }
     match exit {
         Exit::Released => {}
         Exit::Failed(error) => {
@@ -261,8 +267,21 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
         }
     };
     let mut session_file = task.session_file.as_ref().map(|f| f.path.clone());
+    let mut waiting = VecDeque::new();
     let outcome = async {
-    start_turn(d, id, &mut backend, &inputs).await?;
+    macro_rules! request {
+        ($future:expr) => {
+            match wait_request($future, rx, &mut waiting, deadline, &timed_out).await {
+                Ok(result) => result,
+                Err(Exit::Stopped(cause)) => return Ok(cancel(&mut backend, cause).await),
+                Err(exit) => {
+                    backend.kill();
+                    return Ok(exit);
+                }
+            }
+        };
+    }
+    request!(start_turn(d, id, &mut backend, &inputs))?;
     let mut last_activity = Instant::now();
     let mut stalled = false;
     let mut tick = tokio::time::interval(Duration::from_secs(30));
@@ -276,21 +295,19 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
             if !deferred.is_empty() {
                 let input = std::mem::take(&mut deferred);
                 if backend.busy()
-                    && tracking
-                        .steer(d, id, task.agent, &mut backend, &input)
-                        .await?
+                    && request!(tracking.steer(d, id, task.agent, &mut backend, &input))?
                         .is_some()
                 {
                     continue;
                 }
-                start_turn(d, id, &mut backend, &input).await?;
+                request!(start_turn(d, id, &mut backend, &input))?;
                 turn_open = true;
                 continue;
             }
             if !backend.busy() {
-                match release_or_continue(d, id, rx) {
+                match release_or_continue(d, id, rx, &mut waiting) {
                     Next::Turn(input) => {
-                        start_turn(d, id, &mut backend, &input).await?;
+                        request!(start_turn(d, id, &mut backend, &input))?;
                         turn_open = true;
                     }
                     Next::Stop(exit) => break exit,
@@ -299,6 +316,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
         }
         tokio::select! {
             biased;
+            _ = sleep_until(deadline) => break cancel(&mut backend, timed_out()).await,
             ev = erx.recv() => {
                 let Some(ev) = ev else {
                     break Exit::Failed("agent event stream closed".into());
@@ -344,24 +362,11 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                     AgentEvent::Approval(a) => d.request_approval(id, a),
                     AgentEvent::TurnEnded { ok, result, mut error, usage } => {
                         if !ok && let Some(message) = error.take() {
-                            let hint = model_error(d, id, message);
-                            tokio::pin!(hint);
-                            loop {
-                                tokio::select! {
-                                    message = &mut hint => { error = Some(message); break; }
-                                    cmd = rx.recv() => match cmd {
-                                        Some(Cmd::Input(m)) => deferred.push(m.queued()),
-                                        Some(Cmd::Mail(m)) => keep_mail(d, id, m),
-                                        Some(Cmd::Cancel(cause)) => return Ok(cancel(&mut backend, cause).await),
-                                        Some(Cmd::Abort) | None => return Ok(Exit::Aborted),
-                                    },
-                                    _ = sleep_until(deadline) => return Ok(cancel(&mut backend, timed_out()).await),
-                                }
-                            }
+                            error = Some(request!(model_error(d, id, message)));
                         }
                         last_ok = ok;
                         turn_open = false;
-                        let next = next_input(d, id, rx, &mut backend).await;
+                        let next = next_input(d, id, rx, &mut waiting, &mut backend).await;
                         let mut stop = None;
                         match next {
                             Some(Next::Turn(input)) => deferred.extend(input),
@@ -380,7 +385,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                             deferred.splice(0..0, std::mem::take(&mut tracking.pending).into_values());
                         }
                         if task.agent == Agent::Grok {
-                            tokio::time::sleep(GROK_GRACE).await;
+                            request!(tokio::time::sleep(GROK_GRACE));
                         }
                     }
                     AgentEvent::Exited(msg) => {
@@ -393,10 +398,15 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                     }
                 }
             }
-            cmd = rx.recv() => match cmd {
+            cmd = async {
+                match waiting.pop_front() {
+                    Some(cmd) => Some(cmd),
+                    None => rx.recv().await,
+                }
+            } => match cmd {
                 Some(Cmd::Input(input)) => {
                     if backend.busy() {
-                        match tracking.steer(d, id, task.agent, &mut backend, std::slice::from_ref(&input.text)).await? {
+                        match request!(tracking.steer(d, id, task.agent, &mut backend, std::slice::from_ref(&input.text)))? {
                             Some(how) => {
                                 let _ = input.reply.send(how);
                             }
@@ -408,12 +418,12 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                         deferred.push(input.queued());
                     } else {
                         let text = input.queued();
-                        start_turn(d, id, &mut backend, &[text]).await?;
+                        request!(start_turn(d, id, &mut backend, &[text]))?;
                         turn_open = true;
                     }
                 }
                 Some(Cmd::Mail(msg)) => {
-                    if backend.in_turn() && matches!(backend.steer(&msg, None).await?, Steer::Accepted) {
+                    if backend.in_turn() && matches!(request!(backend.steer(&msg, None))?, Steer::Accepted) {
                         d.emit_with(id, "steered", json!({"chars": msg.len()}), Some(&msg))?;
                         delivered(d, id, &[], &[msg])?;
                     } else {
@@ -433,7 +443,6 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                     d.try_emit(id, "stalled", json!({"quiet_secs": last_activity.elapsed().as_secs()}))?;
                 }
             }
-            _ = sleep_until(deadline) => break cancel(&mut backend, timed_out()).await,
         }
     };
 
@@ -441,8 +450,41 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
     Ok(exit)
     }.await;
     backend.shutdown().await;
+    // Session announcements can precede a first turn whose admission never replies.
+    while let Ok(event) = erx.try_recv() {
+        if let AgentEvent::Session { id: sid, file } = event {
+            d.try_update(id, |t| t.session = Some(sid))?;
+            if file.is_some() {
+                session_file = file;
+            }
+        }
+    }
     record_session(d, id, session_file.as_deref())?;
     outcome
+}
+
+/// Keep control commands live while a backend request holds the actor. Data commands
+/// retain their reply channels and order until the request completes.
+async fn wait_request<T>(
+    request: impl Future<Output = T>,
+    rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    waiting: &mut VecDeque<Cmd>,
+    deadline: Option<Instant>,
+    timed_out: impl FnOnce() -> Cancellation,
+) -> std::result::Result<T, Exit> {
+    tokio::pin!(request);
+    loop {
+        tokio::select! {
+            biased;
+            _ = sleep_until(deadline) => return Err(Exit::Stopped(timed_out())),
+            cmd = rx.recv() => match cmd {
+                Some(Cmd::Cancel(cause)) => return Err(Exit::Stopped(cause)),
+                Some(Cmd::Abort) | None => return Err(Exit::Aborted),
+                Some(cmd) => waiting.push_back(cmd),
+            },
+            result = &mut request => return Ok(result),
+        }
+    }
 }
 
 fn settle_release(d: &Daemon, id: &str, last_ok: bool) -> Result<()> {
@@ -523,7 +565,7 @@ async fn start_turn(d: &Daemon, id: &str, backend: &mut Backend, inputs: &[Strin
         .lock()
         .tasks
         .get(id)
-        .map(|e| e.task.pending_mail.clone())
+        .map(|e| e.mail.clone())
         .unwrap_or_default();
     let input = mail
         .iter()
@@ -615,10 +657,11 @@ async fn next_input(
     d: &Daemon,
     id: &str,
     rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    waiting: &mut VecDeque<Cmd>,
     backend: &mut Backend,
 ) -> Option<Next> {
     let mut inputs = Vec::new();
-    while let Ok(cmd) = rx.try_recv() {
+    while let Some(cmd) = waiting.pop_front().or_else(|| rx.try_recv().ok()) {
         match cmd {
             Cmd::Input(m) => inputs.push(m.queued()),
             Cmd::Mail(m) => keep_mail(d, id, m),
@@ -634,10 +677,15 @@ async fn next_input(
 
 /// Under the daemon lock, either pick up input that slipped in, or mark the task as releasing so
 /// that later input waits for a fresh process.
-fn release_or_continue(d: &Daemon, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>) -> Next {
+fn release_or_continue(
+    d: &Daemon,
+    id: &str,
+    rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    waiting: &mut VecDeque<Cmd>,
+) -> Next {
     let mut st = d.lock();
     let mut inputs = Vec::new();
-    while let Ok(cmd) = rx.try_recv() {
+    while let Some(cmd) = waiting.pop_front().or_else(|| rx.try_recv().ok()) {
         match cmd {
             Cmd::Input(m) => inputs.push(m.queued()),
             Cmd::Mail(m) => {
@@ -707,7 +755,8 @@ mod tests {
                 );
                 assert!(rx.try_recv().is_err());
             } else {
-                let Next::Stop(Exit::Stopped(cause)) = release_or_continue(&f.d, "test", &mut rx)
+                let Next::Stop(Exit::Stopped(cause)) =
+                    release_or_continue(&f.d, "test", &mut rx, &mut VecDeque::new())
                 else {
                     panic!("lost cancellation");
                 };
@@ -732,7 +781,8 @@ mod tests {
             .unwrap();
             replies.push(receive);
         }
-        let Next::Turn(inputs) = release_or_continue(&f.d, "test", &mut rx) else {
+        let Next::Turn(inputs) = release_or_continue(&f.d, "test", &mut rx, &mut VecDeque::new())
+        else {
             panic!("lost inputs")
         };
         assert_eq!(inputs, ["first", "second"]);
@@ -741,7 +791,7 @@ mod tests {
         }
         assert!(!f.d.lock().tasks["test"].releasing);
         assert!(matches!(
-            release_or_continue(&f.d, "test", &mut rx),
+            release_or_continue(&f.d, "test", &mut rx, &mut VecDeque::new()),
             Next::Stop(Exit::Released)
         ));
         assert_eq!(
@@ -1020,5 +1070,336 @@ mod release_tests {
         settle_release(&f.d, "test", true).unwrap();
         assert_eq!(f.d.lock().tasks["test"].task.status, Status::Interrupted);
         assert_eq!(f.d.store.load_all()[0].status, Status::Interrupted);
+    }
+}
+
+#[cfg(test)]
+mod request_tests {
+    use super::super::tests::{Fixture, fixture};
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn directory(f: &Fixture) -> PathBuf {
+        f.d.store.prompt_path("test").parent().unwrap().to_owned()
+    }
+
+    fn compile_peer(f: &Fixture) -> PathBuf {
+        let exe = directory(f).join(if cfg!(windows) { "codex.exe" } else { "codex" });
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/fixtures/timeout_agent.rs");
+        let output = std::process::Command::new("rustc")
+            .args(["--edition=2021", "--crate-name=timeout_agent"])
+            .arg(source)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        exe
+    }
+
+    fn prepare(f: &Fixture, exe: &Path, hang: &str, seconds: u64) {
+        let dir = directory(f);
+        let session = dir.join("session.jsonl");
+        std::fs::write(&session, "old session\n").unwrap();
+        f.d.try_update("test", |t| {
+            t.cwd = dir.clone();
+            t.timeout_secs = Some(seconds);
+            t.pending_inputs = vec!["initial".into()];
+            t.session_file = Fingerprint::of(&session);
+        })
+        .unwrap();
+        let mut st = f.d.lock();
+        let entry = st.tasks.get_mut("test").unwrap();
+        entry.pending = vec!["initial".into()];
+        entry.env = Some(vec![
+            (
+                "PATH".into(),
+                exe.parent().unwrap().to_string_lossy().into_owned(),
+            ),
+            (
+                "AXIOPERA_FAKE_HOME".into(),
+                dir.to_string_lossy().into_owned(),
+            ),
+            ("AXIOPERA_FAKE_HANG".into(), hang.into()),
+            (
+                "AXIOPERA_FAKE_SESSION".into(),
+                serde_json::to_string(&session).unwrap(),
+            ),
+        ]);
+    }
+
+    async fn observed(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !path.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    fn input(
+        f: &Fixture,
+        tx: &mpsc::UnboundedSender<Cmd>,
+        text: &str,
+    ) -> oneshot::Receiver<&'static str> {
+        f.d.try_update("test", |t| t.pending_inputs.push(text.into()))
+            .unwrap();
+        let (reply, receive) = oneshot::channel();
+        tx.send(Cmd::Input(Input {
+            text: text.into(),
+            reply,
+        }))
+        .unwrap();
+        receive
+    }
+
+    fn mail(f: &Fixture, tx: &mpsc::UnboundedSender<Cmd>, text: &str) {
+        f.d.try_update("test", |t| t.pending_mail.push(text.into()))
+            .unwrap();
+        tx.send(Cmd::Mail(text.into())).unwrap();
+    }
+
+    fn assert_reaped(dir: &Path) {
+        let pid: u32 = std::fs::read_to_string(dir.join("pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        #[cfg(windows)]
+        unsafe {
+            use windows_sys::Win32::{
+                Foundation::CloseHandle,
+                System::Threading::{OpenProcess, WaitForSingleObject},
+            };
+            // SYNCHRONIZE permits checking termination without inspecting the child.
+            let handle = OpenProcess(0x00100000, 0, pid);
+            if !handle.is_null() {
+                let status = WaitForSingleObject(handle, 0);
+                CloseHandle(handle);
+                assert_eq!(status, 0, "fake peer is still running");
+            }
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            unsafe { libc::kill(pid as i32, 0) },
+            -1,
+            "fake peer is still running"
+        );
+    }
+
+    #[tokio::test]
+    async fn hung_admissions_honor_timeout_cancel_abort_and_preserve_unconfirmed_data() {
+        let binary = fixture();
+        let exe = compile_peer(&binary);
+        for (hang, action) in [
+            ("turn/start", "timeout"),
+            ("turn/start", "cancel"),
+            ("turn/start", "abort"),
+            ("turn/steer", "timeout"),
+            ("turn/steer", "cancel"),
+            ("turn/steer", "abort"),
+            ("mail", "abort"),
+            ("initialize", "abort"),
+        ] {
+            let f = fixture();
+            let dir = directory(&f);
+            prepare(
+                &f,
+                &exe,
+                if hang == "mail" { "turn/steer" } else { hang },
+                if action == "timeout" { 2 } else { 60 },
+            );
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let d = f.d.clone();
+            let runner = tokio::spawn(async move { drive(&d, "test", &mut rx).await });
+            let mut confirmation = None;
+            if matches!(hang, "turn/steer" | "mail") {
+                observed(&dir.join("turn-start")).await;
+                if hang == "mail" {
+                    mail(&f, &tx, "hanging-mail");
+                } else {
+                    confirmation = Some(input(&f, &tx, "hanging-input"));
+                }
+                observed(&dir.join("turn-steer")).await;
+            } else {
+                observed(&dir.join(hang.replace('/', "-"))).await;
+            }
+            let later = input(&f, &tx, "later");
+            mail(&f, &tx, "later-mail");
+            match action {
+                "cancel" => tx
+                    .send(Cmd::Cancel(Cancellation {
+                        reason: "requested".into(),
+                        by: "user".into(),
+                        interrupted: false,
+                    }))
+                    .unwrap(),
+                "abort" => tx.send(Cmd::Abort).unwrap(),
+                _ => {}
+            }
+            let exit = tokio::time::timeout(Duration::from_secs(12), runner)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            match (&exit, action) {
+                (Exit::Stopped(c), "timeout") => assert!(c.interrupted && c.by == "timeout"),
+                (Exit::Stopped(c), "cancel") => assert!(!c.interrupted && c.by == "user"),
+                (Exit::Aborted, "abort") => {}
+                _ => panic!("unexpected exit for {hang}/{action}"),
+            }
+            finish_exit(&f.d, "test", exit).unwrap();
+            assert_eq!(
+                f.d.lock().tasks["test"].mail,
+                f.d.store.load_all()[0].pending_mail
+            );
+            if let Some(confirmation) = confirmation {
+                assert!(confirmation.await.is_err());
+            }
+            // During startup the existing loop acknowledges durable queueing, never admission.
+            if hang == "initialize" {
+                assert_eq!(later.await.unwrap(), "queued for a new turn");
+            } else {
+                assert!(later.await.is_err());
+            }
+            let saved = f.d.store.load_all().pop().unwrap();
+            assert!(saved.pending_inputs.iter().any(|s| s == "later"));
+            assert!(saved.pending_mail.iter().any(|s| s == "later-mail"));
+            if hang == "turn/start" {
+                assert!(saved.pending_inputs.iter().any(|s| s == "initial"));
+            }
+            if hang == "turn/steer" {
+                assert!(saved.pending_inputs.iter().any(|s| s == "hanging-input"));
+            }
+            if hang == "mail" {
+                assert!(saved.pending_mail.iter().any(|s| s == "hanging-mail"));
+            }
+            if hang == "initialize" {
+                assert!(saved.session_file.is_none());
+            } else {
+                assert_eq!(saved.session.as_deref(), Some("fake-session"));
+                assert_eq!(
+                    saved.session_file,
+                    Fingerprint::of(&dir.join("session.jsonl"))
+                );
+            }
+            assert_reaped(&dir);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_turn_leaves_unread_mail_commands_for_single_delivery() {
+        let binary = fixture();
+        let exe = compile_peer(&binary);
+        let f = fixture();
+        prepare(&f, &exe, "none", 60);
+        let (task, env) = {
+            let st = f.d.lock();
+            (
+                st.tasks["test"].task.clone(),
+                st.tasks["test"].env.clone().unwrap(),
+            )
+        };
+        let spec = StartSpec {
+            task_id: task.id,
+            agent: task.agent,
+            tier: task.tier,
+            cwd: task.cwd,
+            model: None,
+            effort: None,
+            env,
+            resume: None,
+            trace: None,
+        };
+        let (events, _events) = mpsc::unbounded_channel();
+        let mut backend = Backend::start(&spec, &exe, events).await.unwrap();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // The backend startup completed, but the actor has not consumed the Mail command.
+        mail(&f, &tx, "unread-mail");
+        start_turn(&f.d, "test", &mut backend, &["initial".into()])
+            .await
+            .unwrap();
+        assert_eq!(f.d.lock().tasks["test"].task.pending_mail, ["unread-mail"]);
+        let Cmd::Mail(text) = rx.try_recv().unwrap() else {
+            panic!("missing Mail command");
+        };
+        assert!(matches!(
+            backend.steer(&text, None).await.unwrap(),
+            Steer::Accepted
+        ));
+        delivered(&f.d, "test", &[], &[text]).unwrap();
+        backend.shutdown().await;
+        let requests = std::fs::read_to_string(directory(&f).join("requests")).unwrap();
+        assert_eq!(requests.matches("unread-mail").count(), 1);
+        assert_reaped(&directory(&f));
+    }
+
+    #[tokio::test]
+    async fn delayed_admission_replays_inputs_and_mail_once_in_order() {
+        let binary = fixture();
+        let exe = compile_peer(&binary);
+        let f = fixture();
+        let dir = directory(&f);
+        prepare(&f, &exe, "turn/start", 60);
+        f.d.try_update("test", |t| t.pending_mail.push("old-mail".into()))
+            .unwrap();
+        f.d.lock()
+            .tasks
+            .get_mut("test")
+            .unwrap()
+            .mail
+            .push("old-mail".into());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let d = f.d.clone();
+        let runner = tokio::spawn(async move { drive(&d, "test", &mut rx).await });
+        observed(&dir.join("turn-start")).await;
+        let first = input(&f, &tx, "first");
+        mail(&f, &tx, "first-mail");
+        let second = input(&f, &tx, "second");
+        mail(&f, &tx, "second-mail");
+        std::fs::write(dir.join("continue"), "go").unwrap();
+        for received in [first, second] {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), received)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                "sent to its running turn"
+            );
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !f.d.lock().tasks["test"].task.pending_mail.is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tx.send(Cmd::Abort).unwrap();
+        assert!(matches!(runner.await.unwrap().unwrap(), Exit::Aborted));
+        let requests = std::fs::read_to_string(dir.join("requests")).unwrap();
+        let text: Vec<String> = requests
+            .lines()
+            .filter_map(|line| {
+                let v: serde_json::Value = serde_json::from_str(line).unwrap();
+                v["params"]["input"][0]["text"].as_str().map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "old-mail\n\ninitial",
+                "first",
+                "first-mail",
+                "second",
+                "second-mail"
+            ]
+        );
+        assert!(f.d.lock().tasks["test"].task.pending_inputs.is_empty());
+        assert_reaped(&dir);
     }
 }
