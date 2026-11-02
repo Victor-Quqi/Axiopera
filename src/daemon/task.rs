@@ -160,44 +160,47 @@ pub async fn run(d: Arc<Daemon>, id: String, mut rx: mpsc::UnboundedReceiver<Cmd
 }
 
 fn finish_exit(d: &Daemon, id: &str, exit: Exit) -> Result<()> {
+    let result = (|| {
+        match exit {
+            Exit::Released => {}
+            Exit::Failed(error) => {
+                d.try_update(id, |t| t.status = Status::Failed)?;
+                d.try_emit(id, "failed", json!({"error": error}))?;
+            }
+            Exit::Stopped(cause) => {
+                let (status, kind) = if cause.interrupted {
+                    (Status::Interrupted, "interrupted")
+                } else {
+                    (Status::Cancelled, "cancelled")
+                };
+                d.try_update(id, |t| t.status = status)?;
+                if let Some(entry) = d.lock().tasks.get_mut(id) {
+                    entry.pending.clear();
+                }
+                d.try_emit(id, kind, json!(cause))?;
+            }
+            Exit::Aborted => {
+                d.try_update(id, |t| t.status = Status::Interrupted)?;
+                d.try_emit(id, "interrupted", json!({"reason": "the daemon stopped"}))?;
+            }
+            Exit::Detached => {
+                d.try_update(id, |t| t.detached = true)?;
+                d.try_emit(
+                    id,
+                    "detached",
+                    json!({"reason": "the native session was continued outside axiopera"}),
+                )?;
+            }
+        }
+        Ok(())
+    })();
     if let Some(entry) = d.lock().tasks.get_mut(id) {
-        // Unhandled Mail commands are still durable. Keep them for an in-process resume;
-        // later tell calls must bypass the receiver that this actor is about to drop.
+        // Final state and queue cleanup must precede accepting input for a new process.
+        // Restore unread durable mail before this actor drops its receiver.
         entry.releasing = true;
         entry.mail = entry.task.pending_mail.clone();
     }
-    match exit {
-        Exit::Released => {}
-        Exit::Failed(error) => {
-            d.try_update(id, |t| t.status = Status::Failed)?;
-            d.try_emit(id, "failed", json!({"error": error}))?;
-        }
-        Exit::Stopped(cause) => {
-            let (status, kind) = if cause.interrupted {
-                (Status::Interrupted, "interrupted")
-            } else {
-                (Status::Cancelled, "cancelled")
-            };
-            d.try_update(id, |t| t.status = status)?;
-            if let Some(entry) = d.lock().tasks.get_mut(id) {
-                entry.pending.clear();
-            }
-            d.try_emit(id, kind, json!(cause))?;
-        }
-        Exit::Aborted => {
-            d.try_update(id, |t| t.status = Status::Interrupted)?;
-            d.try_emit(id, "interrupted", json!({"reason": "the daemon stopped"}))?;
-        }
-        Exit::Detached => {
-            d.try_update(id, |t| t.detached = true)?;
-            d.try_emit(
-                id,
-                "detached",
-                json!({"reason": "the native session was continued outside axiopera"}),
-            )?;
-        }
-    }
-    Ok(())
+    result
 }
 
 async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>) -> Result<Exit> {
@@ -1053,6 +1056,23 @@ mod fingerprint_tests {
 mod release_tests {
     use super::super::tests::fixture;
     use super::*;
+
+    #[test]
+    fn failed_exit_save_still_recovers_mail_for_release() {
+        let f = fixture();
+        f.d.try_update("test", |t| t.pending_mail.push("unread".into()))
+            .unwrap();
+        std::fs::create_dir(
+            f.d.store
+                .prompt_path("test")
+                .with_file_name("task.json.tmp"),
+        )
+        .unwrap();
+        assert!(finish_exit(&f.d, "test", Exit::Failed("stopped".into())).is_err());
+        let st = f.d.lock();
+        assert!(st.tasks["test"].releasing);
+        assert_eq!(st.tasks["test"].mail, ["unread"]);
+    }
 
     #[test]
     fn timeout_during_release_keeps_interrupted_status() {
