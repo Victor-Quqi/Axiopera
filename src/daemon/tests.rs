@@ -79,6 +79,16 @@ fn blocked_is_logged_without_waking_and_counted_once_per_turn() {
     }
 }
 
+#[test]
+fn a_message_given_is_saved_whole_by_its_event() {
+    let f = fixture();
+    let message = "Check it again.\n\nAll of it.";
+    f.d.emit_message("test", "steered", json!({"queued": false}), message);
+    let events = f.d.store.events("test");
+    let path = f.d.store.message_path("test", events[0].seq);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), message);
+}
+
 #[tokio::test]
 async fn send_changes_tier_and_preserves_the_session_across_reload() {
     for status in [

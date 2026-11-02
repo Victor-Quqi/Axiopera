@@ -426,8 +426,11 @@ impl View {
                 prompt: read_text(&self.store.prompt_path(id)),
                 ..Tail::default()
             });
-            for e in tail.read(&self.store.events_path(id)) {
-                tail.absorb(&e);
+            for e in tail.read(&store.events_path(id)) {
+                tail.absorb(&e, || {
+                    let path = store.message_path(id, e.seq);
+                    Some((read_text(&path)?, path))
+                });
             }
             // The results of the turns whose last messages are kept, and the latest.
             let mut wanted: Vec<u32> = tail
@@ -769,6 +772,7 @@ impl View {
                     "── turn {n}, {} ago",
                     age(now.saturating_sub(l.at))
                 )),
+                What::Given { text, file } => Block::task(text.shown(), Some(file.clone())),
             };
             blocks.push((l.at, block));
         }
@@ -1535,8 +1539,9 @@ impl Tail {
             .collect()
     }
 
-    /// Follows the daemon's own account of turns in `Daemon::emit`.
-    fn absorb(&mut self, e: &Event) {
+    /// Follows the daemon's own account of turns in `Daemon::emit`. `message` reads the message
+    /// the event tells the agent was given, and the file it is in.
+    fn absorb(&mut self, e: &Event, message: impl FnOnce() -> Option<(Text, PathBuf)>) {
         let text = |k: &str| e.data.get(k).and_then(Value::as_str).unwrap_or("");
         let turn = || e.data.get("turn").and_then(Value::as_u64).map(|n| n as u32);
         match e.kind.as_str() {
@@ -1544,11 +1549,13 @@ impl Tail {
                 self.start(e.ts);
                 self.approvals.clear();
                 self.stop = None;
-                match turn() {
-                    Some(n) if n > 1 => self.log(e.ts, What::Turn(n)),
-                    _ => {}
+                // The first turn's message is the task text, shown first.
+                if let Some(n) = turn().filter(|n| *n > 1) {
+                    self.log(e.ts, What::Turn(n));
+                    self.given(e.ts, message);
                 }
             }
+            "steered" => self.given(e.ts, message),
             "turn_ended" => {
                 self.in_turn = false;
                 self.ended_ms = e.ts;
@@ -1602,6 +1609,14 @@ impl Tail {
         self.tool_calls = 0;
     }
 
+    /// A message given to the agent, unless it is not kept: given before the daemon kept
+    /// them.
+    fn given(&mut self, at: u64, message: impl FnOnce() -> Option<(Text, PathBuf)>) {
+        if let Some((text, file)) = message().filter(|(t, _)| !t.lines.is_empty()) {
+            self.log(at, What::Given { text, file });
+        }
+    }
+
     fn log(&mut self, at: u64, what: What) {
         if self.log.len() == LOGGED {
             self.log.pop_front();
@@ -1624,6 +1639,9 @@ enum What {
     Tool { name: String, detail: String },
     /// The start of a turn after the first.
     Turn(u32),
+    /// A message given to the agent after its task text: one that began a turn, or one sent
+    /// into a turn. `file` has all of it.
+    Given { text: Text, file: PathBuf },
 }
 
 /// One line from its pieces. Given a width, it is cut to fit and colored, and a line whose
@@ -2534,6 +2552,92 @@ mod tests {
         assert_eq!(view.frame(NOW, Some((100, 10)), None), frame);
         // The daemon may leave the stalled mark on a task that stopped.
         assert_eq!(state(&view.tasks["t0"], view.tail("t0")).0, "cancelled");
+    }
+
+    #[test]
+    fn messages_given_after_the_task_show_where_they_were_given() {
+        let h = home();
+        let store = Store::new(&h.0);
+        let mut t1 = task(
+            "t1",
+            "claude:s1",
+            "running",
+            NOW - 600_000,
+            json!({"name": "review"}),
+        );
+        t1.turns = 2;
+        store.save_prompt("t1", "Review the parser.").unwrap();
+        store.save(&t1).unwrap();
+        // Turn 2 began before the daemon kept messages; turn 3 after, and one was sent into it.
+        store
+            .save_message(
+                "t1",
+                6,
+                "Now the writer.
+And its tests.",
+            )
+            .unwrap();
+        store.save_message("t1", 8, "Skip the fixtures.").unwrap();
+        for e in [
+            event(1, 90_000, "t1", "said", json!({"text": "Read it."})),
+            event(
+                2,
+                90_000,
+                "t1",
+                "turn_ended",
+                json!({"turn": 1, "ok": true}),
+            ),
+            event(3, 55_000, "t1", "turn_started", json!({"turn": 2})),
+            event(4, 50_000, "t1", "said", json!({"text": "Read it again."})),
+            event(
+                5,
+                50_000,
+                "t1",
+                "turn_ended",
+                json!({"turn": 2, "ok": true}),
+            ),
+            event(
+                6,
+                30_000,
+                "t1",
+                "turn_started",
+                json!({"turn": 3, "chars": 29}),
+            ),
+            event(
+                7,
+                20_000,
+                "t1",
+                "tool",
+                json!({"name": "Read", "detail": "src/w.rs"}),
+            ),
+            event(8, 10_000, "t1", "steered", json!({"queued": false})),
+        ] {
+            store.append(&e).unwrap();
+        }
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let frame = view.task_frame("t1", NOW, None, false);
+        assert_eq!(
+            frame[2..],
+            [
+                "› Review the parser.",
+                "",
+                "• Read it.",
+                "",
+                "── turn 2, 55s ago",
+                "",
+                "• Read it again.",
+                "",
+                "── turn 3, 30s ago",
+                "",
+                "› Now the writer.",
+                "  And its tests.",
+                "  └ Read src/w.rs",
+                "",
+                "› Skip the fixtures.",
+            ],
+            "{frame:#?}"
+        );
     }
 
     #[test]

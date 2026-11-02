@@ -198,6 +198,19 @@ impl Store {
         self.dir(id).join(kind).join(format!("{name}.txt"))
     }
 
+    /// Where a message the task's agent was given is kept whole, by the sequence number of the
+    /// event that tells it was given.
+    pub fn message_path(&self, id: &str, seq: u64) -> PathBuf {
+        self.dir(id).join("messages").join(format!("{seq}.md"))
+    }
+
+    pub fn save_message(&self, id: &str, seq: u64, text: &str) -> Result<()> {
+        let path = self.message_path(id, seq);
+        fs::create_dir_all(self.dir(id).join("messages"))?;
+        fs::write(path, text)?;
+        Ok(())
+    }
+
     pub fn save_turn(&self, id: &str, turn: u32, text: &str) -> Result<PathBuf> {
         let path = self.turn_path(id, turn);
         fs::write(&path, text)?;

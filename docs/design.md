@@ -48,11 +48,12 @@
     task.json
     events.jsonl
     turns/<n>.md
+    messages/<事件序号>.md
     approvals/<请求 ID>.txt、questions/<提问 ID>.txt、notes/<编号>.txt
   ledger.json
 ```
 
-`prompt.md` 是派发时的任务文本，先于 `task.json` 写入，读到任务的人都能读到它；之后 `send` 的消息不保存。`task.json` 记录状态、工作目录和原生会话，写临时文件后原子替换。`events.jsonl` 只追加。`ledger.json` 保存游标、结果交付标记、Codex 推送目标、待确认批次和已排入的门铃。事件序号在整个 daemon 内单调递增，重启后继续；清理前先把当前序号记入 ledger，任务全被删除后也不会回退。
+`prompt.md` 是派发时的任务文本，先于 `task.json` 写入，读到任务的人都能读到它。之后交给子 agent 的消息存在 `messages/` 下，以 `turn_started` 或 `steered` 事件的序号命名，先于事件写入；内容是子 agent 实际收到的全文，包括并入的兄弟留言。`task.json` 记录状态、工作目录和原生会话，写临时文件后原子替换。`events.jsonl` 只追加。`ledger.json` 保存游标、结果交付标记、Codex 推送目标、待确认批次和已排入的门铃。事件序号在整个 daemon 内单调递增，重启后继续；清理前先把当前序号记入 ledger，任务全被删除后也不会回退。
 
 提问和答案随任务保存。审批应答通道、尚未送出的兄弟留言和消息消费跟踪 ID 只保存在内存中。
 

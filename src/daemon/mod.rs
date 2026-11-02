@@ -324,6 +324,16 @@ impl Daemon {
 
     /// Append an event and wake waiters. `data` must be a JSON object.
     pub fn emit(&self, task: &str, kind: &str, data: Value) {
+        self.emit_with(task, kind, data, None);
+    }
+
+    /// Like `emit`, for an event that tells the task's agent was given `message`: the message
+    /// is saved whole before the event is appended.
+    pub fn emit_message(&self, task: &str, kind: &str, data: Value, message: &str) {
+        self.emit_with(task, kind, data, Some(message));
+    }
+
+    fn emit_with(&self, task: &str, kind: &str, data: Value, message: Option<&str>) {
         let mut st = self.lock();
         st.seq += 1;
         let event = Event {
@@ -336,9 +346,16 @@ impl Daemon {
                 _ => Map::new(),
             },
         };
+        let mut errors = Vec::new();
+        if let Some(Err(e)) = message.map(|m| self.store.save_message(task, event.seq, m)) {
+            errors.push(format!("writing a message to {task}: {e:#}"));
+        }
         if let Err(e) = self.store.append(&event) {
+            errors.push(format!("writing event for {task}: {e:#}"));
+        }
+        if !errors.is_empty() {
             drop(st);
-            self.log(&format!("writing event for {task}: {e:#}"));
+            errors.iter().for_each(|e| self.log(e));
             st = self.lock();
         }
         if let Some(entry) = st.tasks.get_mut(task) {

@@ -74,7 +74,7 @@ impl InputTracking {
         } else {
             self.pending.insert(self.serial, input.to_string());
         }
-        d.emit(id, "steered", json!({"queued": queued}));
+        d.emit_message(id, "steered", json!({"queued": queued}), input);
         Ok(Some(if queued {
             "queued for a following turn"
         } else {
@@ -377,7 +377,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                 }
                 Some(Cmd::Mail(msg)) => {
                     if backend.in_turn() && matches!(backend.steer(&msg, None).await?, Steer::Accepted) {
-                        d.emit(id, "steered", json!({"chars": msg.len()}));
+                        d.emit_message(id, "steered", json!({"chars": msg.len()}), &msg);
                     } else {
                         keep_mail(d, id, msg);
                     }
@@ -474,10 +474,11 @@ async fn start_turn(d: &Daemon, id: &str, backend: &mut Backend, input: &str) ->
     );
     backend.turn(&input).await?;
     let turn = d.lock().tasks.get(id).map_or(0, |e| e.task.turns) + 1;
-    d.emit(
+    d.emit_message(
         id,
         "turn_started",
         json!({"turn": turn, "chars": input.len()}),
+        &input,
     );
     Ok(())
 }
