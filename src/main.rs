@@ -135,7 +135,7 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Cancel a task and everything it spawned.
+    /// Stop a task and its children. Use send to continue them later.
     Cancel { task: String },
     /// For sub-agents: ask your parent a question. Returns at once; keep working.
     Ask { question: Vec<String> },

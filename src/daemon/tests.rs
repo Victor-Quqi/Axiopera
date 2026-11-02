@@ -96,6 +96,7 @@ async fn send_changes_tier_and_preserves_the_session_across_reload() {
         Status::Waiting,
         Status::Failed,
         Status::Interrupted,
+        Status::Cancelled,
     ] {
         let f = fixture();
         // Hold scheduling so this test can inspect accepted input without a real CLI.
@@ -123,7 +124,15 @@ async fn send_changes_tier_and_preserves_the_session_across_reload() {
             let saved = again.lock().tasks["test"].task.clone();
             assert_eq!(saved.tier, tier);
             assert_eq!(saved.session.as_deref(), Some("native-session"));
-            assert_eq!((saved.turns, saved.delivered, saved.status), (3, 2, status));
+            let recovered = if status.is_stopped() {
+                Status::Interrupted
+            } else {
+                status
+            };
+            assert_eq!(
+                (saved.turns, saved.delivered, saved.status),
+                (3, 2, recovered)
+            );
             let mut st = f.d.lock();
             assert_eq!(st.tasks["test"].pending, ["continue"]);
             st.tasks.get_mut("test").unwrap().pending.clear();
@@ -139,7 +148,7 @@ async fn send_changes_tier_and_preserves_the_session_across_reload() {
 
 #[tokio::test]
 async fn tier_changes_reject_busy_and_closed_tasks_without_accepting_input() {
-    for case in ["running", "releasing", "pending", "cancelled", "detached"] {
+    for case in ["running", "releasing", "pending", "detached"] {
         let f = fixture();
         f.d.lock().stopping = true;
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -152,7 +161,6 @@ async fn tier_changes_reject_busy_and_closed_tasks_without_accepting_input() {
                     e.releasing = case == "releasing";
                 }
                 "pending" => e.pending.push("previous".into()),
-                "cancelled" => e.task.status = Status::Cancelled,
                 "detached" => e.task.detached = true,
                 _ => unreachable!(),
             }
@@ -169,7 +177,6 @@ async fn tier_changes_reject_busy_and_closed_tasks_without_accepting_input() {
             .unwrap_err()
             .to_string();
         let expected = match case {
-            "cancelled" => "was cancelled",
             "detached" => "taken over",
             _ => "still running or has queued input",
         };
@@ -257,6 +264,18 @@ async fn tier_changes_respect_task_ownership_and_parent_child_limits() {
         .is_err()
     );
     f.d.set_status("kid", Status::Cancelled);
+    assert!(
+        f.d.input(
+            "user",
+            "test",
+            "continue".into(),
+            Some(ipc::Tier::Read),
+            None
+        )
+        .await
+        .is_err()
+    );
+    f.d.try_update("kid", |t| t.detached = true).unwrap();
     f.d.input(
         "user",
         "test",
@@ -1654,6 +1673,93 @@ async fn answers_and_their_input_are_committed_together() {
     assert_eq!(
         task.questions[0].answer.as_ref(),
         task.pending_inputs.first()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_queued_continuation_prevents_scheduling() {
+    let f = fixture();
+    f.d.lock().stopping = true;
+    f.d.try_cancel_tree("test", "cancelled", "user").unwrap();
+    f.d.input("user", "test", "resume".into(), None, Some(Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(f.d.lock().tasks["test"].task.status, Status::Queued);
+    f.d.try_cancel_tree("test", "cancelled again", "user")
+        .unwrap();
+    f.d.lock().stopping = false;
+    f.d.schedule("test");
+    let st = f.d.lock();
+    assert!(st.tasks["test"].pending.is_empty());
+    assert!(st.tasks["test"].actor.is_none());
+    assert_eq!(st.tasks["test"].task.status, Status::Cancelled);
+}
+
+#[tokio::test]
+async fn cancelled_tree_can_resume_after_restart_with_input_mail_and_answers() {
+    let f = fixture_with(&[
+        json!({"id":"kid", "parent":"task:test"}),
+        json!({"id":"sibling"}),
+    ]);
+    f.d.lock().stopping = true;
+    for id in ["test", "kid"] {
+        f.d.try_update(id, |t| {
+            t.session = Some(format!("session-{id}"));
+            t.pending_mail.push("saved note".into());
+        })
+        .unwrap();
+        f.d.input("user", id, "earlier".into(), None, None)
+            .await
+            .unwrap();
+    }
+    f.d.try_update("test", |t| {
+        t.questions.push(store::Question {
+            id: "qresume".into(),
+            text: "Continue?".into(),
+            answer: None,
+            asked_ms: 0,
+        })
+    })
+    .unwrap();
+    f.d.try_cancel_tree("test", "cancelled by request", "user")
+        .unwrap();
+    let again = Arc::new(Daemon::load(options(&f.home), None).unwrap());
+    again.lock().stopping = true;
+    for id in ["test", "kid"] {
+        assert_eq!(again.lock().tasks[id].task.status, Status::Cancelled);
+        assert!(again.lock().tasks[id].pending.is_empty());
+        assert_eq!(again.lock().tasks[id].mail, ["saved note"]);
+    }
+    assert_eq!(again.collect(u64::MAX).unwrap(), 1);
+    again
+        .reply(
+            "user",
+            "qresume",
+            "yes".into(),
+            None,
+            &mut Out::new(&mut Vec::new()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(again.lock().tasks["test"].pending.len(), 2);
+    assert_eq!(
+        again.lock().tasks["test"].task.questions[0]
+            .answer
+            .as_deref(),
+        Some("yes")
+    );
+    assert!(again.lock().tasks["kid"].pending.is_empty());
+    again
+        .input("task:test", "kid", "resume child".into(), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        again.lock().tasks["kid"].pending,
+        ["earlier", "resume child"]
+    );
+    assert_eq!(
+        again.lock().tasks["kid"].task.session.as_deref(),
+        Some("session-kid")
     );
 }
 

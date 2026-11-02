@@ -32,9 +32,9 @@ pub enum Status {
 }
 
 impl Status {
-    /// Only cancellation is final; a failed or interrupted task can be continued with `send`.
-    pub fn is_final(self) -> bool {
-        self == Status::Cancelled
+    /// Stopped executions need explicit input before another actor may run.
+    pub fn is_stopped(self) -> bool {
+        matches!(self, Status::Cancelled | Status::Interrupted)
     }
 }
 

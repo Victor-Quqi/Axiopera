@@ -295,7 +295,7 @@ impl Daemon {
                 turn_ended_ms: 0,
                 // Persisted input becomes schedulable when a caller supplies its environment.
                 pending: Vec::new(),
-                mail: if task.status.is_final() || task.detached {
+                mail: if task.detached {
                     Vec::new()
                 } else {
                     task.pending_mail.clone()
@@ -1108,7 +1108,7 @@ impl Daemon {
             return;
         };
         if entry.actor.is_some()
-            || entry.task.status.is_final()
+            || entry.task.status.is_stopped()
             || entry.task.detached
             || entry.env.is_none()
         {
@@ -1132,9 +1132,7 @@ impl Daemon {
             st.tasks.get_mut(id).is_some_and(|e| {
                 e.actor = None;
                 e.releasing = false;
-                !e.pending.is_empty()
-                    && !e.task.status.is_final()
-                    && e.task.status != Status::Interrupted
+                !e.pending.is_empty() && !e.task.status.is_stopped()
             })
         };
         // Not an event of its own: lets `wait` notice the task went idle.
@@ -1225,9 +1223,6 @@ impl Daemon {
             let Some(entry) = st.tasks.get(id) else {
                 return refuse(ErrorCode::NotFound, format!("no task {id}"));
             };
-            if entry.task.status.is_final() {
-                return refuse(ErrorCode::Invalid, format!("{id} was cancelled"));
-            }
             if entry.task.detached {
                 return refuse(
                     ErrorCode::Invalid,
@@ -1259,15 +1254,12 @@ impl Daemon {
                 }
                 if st.tasks.values().any(|e| {
                     identity::task_of(&e.task.parent) == Some(id)
-                        && !e.task.status.is_final()
                         && !e.task.detached
                         && e.task.tier > tier
                 }) {
                     return refuse(
                         ErrorCode::Invalid,
-                        format!(
-                            "{id} has sub-tasks above {tier:?}; lower their tiers or cancel them first"
-                        ),
+                        format!("{id} has sub-tasks above {tier:?}; lower their tiers first"),
                     );
                 }
             }
@@ -1288,17 +1280,15 @@ impl Daemon {
             if let Some(tier) = tier {
                 task.tier = tier;
             }
-            // New input explicitly resumes a task interrupted during process release.
-            if entry.releasing && task.status == Status::Interrupted {
+            // Explicit input waits for the stopped actor to release its process.
+            if (entry.actor.is_none() || entry.releasing) && task.status.is_stopped() {
                 task.status = Status::Queued;
             }
             // Claim the answer and persist accepted input in the same snapshot.
             task.pending_inputs.push(input.text.clone());
             task.updated_ms = store::now_ms();
             self.store.save(&task)?;
-            if entry.actor.is_none()
-                || (entry.releasing && entry.task.status == Status::Interrupted)
-            {
+            if entry.actor.is_none() || (entry.releasing && entry.task.status.is_stopped()) {
                 entry.pending = entry.task.pending_inputs.clone();
             }
             entry.task = task;
@@ -1399,9 +1389,6 @@ impl Daemon {
                     format!("{qid} was asked by {}, which is not your sub-task", task.id),
                 );
             }
-            if task.status.is_final() {
-                return refuse(ErrorCode::Invalid, format!("{} was cancelled", task.id));
-            }
             let q = task.questions.iter().find(|q| q.id == qid).unwrap();
             if q.answer.is_some() {
                 return refuse(ErrorCode::Invalid, format!("{qid} is already answered"));
@@ -1490,7 +1477,7 @@ impl Daemon {
             if entry.task.parent != parent || to == me {
                 return refuse(ErrorCode::Invalid, format!("{to} is not your sibling"));
             }
-            if entry.task.status.is_final() || entry.task.detached {
+            if entry.task.detached {
                 return refuse(
                     ErrorCode::Invalid,
                     format!("{to} is no longer driven by axiopera"),
@@ -1628,8 +1615,7 @@ impl Daemon {
         let settled = |e: &Entry| {
             e.actor.is_none()
                 && e.pending.is_empty()
-                && (e.task.status.is_final()
-                    || e.task.detached
+                && (e.task.detached
                     || (e.task.pending_inputs.is_empty() && e.task.pending_mail.is_empty()))
                 && !matches!(e.task.status, Status::Queued | Status::Running)
                 && e.task.updated_ms < cutoff_ms
@@ -1861,7 +1847,7 @@ impl Daemon {
             let Some(entry) = st.tasks.get_mut(id) else {
                 return Ok(n);
             };
-            if entry.task.status.is_final() {
+            if entry.task.status == Status::Cancelled {
                 return Ok(n);
             }
             let mut task = entry.task.clone();
@@ -1875,7 +1861,9 @@ impl Daemon {
             entry.task = task;
             entry.pending.clear();
             // An actor letting go of its process no longer reads commands.
-            entry.actor.clone().filter(|_| !entry.releasing)
+            let actor = entry.actor.clone().filter(|_| !entry.releasing);
+            entry.releasing = entry.actor.is_some();
+            actor
         };
         n += 1;
         let cause = task::Cancellation {

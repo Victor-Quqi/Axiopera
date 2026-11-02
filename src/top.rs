@@ -1579,10 +1579,8 @@ fn details(t: &Task, tail: &Tail) -> Vec<Detail> {
             out.push(line("needs", YELLOW, format!("approval {id}: {summary}")));
         }
     }
-    if !t.status.is_final() {
-        for q in t.open_questions() {
-            out.push(line("asks", YELLOW, format!("{}: {}", q.id, q.text)));
-        }
+    for q in t.open_questions() {
+        out.push(line("asks", YELLOW, format!("{}: {}", q.id, q.text)));
     }
     if let Some((label, text)) = stop(t, tail) {
         out.push(line(label, RED, text.into()));
@@ -1601,17 +1599,14 @@ fn stop<'a>(t: &Task, tail: &'a Tail) -> Option<(&'static str, &'a str)> {
 fn waits(t: &Task, tail: &Tail) -> bool {
     t.status == Status::Waiting
         || t.status == Status::Running && !tail.approvals.is_empty()
-        || !t.status.is_final() && t.open_questions().next().is_some()
+        || t.open_questions().next().is_some()
 }
 
 /// What a task last said, for its line, on one line: its latest message, or a question it asks
 /// since. A task whose messages are no longer in its events has the first line of its latest
 /// result.
 fn words(t: &Task, tail: &Tail) -> Option<String> {
-    let asked = match t.status.is_final() {
-        true => None,
-        false => t.open_questions().max_by_key(|q| q.asked_ms),
-    };
+    let asked = t.open_questions().max_by_key(|q| q.asked_ms);
     let text = match (&tail.words, asked) {
         (Some((said, at)), Some(q)) if *at > q.asked_ms => said.clone(),
         (_, Some(q)) => q.text.clone(),
@@ -2335,6 +2330,27 @@ mod tests {
 
     fn indent(line: &str) -> usize {
         line.len() - line.trim_start().len()
+    }
+
+    #[test]
+    fn cancelled_questions_remain_visible_for_reply() {
+        let t = task(
+            "tc",
+            "user",
+            "cancelled",
+            NOW,
+            json!({"questions": [
+                {"id": "q1", "text": "Which port?", "answer": null, "asked_ms": NOW}
+            ]}),
+        );
+        let tail = Tail::default();
+        assert!(waits(&t, &tail));
+        assert_eq!(words(&t, &tail).as_deref(), Some("Which port?"));
+        assert!(
+            details(&t, &tail)
+                .iter()
+                .any(|d| d.label == "asks" && d.text == "q1: Which port?")
+        );
     }
 
     #[test]

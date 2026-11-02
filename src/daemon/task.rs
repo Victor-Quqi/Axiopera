@@ -148,11 +148,6 @@ pub async fn run(d: Arc<Daemon>, id: String, mut rx: mpsc::UnboundedReceiver<Cmd
     } else {
         exit
     };
-    if !matches!(exit, Exit::Released) {
-        if let Some(entry) = d.lock().tasks.get_mut(&id) {
-            entry.pending.clear();
-        }
-    }
     if let Err(e) = finish_exit(&d, &id, exit) {
         d.log(&format!("finishing {id}: {e:#}"));
     }
@@ -160,47 +155,70 @@ pub async fn run(d: Arc<Daemon>, id: String, mut rx: mpsc::UnboundedReceiver<Cmd
 }
 
 fn finish_exit(d: &Daemon, id: &str, exit: Exit) -> Result<()> {
-    let result = (|| {
-        match exit {
-            Exit::Released => {}
-            Exit::Failed(error) => {
-                d.try_update(id, |t| t.status = Status::Failed)?;
-                d.try_emit(id, "failed", json!({"error": error}))?;
-            }
-            Exit::Stopped(cause) => {
-                let (status, kind) = if cause.interrupted {
-                    (Status::Interrupted, "interrupted")
-                } else {
-                    (Status::Cancelled, "cancelled")
-                };
-                d.try_update(id, |t| t.status = status)?;
-                if let Some(entry) = d.lock().tasks.get_mut(id) {
-                    entry.pending.clear();
-                }
-                d.try_emit(id, kind, json!(cause))?;
-            }
-            Exit::Aborted => {
-                d.try_update(id, |t| t.status = Status::Interrupted)?;
-                d.try_emit(id, "interrupted", json!({"reason": "the daemon stopped"}))?;
-            }
-            Exit::Detached => {
-                d.try_update(id, |t| t.detached = true)?;
-                d.try_emit(
-                    id,
-                    "detached",
-                    json!({"reason": "the native session was continued outside axiopera"}),
-                )?;
-            }
+    let released = matches!(exit, Exit::Released);
+    let detached = matches!(exit, Exit::Detached);
+    let (status, event) = match exit {
+        Exit::Released => (None, None),
+        Exit::Failed(error) => (
+            Some(Status::Failed),
+            Some(("failed", json!({"error": error}))),
+        ),
+        Exit::Stopped(cause) => {
+            let (status, kind) = if cause.interrupted {
+                (Status::Interrupted, "interrupted")
+            } else {
+                (Status::Cancelled, "cancelled")
+            };
+            (Some(status), Some((kind, json!(cause))))
         }
-        Ok(())
-    })();
-    if let Some(entry) = d.lock().tasks.get_mut(id) {
-        // Final state and queue cleanup must precede accepting input for a new process.
-        // Restore unread saved mail before this actor drops its receiver.
+        Exit::Aborted => (
+            Some(Status::Interrupted),
+            Some(("interrupted", json!({"reason": "the daemon stopped"}))),
+        ),
+        Exit::Detached => (
+            None,
+            Some((
+                "detached",
+                json!({"reason": "the native session was continued outside axiopera"}),
+            )),
+        ),
+    };
+    {
+        let mut st = d.lock();
+        let entry = st
+            .tasks
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("task vanished"))?;
+        let mut task = entry.task.clone();
+        // Input accepted after a stop belongs to the next actor, not this exit.
+        let resumed = entry.releasing && task.status == Status::Queued && !entry.pending.is_empty();
+        if let Some(status) = status
+            && !resumed
+            && !task.status.is_stopped()
+        {
+            task.status = status;
+        }
+        if detached {
+            task.detached = true;
+        }
+        task.updated_ms = crate::store::now_ms();
+        let saved = if released {
+            Ok(())
+        } else {
+            d.store.save(&task)
+        };
         entry.releasing = true;
         entry.mail = entry.task.pending_mail.clone();
+        if !released && !resumed {
+            entry.pending.clear();
+        }
+        saved?;
+        entry.task = task;
     }
-    result
+    if let Some((kind, data)) = event {
+        d.try_emit(id, kind, data)?;
+    }
+    Ok(())
 }
 
 async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>) -> Result<Exit> {
@@ -493,7 +511,7 @@ async fn wait_request<T>(
 fn settle_release(d: &Daemon, id: &str, last_ok: bool) -> Result<()> {
     d.try_update(id, |t| {
         // Cancellation or timeout can settle the task while its process is releasing.
-        if !t.status.is_final() && t.status != Status::Interrupted {
+        if !t.status.is_stopped() {
             t.status = if !last_ok {
                 Status::Failed
             } else if t.open_questions().next().is_some() {
@@ -1003,10 +1021,12 @@ mod timeout_tests {
         f.d.try_cancel_tree("test", "cancelled by request", "user")
             .unwrap();
         assert_eq!(f.d.lock().tasks["test"].task.status, Status::Cancelled);
-        assert!(
-            f.d.input("user", "test", "no".into(), None, None)
-                .await
-                .is_err()
+        f.d.input("user", "test", "continue after cancel".into(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.d.lock().tasks["test"].pending,
+            ["saved input", "resume", "continue after cancel"]
         );
     }
 }
@@ -1057,6 +1077,69 @@ mod release_tests {
     use super::super::tests::fixture;
     use super::*;
 
+    #[tokio::test]
+    async fn cancel_then_send_survives_actor_exit_and_repeated_cancellation() {
+        for releasing in [false, true] {
+            for after_exit in [false, true] {
+                let f = fixture();
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                {
+                    let mut st = f.d.lock();
+                    st.stopping = true;
+                    st.running = 1;
+                    let entry = st.tasks.get_mut("test").unwrap();
+                    entry.actor = Some(tx);
+                    entry.releasing = releasing;
+                    entry.task.status = Status::Running;
+                    entry.task.session = Some("same-session".into());
+                    entry.task.pending_inputs.push("earlier".into());
+                }
+                f.d.try_cancel_tree("test", "cancelled by request", "user")
+                    .unwrap();
+                let exit = if releasing {
+                    Exit::Released
+                } else {
+                    let Cmd::Cancel(cause) = rx.try_recv().unwrap() else {
+                        panic!("expected cancellation")
+                    };
+                    Exit::Stopped(cause)
+                };
+                if after_exit {
+                    finish_exit(&f.d, "test", exit).unwrap();
+                    assert_eq!(f.d.lock().tasks["test"].task.status, Status::Cancelled);
+                    f.d.input("user", "test", "resume".into(), None, Some(Vec::new()))
+                        .await
+                        .unwrap();
+                } else {
+                    f.d.input("user", "test", "resume".into(), None, Some(Vec::new()))
+                        .await
+                        .unwrap();
+                    if releasing {
+                        settle_release(&f.d, "test", true).unwrap();
+                    }
+                    finish_exit(&f.d, "test", exit).unwrap();
+                }
+                assert!(rx.try_recv().is_err());
+                {
+                    let st = f.d.lock();
+                    assert_eq!(st.tasks["test"].pending, ["earlier", "resume"]);
+                    assert!(!st.tasks["test"].task.status.is_stopped());
+                    assert_eq!(
+                        st.tasks["test"].task.session.as_deref(),
+                        Some("same-session")
+                    );
+                }
+                // A second cancel stops the queued continuation; it must not restart itself.
+                f.d.try_cancel_tree("test", "cancelled again", "user")
+                    .unwrap();
+                f.d.actor_done("test");
+                assert!(f.d.lock().tasks["test"].actor.is_none());
+                assert!(f.d.lock().tasks["test"].pending.is_empty());
+                assert_eq!(f.d.lock().tasks["test"].task.status, Status::Cancelled);
+            }
+        }
+    }
+
     #[test]
     fn failed_exit_save_still_recovers_mail_for_release() {
         let f = fixture();
@@ -1098,6 +1181,54 @@ mod request_tests {
     use super::super::tests::{Fixture, fixture};
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[tokio::test]
+    async fn send_after_cancel_starts_a_new_process_in_the_same_session() {
+        let binary = fixture();
+        let exe = compile_peer(&binary);
+        let f = fixture();
+        prepare(&f, &exe, "none", 60);
+        let dir = directory(&f);
+        f.d.schedule("test");
+        observed(&dir.join("turn-start")).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while f.d.lock().tasks["test"].task.session.is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let first_pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+        f.d.try_cancel_tree("test", "cancelled by request", "user")
+            .unwrap();
+        f.d.input("user", "test", "resume-now".into(), None, None)
+            .await
+            .unwrap();
+        observed(&dir.join("thread-resume")).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !f.d.lock().tasks["test"].task.pending_inputs.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(std::fs::read_to_string(dir.join("pid")).unwrap(), first_pid);
+        let requests = std::fs::read_to_string(dir.join("requests")).unwrap();
+        assert!(requests.contains("thread/resume") && requests.contains("fake-session"));
+        assert_eq!(requests.matches("resume-now").count(), 1);
+        f.d.try_cancel_tree("test", "cancelled again", "user")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while f.d.lock().tasks["test"].actor.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(f.d.lock().tasks["test"].task.status, Status::Cancelled);
+        assert_eq!(f.d.lock().running, 0);
+        assert_reaped(&dir).await;
+    }
 
     fn directory(f: &Fixture) -> PathBuf {
         f.d.store.prompt_path("test").parent().unwrap().to_owned()

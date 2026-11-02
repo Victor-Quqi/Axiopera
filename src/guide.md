@@ -31,6 +31,8 @@ Continue a task
   axiopera send <task> "Also update the docs."    steers the running turn, or starts a new turn
                                                    in the same session if it already finished.
   Results note when they may predate your message; late messages are handled in the next turn.
+  Cancelled tasks can also resume with send or reply; their cancelled children stay stopped
+  until continued separately.
   Add --tier full to change permissions when idle.
 
 Answer questions

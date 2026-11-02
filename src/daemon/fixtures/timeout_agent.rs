@@ -20,6 +20,7 @@ fn main() {
         let method = [
             "initialize",
             "thread/start",
+            "thread/resume",
             "turn/start",
             "turn/steer",
             "turn/interrupt",
@@ -51,7 +52,7 @@ fn main() {
             }
         }
         let result = match method {
-            "thread/start" => {
+            "thread/start" | "thread/resume" => {
                 format!("{{\"thread\":{{\"id\":\"fake-session\",\"path\":{session}}}}}")
             }
             "turn/start" => "{\"turn\":{\"id\":\"turn\"}}".to_owned(),

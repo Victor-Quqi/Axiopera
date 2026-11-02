@@ -8,7 +8,7 @@
 
 主 agent 负责检查子 agent 的改动、提交和合并分支。子 agent 的权限由 `--tier` 指定，默认 `work`。各档位在不同 backend 上的具体行为见[权限](backends.md#权限)。
 
-空闲后用 `axiopera send <task> --tier full "继续执行"` 在原会话中改档续接。子 agent 只能修改自己直接派发的任务；降低父任务档位前，先降低或取消超出新档位的子任务。
+空闲后用 `axiopera send <task> --tier full "继续执行"` 在原会话中改档续接。子 agent 只能修改自己直接派发的任务；降低父任务档位前，先降低超出新档位的子任务档位。
 
 任务 ID 全局唯一，`--name` 指定的别名在同一个调用方下唯一。主 agent 为第 0 层，最多派发到第 2 层，只统计 Axiopera 任务。宿主内置子 agent 归属于所在的 Axiopera 任务，它再派发的任务继续受该任务树的深度和权限限制。子任务的档位不能高于父任务。内置子 agent 的收件隔离见[后端文档](backends.md#会话与消息)。
 
@@ -24,7 +24,7 @@
 
 `detach <task>` 将任务交给人接管，并打印工作目录和原生 resume 命令。接管前要等这一轮结束，或先 `cancel`。Axiopera 发现原生会话文件被其他进程修改时，也会将任务标为 detached。
 
-`cancel` 取消整个任务子树。`failed` 和 `interrupted` 任务可以用 `send` 继续；已取消或脱管的任务通过原生 CLI 接管。
+`cancel` 停止任务及其子任务当前的执行，保留会话和未交付输入。`cancelled`、`failed` 和 `interrupted` 任务都可以用 `send` 继续，回答未解决的问题也会续接任务。继续父任务不会自动启动已取消的子任务，需要分别续接。脱管的任务通过原生 CLI 接管。
 
 退出码见 [guide](../src/guide.md)。带消息的输出总以 0 退出：宿主对非零退出的输出截得更短，Windows 上的 Codex 还把所有非零退出码报成 1。
 
@@ -50,7 +50,7 @@ stall_minutes = 10
 approval_timeout_minutes = 2
 ```
 
-`concurrency` 是同时运行的顶层任务上限，所有会话共用，嵌套任务不计入。它用于防止失控派发：达到上限时新的 `spawn` 直接报错，不排队；已有任务经 `send` 或 `reply` 开始的新一轮不受限制。持续没有事件达到 `stall_minutes` 时，任务标为 stalled 并通知调用方；任务继续运行。`spawn --timeout` 在每次启动执行达到时限后中断任务及仍在执行的子任务，状态为 `interrupted`；用 `send` 在原生会话中续接，新一次执行重新计时。手动 `cancel` 的任务保持不可续接。
+`concurrency` 是同时运行的顶层任务上限，所有会话共用，嵌套任务不计入。它用于防止失控派发：达到上限时新的 `spawn` 直接报错，不排队；已有任务经 `send` 或 `reply` 开始的新一轮不受限制。持续没有事件达到 `stall_minutes` 时，任务标为 stalled 并通知调用方；任务继续运行。`spawn --timeout` 在每次启动执行达到时限后中断任务及仍在执行的子任务，状态为 `interrupted`；用 `send` 在原生会话中续接，新一次执行重新计时。手动 `cancel` 后同样可以续接。
 
 每个 backend 可以设置默认模型和可执行文件路径。例如：
 
