@@ -112,16 +112,23 @@ pub async fn run(home: &Path, task: Option<&str>, all: bool) -> Result<i32> {
     let mut tick = tokio::time::interval(REFRESH);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
+    let mut previous = Vec::new();
+    let mut last_size = None;
     let drawn = loop {
         let size = platform::terminal_size()
             .filter(|&(w, h)| w > 0 && h > 0)
             .or_else(env_size)
             .unwrap_or(FALLBACK_SIZE);
-        // Drawn over the last frame instead of after clearing it, which would flicker.
+        // Synchronized output keeps the old and new selection from appearing mid-frame.
         let lines = ui.draw(&view, store::now_ms(), size);
-        if let Err(e) = show(&format!("\x1b[H{}\x1b[K\x1b[J", lines.join("\x1b[K\r\n"))) {
+        let output = redraw(&previous, &lines, last_size != Some(size), size.1);
+        if !output.is_empty()
+            && let Err(e) = show(&output)
+        {
             break Err(e);
         }
+        previous = lines;
+        last_size = Some(size);
         // Keys are followed at once; the files are read again each second.
         let pressed = tokio::select! {
             () = &mut stop => break Ok(()),
@@ -147,7 +154,8 @@ pub async fn run(home: &Path, task: Option<&str>, all: bool) -> Result<i32> {
             break Ok(());
         }
     };
-    show("\x1b[?7h\x1b[?25h\x1b[?1049l")?;
+    // Release synchronized output even if writing a frame failed partway through.
+    show("\x1b[?2026l\x1b[0m\x1b[?7h\x1b[?25h\x1b[?1049l")?;
     drop(keys);
     drawn?;
     Ok(0)
@@ -469,6 +477,24 @@ fn show(s: &str) -> std::io::Result<()> {
     let mut out = std::io::stdout().lock();
     out.write_all(s.as_bytes())?;
     out.flush()
+}
+
+/// Only changed rows are sent, including their styles. This also limits tearing in
+/// terminal relays that do not preserve synchronized output boundaries.
+fn redraw(previous: &[String], lines: &[String], resized: bool, height: usize) -> String {
+    let mut changes = String::new();
+    for (i, line) in lines.iter().enumerate() {
+        if resized || previous.get(i) != Some(line) {
+            changes.push_str(&format!("\x1b[{};1H{line}\x1b[0m\x1b[K", i + 1));
+        }
+    }
+    if (resized || lines.len() < previous.len()) && lines.len() < height {
+        changes.push_str(&format!("\x1b[{};1H\x1b[J", lines.len() + 1));
+    }
+    if changes.is_empty() {
+        return changes;
+    }
+    format!("\x1b[?2026h\x1b[0m{changes}\x1b[?2026l")
 }
 
 /// `COLUMNS` and `LINES`, for terminals that are not consoles, such as mintty without ConPTY.
@@ -3443,6 +3469,109 @@ mod tests {
             frame.ends_with("\n\n› not recorded: spawned before axiopera kept it"),
             "{frame}"
         );
+    }
+
+    #[test]
+    fn redraw_keeps_selection_atomic_and_clears_rows_when_the_view_shrinks() {
+        // A small VT screen checks visible states, not just the generated escape strings.
+        fn apply(screen: &mut [Vec<(char, bool)>], output: &str) -> usize {
+            let (mut row, mut col, mut reverse, mut synced) = (0, 0, false, false);
+            let mut written = 0;
+            let mut chars = output.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    assert_eq!(chars.next(), Some('['));
+                    let mut params = String::new();
+                    let end = loop {
+                        let c = chars.next().unwrap();
+                        if ('@'..='~').contains(&c) {
+                            break c;
+                        }
+                        params.push(c);
+                    };
+                    match end {
+                        'h' | 'l' if params == "?2026" => synced = end == 'h',
+                        'H' => {
+                            let mut pos = params.split(';').map(|s| s.parse::<usize>().unwrap());
+                            row = pos.next().unwrap() - 1;
+                            col = pos.next().unwrap() - 1;
+                        }
+                        'm' => {
+                            for code in params.split(';') {
+                                match code {
+                                    "0" | "27" => reverse = false,
+                                    "7" => reverse = true,
+                                    _ => {}
+                                }
+                            }
+                        }
+                        'K' => screen[row][col..].fill((' ', reverse)),
+                        'J' => {
+                            screen[row][col..].fill((' ', reverse));
+                            for line in &mut screen[row + 1..] {
+                                line.fill((' ', reverse));
+                            }
+                        }
+                        _ => panic!("unexpected sequence {params}{end}"),
+                    }
+                } else {
+                    screen[row][col] = (c, reverse);
+                    col += 1;
+                    written += 1;
+                }
+                if !synced {
+                    assert_eq!(
+                        screen
+                            .iter()
+                            .filter(|line| line.iter().any(|(_, selected)| *selected))
+                            .count(),
+                        1,
+                        "a partial frame became visible"
+                    );
+                }
+            }
+            assert!(!synced, "output left suspended");
+            written
+        }
+        let frame = |chosen: usize, count: usize| {
+            (0..count)
+                .map(|i| {
+                    let mut segs = vec![(format!("task-{i}"), "")];
+                    if i == chosen {
+                        segs.insert(0, (String::new(), CHOSEN));
+                    }
+                    paint(&segs, Some(30))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut screen = vec![vec![(' ', false); 30]; 8];
+        let mut previous = Vec::new();
+        for (chosen, count, resized, height) in [
+            (0, 7, true, 8),
+            (1, 7, false, 8),
+            (0, 7, false, 8),
+            (2, 3, false, 8),
+            (1, 2, true, 2),
+            (1, 2, true, 8),
+        ] {
+            let lines = frame(chosen, count);
+            let written = apply(
+                &mut screen[..height],
+                &redraw(&previous, &lines, resized, height),
+            );
+            assert!(screen[chosen].iter().any(|(_, selected)| *selected));
+            if !resized && previous.len() == lines.len() {
+                assert!(written < 60, "unchanged rows were redrawn");
+            }
+            for (i, row) in screen.iter().enumerate().take(height).skip(count) {
+                assert!(
+                    row.iter().all(|cell| *cell == (' ', false)),
+                    "stale row {i}"
+                );
+            }
+            assert!(redraw(&lines, &lines, false, height).is_empty());
+            previous = lines;
+        }
     }
 
     #[test]
