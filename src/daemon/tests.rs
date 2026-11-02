@@ -127,6 +127,12 @@ async fn send_changes_tier_and_preserves_the_session_across_reload() {
             let mut st = f.d.lock();
             assert_eq!(st.tasks["test"].pending, ["continue"]);
             st.tasks.get_mut("test").unwrap().pending.clear();
+            st.tasks
+                .get_mut("test")
+                .unwrap()
+                .task
+                .pending_inputs
+                .clear();
         }
     }
 }
@@ -1220,7 +1226,7 @@ fn delivery_performance() {
             at.elapsed()
         );
     }
-    f.d.file_changed("test", "repeat.rs");
+    f.d.file_changed("test", "repeat.rs").unwrap();
     let at = Instant::now();
     for _ in 0..200 {
         f.d.update("test", |t| {
@@ -1232,7 +1238,7 @@ fn delivery_performance() {
     let before = at.elapsed();
     let at = Instant::now();
     for _ in 0..200 {
-        f.d.file_changed("test", "repeat.rs");
+        f.d.file_changed("test", "repeat.rs").unwrap();
     }
     println!(
         "FileChanged: 200 duplicate updates: saved={before:?}, skipped={:?}",
@@ -1318,4 +1324,277 @@ fn delivery_performance() {
         "reminder: 20 results x 128KiB, 20 renders (including cold cache): full={before:?}, limited_cached={:?}",
         at.elapsed()
     );
+}
+
+#[test]
+fn failed_gc_keeps_the_task_and_cursor_for_retry() {
+    let f = fixture();
+    let path = f.home.join("tasks/test");
+    let backup = f.home.join("saved-task");
+    std::fs::rename(&path, &backup).unwrap();
+    std::fs::write(&path, "occupied").unwrap();
+    let key = cursor_key("codex:host", "test");
+    f.d.lock().ledger.cursors.insert(key.clone(), 0);
+    assert!(f.d.collect(u64::MAX).is_err());
+    assert!(f.d.lock().tasks.contains_key("test"));
+    assert!(f.d.lock().ledger.cursors.contains_key(&key));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::rename(backup, &path).unwrap();
+    assert_eq!(f.d.collect(u64::MAX).unwrap(), 1);
+}
+
+#[test]
+fn missing_directory_gc_is_idempotent() {
+    let f = fixture();
+    std::fs::remove_dir_all(f.home.join("tasks/test")).unwrap();
+    assert_eq!(f.d.collect(u64::MAX).unwrap(), 1);
+}
+
+#[test]
+fn invalid_tasks_are_quarantined_and_valid_events_after_corruption_recover() {
+    let f = fixture();
+    let root = f.home.join("tasks");
+    for name in ["missing", "broken", "mismatch"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+    }
+    std::fs::write(root.join("missing/prompt.md"), "keep me").unwrap();
+    std::fs::write(root.join("broken/task.json"), "{bad").unwrap();
+    std::fs::copy(root.join("test/task.json"), root.join("mismatch/task.json")).unwrap();
+    let path = f.d.store.events_path("test");
+    let data = b"{\"seq\":1,\"ts\":0,\"task\":\"test\",\"kind\":\"tool\"}\n\xff\n{\"seq\":2,\"ts\":0,\"task\":\"test\",\"kind\":\"turn_ended\",\"turn\":1}\n";
+    std::fs::write(&path, data).unwrap();
+    let again = Daemon::load(options(&f.home), None);
+    assert_eq!(again.lock().tasks.len(), 1);
+    assert_eq!(again.lock().tasks["test"].deliverable[0].kind, "turn_ended");
+    assert_eq!(again.lock().seq, 2);
+    let dirs = std::fs::read_dir(f.home.join("quarantine"))
+        .unwrap()
+        .map(|d| d.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(dirs.len(), 3);
+    assert_eq!(std::fs::read(&path).unwrap(), data);
+}
+
+#[test]
+fn torn_event_tail_is_backed_up_and_next_append_stays_readable() {
+    for tail in [b"{\"seq\":9".as_slice(), b"\xe4\xbd".as_slice()] {
+        let f = fixture();
+        f.d.try_emit("test", "failed", json!({"error":"first"}))
+            .unwrap();
+        let path = f.d.store.events_path("test");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(tail)
+            .unwrap();
+        let again = Daemon::load(options(&f.home), None);
+        again
+            .try_emit("test", "failed", json!({"error":"second"}))
+            .unwrap();
+        assert_eq!(again.store.events("test").len(), 2);
+        let backups = std::fs::read_dir(f.home.join("tasks/test"))
+            .unwrap()
+            .filter_map(|d| {
+                let p = d.unwrap().path();
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("events.tail-")
+                    .then_some(p)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read(&backups[0]).unwrap(), tail);
+    }
+}
+
+#[test]
+fn complete_event_without_newline_is_recovered_once() {
+    let f = fixture();
+    std::fs::write(
+        f.d.store.events_path("test"),
+        br#"{"seq":42,"ts":0,"task":"test","kind":"failed"}"#,
+    )
+    .unwrap();
+    let again = Daemon::load(options(&f.home), None);
+    assert_eq!(again.lock().seq, 42);
+    again.try_emit("test", "failed", json!({})).unwrap();
+    assert_eq!(
+        again
+            .store
+            .events("test")
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<_>>(),
+        [42, 43]
+    );
+}
+
+#[test]
+fn restart_removes_missing_malformed_and_future_cursors() {
+    let f = fixture();
+    f.d.try_emit("test", "failed", json!({})).unwrap();
+    let mut ledger = Ledger::default();
+    for (key, seq) in [
+        ("codex:host|test", 1),
+        ("codex:other|gone", 1),
+        ("bad", 0),
+        ("|test", 0),
+        ("user|test", 99),
+    ] {
+        ledger.cursors.insert(key.into(), seq);
+    }
+    ledger.save(&f.home).unwrap();
+    let again = Daemon::load(options(&f.home), None);
+    assert_eq!(again.lock().ledger.cursors.len(), 1);
+    assert_eq!(Ledger::load(&f.home).cursors.len(), 1);
+}
+
+#[tokio::test]
+async fn accepted_input_and_mail_survive_restart_without_starting_an_agent() {
+    let f = fixture_with(&[json!({"id":"sibling"})]);
+    f.d.lock().stopping = true;
+    f.d.input("codex:host", "test", "first".into(), None, None)
+        .await
+        .unwrap();
+    f.d.input("codex:host", "test", "second".into(), None, None)
+        .await
+        .unwrap();
+    f.d.tell(
+        "task:sibling",
+        "test",
+        "note".into(),
+        &mut Out::new(&mut Vec::new()),
+    )
+    .await
+    .unwrap();
+    let again = Arc::new(Daemon::load(options(&f.home), None));
+    assert_eq!(again.lock().tasks["test"].pending, ["first", "second"]);
+    assert_eq!(again.lock().tasks["test"].mail.len(), 1);
+    again.schedule("test");
+    assert!(again.lock().tasks["test"].actor.is_none());
+    again.lock().stopping = true;
+    again
+        .input("codex:host", "test", "third".into(), None, Some(Vec::new()))
+        .await
+        .unwrap();
+    assert_eq!(
+        again.lock().tasks["test"].pending,
+        ["first", "second", "third"]
+    );
+    assert_eq!(again.collect(u64::MAX).unwrap(), 1);
+    assert!(again.lock().tasks.contains_key("test"));
+}
+
+#[tokio::test]
+async fn failed_input_and_question_saves_do_not_acknowledge_or_mutate_state() {
+    let f = fixture();
+    std::fs::create_dir(f.home.join("tasks/test/task.json.tmp")).unwrap();
+    assert!(
+        f.d.input("codex:host", "test", "lost".into(), None, None)
+            .await
+            .is_err()
+    );
+    let mut output = Vec::new();
+    assert!(
+        f.d.ask("task:test", "question".into(), &mut Out::new(&mut output))
+            .await
+            .is_err()
+    );
+    assert!(output.is_empty());
+    let st = f.d.lock();
+    assert!(st.tasks["test"].pending.is_empty());
+    assert!(st.tasks["test"].task.pending_inputs.is_empty());
+    assert!(st.tasks["test"].task.questions.is_empty());
+}
+
+#[test]
+fn failed_event_and_message_writes_are_not_published() {
+    let f = fixture();
+    let mut rx = f.d.events.subscribe();
+    std::fs::create_dir(f.d.store.events_path("test")).unwrap();
+    assert!(f.d.try_emit("test", "failed", json!({})).is_err());
+    assert!(f.d.lock().tasks["test"].deliverable.is_empty());
+    assert!(rx.try_recv().is_err());
+    std::fs::remove_dir(f.d.store.events_path("test")).unwrap();
+    std::fs::write(f.home.join("tasks/test/messages"), "occupied").unwrap();
+    assert!(
+        f.d.emit_with("test", "turn_started", json!({}), Some("input"))
+            .is_err()
+    );
+    assert!(!f.d.lock().tasks["test"].in_turn);
+    assert!(f.d.store.events("test").is_empty());
+}
+
+#[test]
+fn failed_ledger_save_does_not_advance_in_memory_cursors() {
+    let f = fixture();
+    f.d.try_emit("test", "failed", json!({})).unwrap();
+    let events = f.d.lock().tasks["test"].deliverable.clone();
+    std::fs::create_dir(f.home.join("ledger.json.tmp")).unwrap();
+    assert!(f.d.mark_seen("codex:host", &events, &[], &[]).is_err());
+    assert!(f.d.lock().ledger.cursors.is_empty());
+    std::fs::remove_dir(f.home.join("ledger.json.tmp")).unwrap();
+    f.d.mark_seen("codex:host", &events, &[], &[]).unwrap();
+    assert_eq!(
+        Ledger::load(&f.home).cursors["codex:host|test"],
+        events[0].seq
+    );
+}
+
+#[test]
+fn only_legacy_timeouts_are_migrated_to_resumable_tasks() {
+    let f = fixture_with(&[json!({"id":"manual"}), json!({"id":"unknown"})]);
+    for id in ["test", "manual", "unknown"] {
+        f.d.try_update(id, |t| t.status = Status::Cancelled)
+            .unwrap();
+    }
+    f.d.try_emit("test", "cancelled", json!({"by":"timeout"}))
+        .unwrap();
+    f.d.try_emit("manual", "cancelled", json!({"by":"user"}))
+        .unwrap();
+    let again = Daemon::load(options(&f.home), None);
+    assert_eq!(again.lock().tasks["test"].task.status, Status::Interrupted);
+    assert_eq!(again.lock().tasks["manual"].task.status, Status::Cancelled);
+    assert_eq!(again.lock().tasks["unknown"].task.status, Status::Cancelled);
+    let twice = Daemon::load(options(&f.home), None);
+    assert_eq!(twice.lock().tasks["test"].deliverable.len(), 2);
+}
+
+#[cfg(windows)]
+#[test]
+fn transient_task_read_failure_keeps_the_directory_for_retry() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let f = fixture();
+    let path = f.home.join("tasks/test/task.json");
+    let held = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&path)
+        .unwrap();
+    let again = Daemon::load(options(&f.home), None);
+    assert!(again.lock().tasks.is_empty());
+    assert!(path.exists());
+    assert!(!f.home.join("quarantine").exists());
+    drop(held);
+    let again = Daemon::load(options(&f.home), None);
+    assert!(again.lock().tasks.contains_key("test"));
+}
+
+#[test]
+#[ignore = "local disk timing, no agent processes"]
+fn event_flush_cost() {
+    let f = fixture();
+    for kind in ["tool", "failed"] {
+        let start = Instant::now();
+        for _ in 0..1000 {
+            f.d.try_emit("test", kind, json!({})).unwrap();
+        }
+        eprintln!("1000 {kind} events: {:?}", start.elapsed());
+    }
+    let start = Instant::now();
+    let mut count = 0;
+    f.d.store.recover_events("test", |_| count += 1).unwrap();
+    eprintln!("streamed {count} events: {:?}", start.elapsed());
 }

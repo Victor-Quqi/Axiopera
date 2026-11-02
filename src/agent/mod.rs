@@ -299,6 +299,7 @@ impl Backend {
         p.stdin.close().await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), p.child.wait()).await;
         p.job.kill();
+        let _ = p.child.wait().await;
     }
 
     pub fn stderr_tail(&mut self) -> String {

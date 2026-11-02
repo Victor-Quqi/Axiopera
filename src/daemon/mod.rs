@@ -243,16 +243,45 @@ pub async fn run(opts: Options) -> Result<()> {
 impl Daemon {
     fn load(opts: Options, log: Option<File>) -> Daemon {
         let store = Store::new(&opts.home);
-        let ledger = Ledger::load(&opts.home);
+        let mut ledger = Ledger::load(&opts.home);
         let mut tasks = HashMap::new();
+        let mut recovered_timeouts = Vec::new();
         let mut seq = 0;
-        for task in store.load_all() {
-            let events = store.events(&task.id);
-            seq = seq.max(events.last().map_or(0, |e| e.seq));
-            let deliverable: Vec<Event> = events
-                .into_iter()
-                .filter(|e| store::deliverable(&e.kind))
-                .collect();
+        let (loaded, mut errors) = store.recover_tasks();
+        for mut task in loaded {
+            let mut deliverable = Vec::new();
+            if let Err(e) = store.recover_events(&task.id, |event| {
+                seq = seq.max(event.seq);
+                if store::deliverable(&event.kind) {
+                    deliverable.push(event);
+                }
+            }) {
+                errors.push(format!(
+                    "recovering {}: {e:#}; original event log retained",
+                    task.id
+                ));
+            }
+            if task.status == Status::Cancelled
+                && deliverable
+                    .iter()
+                    .rev()
+                    .find(|e| matches!(e.kind.as_str(), "cancelled" | "interrupted"))
+                    .is_some_and(|e| {
+                        e.kind == "cancelled"
+                            && e.data.get("by").and_then(Value::as_str) == Some("timeout")
+                    })
+            {
+                let previous_fingerprint = task.session_file.take();
+                task.status = Status::Interrupted;
+                if let Err(e) = store.save_durable(&task) {
+                    errors.push(format!("recovering timed out task {}: {e:#}", task.id));
+                    task.status = Status::Cancelled;
+                    task.session_file = previous_fingerprint;
+                } else {
+                    recovered_timeouts.push(task.id.clone());
+                }
+            }
+            deliverable.sort_by_key(|event| event.seq);
             let entry = Entry {
                 blocked: 0,
                 notices: Vec::new(),
@@ -261,18 +290,34 @@ impl Daemon {
                 tool_calls: 0,
                 last_tool: None,
                 turn_ended_ms: 0,
+                pending: if task.status.is_final() || task.detached {
+                    Vec::new()
+                } else {
+                    task.pending_inputs.clone()
+                },
+                mail: if task.status.is_final() || task.detached {
+                    Vec::new()
+                } else {
+                    task.pending_mail.clone()
+                },
                 task,
                 actor: None,
                 releasing: false,
                 env: None,
-                pending: Vec::new(),
-                mail: Vec::new(),
                 approval_events: delivery::approval_index(&deliverable),
                 deliverable,
             };
             tasks.insert(entry.task.id.clone(), entry);
         }
         seq = seq.max(ledger.seq);
+        ledger.cursors.retain(|key, cursor| {
+            key.rsplit_once('|').is_some_and(|(caller, id)| {
+                !caller.is_empty() && tasks.contains_key(id) && *cursor <= seq
+            })
+        });
+        if let Err(e) = ledger.save(&opts.home) {
+            errors.push(format!("saving recovered ledger: {e:#}"));
+        }
         let (events, _) = broadcast::channel(1024);
         let d = Daemon {
             opts,
@@ -297,6 +342,12 @@ impl Daemon {
             requests: Mutex::new(()),
             previews: Mutex::new(delivery::Previews::default()),
         };
+        for error in errors {
+            d.log(&error);
+        }
+        for id in recovered_timeouts {
+            d.emit(&id, "interrupted", json!({"reason": "recovered a task cancelled by a previous timeout", "by": "timeout"}));
+        }
         // Whatever was running when the last daemon died has lost its process.
         let ids: Vec<String> = {
             let st = d.lock();
@@ -307,7 +358,12 @@ impl Daemon {
                 .collect()
         };
         for id in ids {
-            d.set_status(&id, Status::Interrupted);
+            if let Err(e) = d.try_update(&id, |task| {
+                task.status = Status::Interrupted;
+                task.session_file = None;
+            }) {
+                d.log(&format!("recovering interrupted task {id}: {e:#}"));
+            }
             d.emit(
                 &id,
                 "interrupted",
@@ -361,16 +417,25 @@ impl Daemon {
 
     /// Append an event and wake waiters. `data` must be a JSON object.
     pub fn emit(&self, task: &str, kind: &str, data: Value) {
-        self.emit_with(task, kind, data, None);
+        if let Err(e) = self.try_emit(task, kind, data) {
+            self.log(&format!("writing event for {task}: {e:#}"));
+        }
+    }
+
+    fn try_emit(&self, task: &str, kind: &str, data: Value) -> Result<()> {
+        self.emit_with(task, kind, data, None)
     }
 
     /// Like `emit`, for an event that tells the task's agent was given `message`: the message
     /// is saved whole before the event is appended.
+    #[cfg(test)]
     pub fn emit_message(&self, task: &str, kind: &str, data: Value, message: &str) {
-        self.emit_with(task, kind, data, Some(message));
+        if let Err(e) = self.emit_with(task, kind, data, Some(message)) {
+            self.log(&format!("writing message for {task}: {e:#}"));
+        }
     }
 
-    fn emit_with(&self, task: &str, kind: &str, data: Value, message: Option<&str>) {
+    fn emit_with(&self, task: &str, kind: &str, data: Value, message: Option<&str>) -> Result<()> {
         let mut st = self.lock();
         st.seq += 1;
         let event = Event {
@@ -383,18 +448,10 @@ impl Daemon {
                 _ => Map::new(),
             },
         };
-        let mut errors = Vec::new();
-        if let Some(Err(e)) = message.map(|m| self.store.save_message(task, event.seq, m)) {
-            errors.push(format!("writing a message to {task}: {e:#}"));
+        if let Some(message) = message {
+            self.store.save_message(task, event.seq, message)?;
         }
-        if let Err(e) = self.store.append(&event) {
-            errors.push(format!("writing event for {task}: {e:#}"));
-        }
-        if !errors.is_empty() {
-            drop(st);
-            errors.iter().for_each(|e| self.log(e));
-            st = self.lock();
-        }
+        self.store.append(&event)?;
         if let Some(entry) = st.tasks.get_mut(task) {
             entry.task.updated_ms = event.ts;
             match kind {
@@ -458,22 +515,39 @@ impl Daemon {
             }
         }
         let _ = self.events.send(event);
+        Ok(())
     }
 
     /// Change a task and persist it.
     pub fn update(&self, id: &str, f: impl FnOnce(&mut Task)) {
-        let mut st = self.lock();
-        let Some(entry) = st.tasks.get_mut(id) else {
-            return;
-        };
-        f(&mut entry.task);
-        entry.task.updated_ms = store::now_ms();
-        // Saved under the lock, so concurrent updates reach the disk in order.
-        if let Err(e) = self.store.save(&entry.task) {
+        if let Err(e) = self.update_task(id, f, false) {
             self.log(&format!("saving {id}: {e:#}"));
         }
     }
 
+    fn try_update(&self, id: &str, f: impl FnOnce(&mut Task)) -> Result<()> {
+        self.update_task(id, f, true)
+    }
+
+    fn update_task(&self, id: &str, f: impl FnOnce(&mut Task), durable: bool) -> Result<()> {
+        let mut st = self.lock();
+        let Some(entry) = st.tasks.get_mut(id) else {
+            return Err(anyhow!("no task {id}"));
+        };
+        let mut task = entry.task.clone();
+        f(&mut task);
+        task.updated_ms = store::now_ms();
+        // Saved under the lock, so concurrent updates reach the disk in order.
+        if durable {
+            self.store.save_durable(&task)?;
+        } else {
+            self.store.save(&task)?;
+        }
+        entry.task = task;
+        Ok(())
+    }
+
+    #[cfg(test)]
     pub fn set_status(&self, id: &str, status: Status) {
         self.update(id, |t| t.status = status);
     }
@@ -772,7 +846,7 @@ impl Daemon {
             Request::Cancel { task } => {
                 let id = self.find(&caller, &task)?;
                 let mut rx = self.events.subscribe();
-                let n = self.cancel_tree(&id, "cancelled by request", &caller);
+                let n = self.try_cancel_tree(&id, "cancelled by request", &caller)?;
                 // Interrupting takes a few seconds; answer once the processes are gone, so a
                 // status right after shows the outcome.
                 let settled = async {
@@ -940,13 +1014,15 @@ impl Daemon {
             delivered: 0,
             changed_files: Vec::new(),
             questions: Vec::new(),
+            pending_inputs: vec![s.task.clone()],
+            pending_mail: Vec::new(),
             stalled: false,
             detached: false,
             created_ms: now,
             updated_ms: now,
         };
         self.store.save_prompt(&id, &s.task)?;
-        self.store.save(&task)?;
+        self.store.save_durable(&task)?;
         {
             let mut st = self.lock();
             // Again under the lock that adds the task, so spawns at once cannot pass it together.
@@ -985,11 +1061,11 @@ impl Daemon {
             };
             st.tasks.insert(id.clone(), entry);
         }
-        self.emit(
+        self.try_emit(
             &id,
             "spawned",
             json!({"agent": s.agent, "tier": s.tier, "cwd": cwd}),
-        );
+        )?;
         self.schedule(&id);
 
         let mut notes = render::capability_notes(s.agent, s.tier);
@@ -1038,7 +1114,11 @@ impl Daemon {
         let Some(entry) = st.tasks.get(id) else {
             return;
         };
-        if entry.actor.is_some() || entry.task.status.is_final() || entry.task.detached {
+        if entry.actor.is_some()
+            || entry.task.status.is_final()
+            || entry.task.detached
+            || entry.env.is_none()
+        {
             return;
         }
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1059,7 +1139,9 @@ impl Daemon {
             st.tasks.get_mut(id).is_some_and(|e| {
                 e.actor = None;
                 e.releasing = false;
-                !e.pending.is_empty() && !e.task.status.is_final()
+                !e.pending.is_empty()
+                    && !e.task.status.is_final()
+                    && e.task.status != Status::Interrupted
             })
         };
         // Not an event of its own: lets `wait` notice the task went idle.
@@ -1179,15 +1261,20 @@ impl Daemon {
                         ),
                     );
                 }
-                // Persist before accepting the input, under the same lock as scheduling and
-                // permission checks. A failed save leaves both tier and message unchanged.
-                let mut task = entry.task.clone();
-                task.tier = tier;
-                task.updated_ms = store::now_ms();
-                self.store.save(&task)?;
-                st.tasks.get_mut(id).unwrap().task = task;
             }
             let entry = st.tasks.get_mut(id).unwrap();
+            let mut task = entry.task.clone();
+            if let Some(tier) = tier {
+                task.tier = tier;
+            }
+            // Persist tier and accepted input together before changing the live entry.
+            task.pending_inputs.push(input.text.clone());
+            task.updated_ms = store::now_ms();
+            self.store.save_durable(&task)?;
+            if entry.actor.is_none() {
+                entry.pending = entry.task.pending_inputs.clone();
+            }
+            entry.task = task;
             if entry.env.is_none() {
                 entry.env = env;
             }
@@ -1234,17 +1321,17 @@ impl Daemon {
                     .any(|e| e.task.questions.iter().any(|q| q.id == id))
             })
         };
-        self.update(&task, |t| {
+        self.try_update(&task, |t| {
             t.questions.push(store::Question {
                 id: qid.clone(),
                 text: text.clone(),
                 answer: None,
                 asked_ms: store::now_ms(),
             })
-        });
+        })?;
         let mut data = json!({"id": qid, "text": text});
-        self.keep_whole(&mut data, &task, "questions", &qid, &text);
-        self.emit(&task, "question", data);
+        self.keep_whole(&mut data, &task, "questions", &qid, &text)?;
+        self.try_emit(&task, "question", data)?;
         let answers = match self.lock().tasks.get(&task).map(|e| e.task.agent) {
             Some(Agent::Codex) => "the `answers` tool",
             _ => "`axiopera answers`",
@@ -1278,7 +1365,8 @@ impl Daemon {
             else {
                 return refuse(ErrorCode::NotFound, format!("no question {qid}"));
             };
-            let task = &mut entry.task;
+            let mut saved = entry.task.clone();
+            let task = &mut saved;
             // Tasks answer only their own children; main sessions and people stand for the user.
             if identity::task_of(caller).is_some() && task.parent != caller {
                 return refuse(
@@ -1296,10 +1384,10 @@ impl Daemon {
             q.answer = Some(answer.clone());
             let question = q.text.clone();
             task.updated_ms = store::now_ms();
-            if let Err(e) = self.store.save(task) {
-                self.log(&format!("saving {}: {e:#}", task.id));
-            }
-            (task.id.clone(), question)
+            self.store.save_durable(task)?;
+            let id = task.id.clone();
+            entry.task = saved;
+            (id, question)
         };
         let message = format!(
             "[axiopera] Answer to your question {qid} (\"{}\"):\n{answer}",
@@ -1317,7 +1405,7 @@ impl Daemon {
                 return Err(e);
             }
         };
-        self.emit(&task, "answered", json!({"id": qid}));
+        self.try_emit(&task, "answered", json!({"id": qid}))?;
         out.text(
             format!("{qid}: {how}"),
             json!({"id": qid, "task": task, "result": how}),
@@ -1398,27 +1486,30 @@ impl Daemon {
                     format!("{to} is no longer driven by axiopera"),
                 );
             }
-            match (&entry.actor, entry.releasing) {
-                (Some(actor), false) => {
-                    let _ = actor.send(Cmd::Mail(message));
-                    "sent"
-                }
-                _ => {
-                    entry.mail.push(message);
-                    // Counts as activity, so gc gives the task time to take the note; set under
-                    // the same lock, so gc cannot remove the task in between.
-                    entry.task.updated_ms = store::now_ms();
-                    if let Err(e) = self.store.save(&entry.task) {
-                        self.log(&format!("saving {to}: {e:#}"));
+            let mut task = entry.task.clone();
+            task.pending_mail.push(message.clone());
+            task.updated_ms = store::now_ms();
+            self.store.save_durable(&task)?;
+            entry.task = task;
+            if let (Some(actor), false) = (&entry.actor, entry.releasing) {
+                match actor.send(Cmd::Mail(message)) {
+                    Ok(()) => "sent",
+                    Err(e) => {
+                        if let Cmd::Mail(message) = e.0 {
+                            entry.mail.push(message);
+                        }
+                        "kept for its next turn"
                     }
-                    "kept for its next turn"
                 }
+            } else {
+                entry.mail.push(message);
+                "kept for its next turn"
             }
         };
         let mut data = json!({"to": to, "text": text});
         let name = store::new_id('n', |n| self.store.text_path(me, "notes", n).exists());
-        self.keep_whole(&mut data, me, "notes", &name, &text);
-        self.emit(me, "message", data);
+        self.keep_whole(&mut data, me, "notes", &name, &text)?;
+        self.try_emit(me, "message", data)?;
         out.text(
             format!("{to}: {how}; your parent gets a copy"),
             json!({"task": to, "result": how}),
@@ -1457,19 +1548,20 @@ impl Daemon {
                 Agent::Codex => format!("codex resume {session}"),
                 Agent::Grok => format!("grok -r {session}"),
             };
+            let mut task = entry.task.clone();
+            task.detached = true;
+            task.updated_ms = store::now_ms();
+            self.store.save_durable(&task)?;
+            entry.task = task;
             entry.pending.clear();
             entry.mail.clear();
-            // Under the same lock as the check, so no `send` can start it in between.
-            entry.task.detached = true;
-            entry.task.updated_ms = store::now_ms();
-            self.store.save(&entry.task)?;
             (entry.task.cwd.clone(), resume)
         };
-        self.emit(
+        self.try_emit(
             &id,
             "detached",
             json!({"reason": "handed over with axiopera detach"}),
-        );
+        )?;
         let (cwd, resume) = task;
         out.text(
             format!("{id} detached\n  cd \"{}\"\n  {resume}", cwd.display()),
@@ -1526,6 +1618,9 @@ impl Daemon {
         let settled = |e: &Entry| {
             e.actor.is_none()
                 && e.pending.is_empty()
+                && (e.task.status.is_final()
+                    || e.task.detached
+                    || (e.task.pending_inputs.is_empty() && e.task.pending_mail.is_empty()))
                 && !matches!(e.task.status, Status::Queued | Status::Running)
                 && e.task.updated_ms < cutoff_ms
         };
@@ -1562,10 +1657,10 @@ impl Daemon {
             {
                 continue;
             }
+            self.store.remove(&id)?;
             st.tasks.remove(&id);
             let suffix = format!("|{id}");
             st.ledger.cursors.retain(|k, _| !k.ends_with(&suffix));
-            self.store.remove(&id)?;
             removed += 1;
         }
         let mut st = self.lock();
@@ -1619,8 +1714,18 @@ impl Daemon {
         };
         let mut data =
             json!({"id": rid, "summary": summary, "approver": approver, "detail": detail});
-        self.keep_whole(&mut data, id, "approvals", &rid, &detail);
-        self.emit(id, "approval_request", data);
+        if let Err(e) = self
+            .keep_whole(&mut data, id, "approvals", &rid, &detail)
+            .and_then(|()| self.try_emit(id, "approval_request", data))
+        {
+            if let Some(pending) = self.lock().approvals.remove(&rid) {
+                let _ = pending.reply.send(agent::Decision::Deny(format!(
+                    "Could not persist approval request: {e:#}"
+                )));
+            }
+            self.log(&format!("saving approval request: {e:#}"));
+            return;
+        }
         let d = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(d.opts.approval_timeout).await;
@@ -1631,17 +1736,24 @@ impl Daemon {
     }
 
     /// Keep a text too long to show whole in a file, and note the file in the event's `data`.
-    fn keep_whole(&self, data: &mut Value, task: &str, kind: &str, name: &str, text: &str) {
+    fn keep_whole(
+        &self,
+        data: &mut Value,
+        task: &str,
+        kind: &str,
+        name: &str,
+        text: &str,
+    ) -> Result<()> {
         if render::tokens(text) <= render::WHOLE_TOKENS {
-            return;
+            return Ok(());
         }
         let file = self.store.text_path(task, kind, name);
-        match std::fs::create_dir_all(file.parent().unwrap())
-            .and_then(|()| std::fs::write(&file, text))
-        {
-            Ok(()) => data["file"] = json!(file),
-            Err(e) => self.log(&format!("writing {}: {e:#}", file.display())),
-        }
+        std::fs::create_dir_all(file.parent().unwrap())?;
+        let mut saved = File::create(&file)?;
+        saved.write_all(text.as_bytes())?;
+        saved.sync_all()?;
+        data["file"] = json!(file);
+        Ok(())
     }
 
     /// Answer an approval request. `by` is the deciding caller, or None for the timeout.
@@ -1678,26 +1790,81 @@ impl Daemon {
             agent::Decision::Approve => ("approved", None),
             agent::Decision::Deny(r) => ("denied", Some(r.clone())),
         };
-        let _ = pending.reply.send(decision);
-        self.emit(
+        if let Err(e) = self.try_emit(
             &pending.task,
             kind,
             json!({"id": rid, "by": by.unwrap_or("timeout"), "reason": reason}),
-        );
+        ) {
+            self.lock().approvals.insert(rid.to_string(), pending);
+            return Err(e);
+        }
+        pending
+            .reply
+            .send(decision)
+            .map_err(|_| anyhow!("approval requester has stopped"))?;
         Ok(pending.task)
     }
 
     /// Cancel a task and its descendants. Returns how many tasks were affected.
+    #[cfg(test)]
     fn cancel_tree(self: &Arc<Self>, id: &str, reason: &str, by: &str) -> usize {
-        let mut n = self.cancel_children(id, by);
+        match self.try_cancel_tree(id, reason, by) {
+            Ok(n) => n,
+            Err(e) => {
+                self.log(&format!("cancelling {id}: {e:#}"));
+                0
+            }
+        }
+    }
+
+    fn try_cancel_tree(self: &Arc<Self>, id: &str, reason: &str, by: &str) -> Result<usize> {
+        self.stop_tree(id, reason, by, false)
+    }
+
+    fn stop_tree(
+        self: &Arc<Self>,
+        id: &str,
+        reason: &str,
+        by: &str,
+        interrupted: bool,
+    ) -> Result<usize> {
+        let children: Vec<String> = self
+            .lock()
+            .tasks
+            .values()
+            .filter(|e| identity::task_of(&e.task.parent) == Some(id))
+            .map(|e| e.task.id.clone())
+            .collect();
+        let mut n = 0;
+        for child in children {
+            n += self.stop_tree(
+                &child,
+                if interrupted {
+                    "parent timed out"
+                } else {
+                    "parent cancelled"
+                },
+                by,
+                interrupted,
+            )?;
+        }
         let actor = {
             let mut st = self.lock();
             let Some(entry) = st.tasks.get_mut(id) else {
-                return n;
+                return Ok(n);
             };
             if entry.task.status.is_final() {
-                return n;
+                return Ok(n);
             }
+            let mut task = entry.task.clone();
+            task.status = if interrupted {
+                Status::Interrupted
+            } else {
+                Status::Cancelled
+            };
+            task.updated_ms = store::now_ms();
+            self.store.save_durable(&task)?;
+            entry.task = task;
             entry.pending.clear();
             // An actor letting go of its process no longer reads commands.
             entry.actor.clone().filter(|_| !entry.releasing)
@@ -1706,17 +1873,25 @@ impl Daemon {
         let cause = task::Cancellation {
             reason: reason.to_string(),
             by: by.to_string(),
+            interrupted,
         };
         match actor {
             Some(a) => {
                 let _ = a.send(Cmd::Cancel(cause));
             }
             None => {
-                self.set_status(id, Status::Cancelled);
-                self.emit(id, "cancelled", json!(cause));
+                self.try_emit(
+                    id,
+                    if interrupted {
+                        "interrupted"
+                    } else {
+                        "cancelled"
+                    },
+                    json!(cause),
+                )?;
             }
         }
-        n
+        Ok(n)
     }
 
     /// No process left in the task or any of its descendants.
@@ -1728,19 +1903,19 @@ impl Daemon {
             .all(|e| e.actor.is_none())
     }
 
-    pub fn cancel_children(self: &Arc<Self>, id: &str, by: &str) -> usize {
-        let children: Vec<String> = {
-            let st = self.lock();
-            st.tasks
-                .values()
-                .filter(|e| identity::task_of(&e.task.parent) == Some(id))
-                .map(|e| e.task.id.clone())
-                .collect()
-        };
-        children
-            .iter()
-            .map(|c| self.cancel_tree(c, "parent cancelled", by))
-            .sum()
+    fn interrupt_children(self: &Arc<Self>, id: &str) {
+        let children: Vec<String> = self
+            .lock()
+            .tasks
+            .values()
+            .filter(|e| identity::task_of(&e.task.parent) == Some(id))
+            .map(|e| e.task.id.clone())
+            .collect();
+        for child in children {
+            if let Err(e) = self.stop_tree(&child, "parent timed out", "timeout", true) {
+                self.log(&format!("interrupting {child}: {e:#}"));
+            }
+        }
     }
 
     fn children(&self, st: &State, caller: &str, only: &[String]) -> Vec<String> {
@@ -2187,27 +2362,28 @@ impl Daemon {
         approvals: &[String],
     ) -> Result<()> {
         for (task, turn) in turns {
-            self.update(task, |t| t.delivered = t.delivered.max(*turn));
+            self.try_update(task, |t| t.delivered = t.delivered.max(*turn))?;
         }
         let mut st = self.lock();
+        let mut ledger = st.ledger.clone();
         for e in seen {
             // A task gc removed meanwhile took its cursors along.
             if !st.tasks.contains_key(&e.task) {
                 continue;
             }
-            let cursor = st
-                .ledger
+            let cursor = ledger
                 .cursors
                 .entry(cursor_key(caller, &e.task))
                 .or_default();
             *cursor = (*cursor).max(e.seq);
         }
+        ledger.save(&self.opts.home)?;
+        st.ledger = ledger;
         for rid in approvals {
             if let Some(p) = st.approvals.get_mut(rid) {
                 p.delivered = true;
             }
         }
-        st.ledger.save(&self.opts.home)?;
         Ok(())
     }
 
@@ -2436,7 +2612,7 @@ impl Daemon {
             json!({"task": id, "turn": turn, "path": path}),
         )
         .await?;
-        self.update(&id, |t| t.delivered = t.delivered.max(turn));
+        self.try_update(&id, |t| t.delivered = t.delivered.max(turn))?;
         Ok(ipc::exit::OK)
     }
 

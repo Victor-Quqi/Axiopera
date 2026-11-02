@@ -16,13 +16,13 @@ use crate::ipc::Agent;
 use crate::store::{Fingerprint, Status};
 
 impl Daemon {
-    pub(super) fn file_changed(&self, id: &str, path: &str) {
+    pub(super) fn file_changed(&self, id: &str, path: &str) -> Result<()> {
         let mut st = self.lock();
         let Some(entry) = st.tasks.get_mut(id) else {
-            return;
+            return Err(anyhow!("no task {id}"));
         };
         if entry.task.changed_files.iter().any(|p| p == path) {
-            return;
+            return Ok(());
         }
         let updated = entry.task.updated_ms;
         entry.task.changed_files.push(path.to_string());
@@ -30,8 +30,9 @@ impl Daemon {
         if let Err(e) = self.store.save(&entry.task) {
             entry.task.changed_files.pop();
             entry.task.updated_ms = updated;
-            self.log(&format!("saving {id}: {e:#}"));
+            return Err(e);
         }
+        Ok(())
     }
 }
 
@@ -50,6 +51,8 @@ pub enum Cmd {
 pub struct Cancellation {
     pub reason: String,
     pub by: String,
+    #[serde(skip)]
+    pub interrupted: bool,
 }
 
 #[derive(Debug)]
@@ -79,12 +82,13 @@ impl InputTracking {
         id: &str,
         agent: Agent,
         backend: &mut Backend,
-        input: &str,
+        inputs: &[String],
     ) -> Result<Option<&'static str>> {
+        let input = inputs.join("\n\n");
         let queued = !backend.in_turn();
         self.serial += 1;
         if matches!(
-            backend.steer(input, Some(self.serial)).await?,
+            backend.steer(&input, Some(self.serial)).await?,
             Steer::NoActiveTurn
         ) {
             return Ok(None);
@@ -94,7 +98,8 @@ impl InputTracking {
         } else {
             self.pending.insert(self.serial, input.to_string());
         }
-        d.emit_message(id, "steered", json!({"queued": queued}), input);
+        d.emit_with(id, "steered", json!({"queued": queued}), Some(&input))?;
+        delivered(d, id, inputs, &[])?;
         Ok(Some(if queued {
             "queued for a following turn"
         } else {
@@ -114,7 +119,7 @@ const SAID: usize = 500;
 enum Exit {
     Released,
     Failed(String),
-    Cancelled(Cancellation),
+    Stopped(Cancellation),
     Aborted,
     Detached,
 }
@@ -131,7 +136,7 @@ pub async fn run(d: Arc<Daemon>, id: String, mut rx: mpsc::UnboundedReceiver<Cmd
             tokio::select! {
                 error = &mut query => break Exit::Failed(error),
                 cmd = rx.recv() => match cmd {
-                    Some(Cmd::Cancel(cause)) => break Exit::Cancelled(cause),
+                    Some(Cmd::Cancel(cause)) => break Exit::Stopped(cause),
                     Some(Cmd::Abort) | None => break Exit::Aborted,
                     Some(Cmd::Input(m)) => {
                         if let Some(entry) = d.lock().tasks.get_mut(&id) { entry.pending.push(m.queued()); }
@@ -143,30 +148,50 @@ pub async fn run(d: Arc<Daemon>, id: String, mut rx: mpsc::UnboundedReceiver<Cmd
     } else {
         exit
     };
+    if !matches!(exit, Exit::Released) {
+        if let Some(entry) = d.lock().tasks.get_mut(&id) {
+            entry.pending.clear();
+        }
+    }
+    if let Err(e) = finish_exit(&d, &id, exit) {
+        d.log(&format!("finishing {id}: {e:#}"));
+    }
+    d.actor_done(&id);
+}
+
+fn finish_exit(d: &Daemon, id: &str, exit: Exit) -> Result<()> {
     match exit {
         Exit::Released => {}
         Exit::Failed(error) => {
-            d.set_status(&id, Status::Failed);
-            d.emit(&id, "failed", json!({"error": error}));
+            d.try_update(id, |t| t.status = Status::Failed)?;
+            d.try_emit(id, "failed", json!({"error": error}))?;
         }
-        Exit::Cancelled(cause) => {
-            d.set_status(&id, Status::Cancelled);
-            d.emit(&id, "cancelled", json!(cause));
+        Exit::Stopped(cause) => {
+            let (status, kind) = if cause.interrupted {
+                (Status::Interrupted, "interrupted")
+            } else {
+                (Status::Cancelled, "cancelled")
+            };
+            d.try_update(id, |t| t.status = status)?;
+            if let Some(entry) = d.lock().tasks.get_mut(id) {
+                entry.pending.clear();
+            }
+            d.try_emit(id, kind, json!(cause))?;
         }
         Exit::Aborted => {
-            d.set_status(&id, Status::Interrupted);
-            d.emit(&id, "interrupted", json!({"reason": "the daemon stopped"}));
+            d.try_update(id, |t| t.status = Status::Interrupted)?;
+            d.try_emit(id, "interrupted", json!({"reason": "the daemon stopped"}))?;
         }
         Exit::Detached => {
-            d.update(&id, |t| t.detached = true);
-            d.emit(
-                &id,
+            d.try_update(id, |t| t.detached = true)?;
+            d.try_emit(
+                id,
                 "detached",
                 json!({"reason": "the native session was continued outside axiopera"}),
-            );
+            )?;
         }
     }
-    d.actor_done(&id);
+    Ok(())
 }
 
 async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>) -> Result<Exit> {
@@ -208,21 +233,16 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
             .filter(|v| v == "1")
             .map(|_| d.opts.home.join("tasks").join(id).join("protocol.log")),
     };
-    let deadline = task.timeout_secs.map(|s| {
-        let elapsed = Duration::from_millis(crate::store::now_ms().saturating_sub(task.created_ms));
-        Instant::now() + Duration::from_secs(s).saturating_sub(elapsed)
-    });
+    let deadline = execution_deadline(task.timeout_secs);
     let timed_out = || {
-        d.cancel_children(id, "timeout");
+        d.interrupt_children(id);
         Cancellation {
             reason: format!("timed out after {}s", task.timeout_secs.unwrap_or(0)),
             by: "timeout".into(),
+            interrupted: true,
         }
     };
-    d.update(id, |t| {
-        t.status = Status::Running;
-        t.stalled = false;
-    });
+    begin_execution(d, id)?;
     let (etx, mut erx) = mpsc::unbounded_channel();
     // Starting can hang (an MCP server, a slow handshake): keep honouring cancel and the
     // deadline. Dropping the half-started backend kills its process.
@@ -234,14 +254,15 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
             cmd = rx.recv() => match cmd {
                 Some(Cmd::Input(m)) => inputs.push(m.queued()),
                 Some(Cmd::Mail(m)) => keep_mail(d, id, m),
-                Some(Cmd::Cancel(cause)) => return Ok(Exit::Cancelled(cause)),
+                Some(Cmd::Cancel(cause)) => return Ok(Exit::Stopped(cause)),
                 Some(Cmd::Abort) | None => return Ok(Exit::Aborted),
             },
-            _ = sleep_until(deadline) => return Ok(Exit::Cancelled(timed_out())),
+            _ = sleep_until(deadline) => return Ok(Exit::Stopped(timed_out())),
         }
     };
     let mut session_file = task.session_file.as_ref().map(|f| f.path.clone());
-    start_turn(d, id, &mut backend, &inputs.join("\n\n")).await?;
+    let outcome = async {
+    start_turn(d, id, &mut backend, &inputs).await?;
     let mut last_activity = Instant::now();
     let mut stalled = false;
     let mut tick = tokio::time::interval(Duration::from_secs(30));
@@ -253,8 +274,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
     let exit = loop {
         if !turn_open && erx.is_empty() {
             if !deferred.is_empty() {
-                let input = deferred.join("\n\n");
-                deferred.clear();
+                let input = std::mem::take(&mut deferred);
                 if backend.busy()
                     && tracking
                         .steer(d, id, task.agent, &mut backend, &input)
@@ -270,7 +290,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
             if !backend.busy() {
                 match release_or_continue(d, id, rx) {
                     Next::Turn(input) => {
-                        start_turn(d, id, &mut backend, &input.join("\n\n")).await?;
+                        start_turn(d, id, &mut backend, &input).await?;
                         turn_open = true;
                     }
                     Next::Stop(exit) => break exit,
@@ -286,29 +306,29 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                 last_activity = Instant::now();
                 if stalled {
                     stalled = false;
-                    d.update(id, |t| t.stalled = false);
+                    d.try_update(id, |t| t.stalled = false)?;
                 }
                 match ev {
                     AgentEvent::Session { id: sid, file } => {
-                        d.update(id, |t| t.session = Some(sid));
+                        d.try_update(id, |t| t.session = Some(sid))?;
                         if file.is_some() {
                             session_file = file;
                         }
                     }
-                    AgentEvent::Tool { id: call, name, detail } => d.emit(id, "tool", json!({"id": call, "name": name, "detail": detail})),
-                    AgentEvent::ToolUpdated { id: call, name, detail } => d.emit(id, "tool_updated", json!({"id": call, "name": name, "detail": detail})),
-                    AgentEvent::Said(text) => d.emit(id, "said", json!({"text": agent::clip(&text, SAID)})),
+                    AgentEvent::Tool { id: call, name, detail } => d.try_emit(id, "tool", json!({"id": call, "name": name, "detail": detail}))?,
+                    AgentEvent::ToolUpdated { id: call, name, detail } => d.try_emit(id, "tool_updated", json!({"id": call, "name": name, "detail": detail}))?,
+                    AgentEvent::Said(text) => d.try_emit(id, "said", json!({"text": agent::clip(&text, SAID)}))?,
                     AgentEvent::FileChanged(path) => {
-                        d.file_changed(id, &path);
-                        d.emit(id, "file_changed", json!({"path": path}));
+                        d.file_changed(id, &path)?;
+                        d.try_emit(id, "file_changed", json!({"path": path}))?;
                     }
                     AgentEvent::InputRead(message) => {
                         if tracking.pending.remove(&message).is_some() {
-                            d.emit(id, "input_read", json!({}));
+                            d.try_emit(id, "input_read", json!({}))?;
                         }
                     }
-                    AgentEvent::Blocked(detail) => d.emit(id, "blocked", json!({"detail": detail})),
-                    AgentEvent::Notice(text) => d.emit(id, "notice", json!({"text": text})),
+                    AgentEvent::Blocked(detail) => d.try_emit(id, "blocked", json!({"detail": detail}))?,
+                    AgentEvent::Notice(text) => d.try_emit(id, "notice", json!({"text": text}))?,
                     AgentEvent::TurnStarted => {
                         // Unless it is the turn we have just started.
                         let turn = d
@@ -318,7 +338,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                             .filter(|e| !e.in_turn)
                             .map(|e| e.task.turns + 1);
                         if let Some(turn) = turn {
-                            d.emit(id, "turn_started", json!({"turn": turn}));
+                            d.try_emit(id, "turn_started", json!({"turn": turn}))?;
                         }
                     }
                     AgentEvent::Approval(a) => d.request_approval(id, a),
@@ -376,7 +396,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
             cmd = rx.recv() => match cmd {
                 Some(Cmd::Input(input)) => {
                     if backend.busy() {
-                        match tracking.steer(d, id, task.agent, &mut backend, &input.text).await? {
+                        match tracking.steer(d, id, task.agent, &mut backend, std::slice::from_ref(&input.text)).await? {
                             Some(how) => {
                                 let _ = input.reply.send(how);
                             }
@@ -388,13 +408,14 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                         deferred.push(input.queued());
                     } else {
                         let text = input.queued();
-                        start_turn(d, id, &mut backend, &text).await?;
+                        start_turn(d, id, &mut backend, &[text]).await?;
                         turn_open = true;
                     }
                 }
                 Some(Cmd::Mail(msg)) => {
                     if backend.in_turn() && matches!(backend.steer(&msg, None).await?, Steer::Accepted) {
-                        d.emit_message(id, "steered", json!({"chars": msg.len()}), &msg);
+                        d.emit_with(id, "steered", json!({"chars": msg.len()}), Some(&msg))?;
+                        delivered(d, id, &[], &[msg])?;
                     } else {
                         keep_mail(d, id, msg);
                     }
@@ -408,32 +429,49 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
             _ = tick.tick() => {
                 if backend.busy() && !stalled && last_activity.elapsed() >= d.stall_after() {
                     stalled = true;
-                    d.update(id, |t| t.stalled = true);
-                    d.emit(id, "stalled", json!({"quiet_secs": last_activity.elapsed().as_secs()}));
+                    d.try_update(id, |t| t.stalled = true)?;
+                    d.try_emit(id, "stalled", json!({"quiet_secs": last_activity.elapsed().as_secs()}))?;
                 }
             }
             _ = sleep_until(deadline) => break cancel(&mut backend, timed_out()).await,
         }
     };
 
-    backend.shutdown().await;
-    if let Exit::Released = exit {
-        let fp = session_file.as_deref().and_then(Fingerprint::of);
-        d.update(id, |t| {
-            t.session_file = fp;
-            // A cancel that arrived while letting go has already settled the status.
-            if !t.status.is_final() {
-                t.status = if !last_ok {
-                    Status::Failed
-                } else if t.open_questions().next().is_some() {
-                    Status::Waiting
-                } else {
-                    Status::Idle
-                };
-            }
-        });
-    }
+    if let Exit::Released = exit { settle_release(d, id, last_ok)?; }
     Ok(exit)
+    }.await;
+    backend.shutdown().await;
+    record_session(d, id, session_file.as_deref())?;
+    outcome
+}
+
+fn settle_release(d: &Daemon, id: &str, last_ok: bool) -> Result<()> {
+    d.try_update(id, |t| {
+        // Cancellation or timeout can settle the task while its process is releasing.
+        if !t.status.is_final() && t.status != Status::Interrupted {
+            t.status = if !last_ok {
+                Status::Failed
+            } else if t.open_questions().next().is_some() {
+                Status::Waiting
+            } else {
+                Status::Idle
+            };
+        }
+    })
+}
+
+fn begin_execution(d: &Daemon, id: &str) -> Result<()> {
+    d.try_update(id, |t| {
+        t.status = Status::Running;
+        t.stalled = false;
+        // Startup can write the session before it reports a path or completes its handshake.
+        t.session_file = None;
+    })
+}
+
+fn record_session(d: &Daemon, id: &str, path: Option<&std::path::Path>) -> Result<()> {
+    let fingerprint = path.and_then(Fingerprint::of);
+    d.try_update(id, |t| t.session_file = fingerprint)
 }
 
 async fn model_error(d: &Daemon, id: &str, error: String) -> String {
@@ -468,6 +506,10 @@ async fn model_error(d: &Daemon, id: &str, error: String) -> String {
     }
 }
 
+fn execution_deadline(timeout_secs: Option<u64>) -> Option<Instant> {
+    timeout_secs.map(|secs| Instant::now() + Duration::from_secs(secs))
+}
+
 async fn sleep_until(deadline: Option<Instant>) {
     match deadline {
         Some(t) => tokio::time::sleep_until(t).await,
@@ -476,28 +518,48 @@ async fn sleep_until(deadline: Option<Instant>) {
 }
 
 /// Sibling notes kept for this turn go first.
-async fn start_turn(d: &Daemon, id: &str, backend: &mut Backend, input: &str) -> Result<()> {
-    let mut parts: Vec<String> = d
+async fn start_turn(d: &Daemon, id: &str, backend: &mut Backend, inputs: &[String]) -> Result<()> {
+    let mail = d
         .lock()
         .tasks
-        .get_mut(id)
-        .map(|e| e.mail.drain(..).collect())
+        .get(id)
+        .map(|e| e.task.pending_mail.clone())
         .unwrap_or_default();
-    parts.push(input.to_string());
-    let input = parts.join(
-        "
-
-",
-    );
+    let input = mail
+        .iter()
+        .chain(inputs)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n\n");
     backend.turn(&input).await?;
     let turn = d.lock().tasks.get(id).map_or(0, |e| e.task.turns) + 1;
-    d.emit_message(
+    d.emit_with(
         id,
         "turn_started",
         json!({"turn": turn, "chars": input.len()}),
-        &input,
-    );
+        Some(&input),
+    )?;
+    delivered(d, id, inputs, &mail)?;
+    if let Some(e) = d.lock().tasks.get_mut(id) {
+        e.mail.clear();
+    }
     Ok(())
+}
+
+// Backend admission and this durable removal cannot be atomic: a crash between them replays input.
+fn delivered(d: &Daemon, id: &str, inputs: &[String], mail: &[String]) -> Result<()> {
+    d.try_update(id, |task| {
+        for (queue, sent) in [
+            (&mut task.pending_inputs, inputs),
+            (&mut task.pending_mail, mail),
+        ] {
+            for text in sent {
+                if let Some(i) = queue.iter().position(|item| item == text) {
+                    queue.remove(i);
+                }
+            }
+        }
+    })
 }
 
 fn end_turn(
@@ -510,12 +572,16 @@ fn end_turn(
     messages: (usize, usize),
 ) -> Result<()> {
     let (unread, unconfirmed) = messages;
-    let mut turn = 0;
-    d.update(id, |t| {
-        t.turns += 1;
-        turn = t.turns;
-    });
+    let turn = d
+        .lock()
+        .tasks
+        .get(id)
+        .ok_or_else(|| anyhow!("task vanished"))?
+        .task
+        .turns
+        + 1;
     d.store().save_turn(id, turn, result)?;
+    d.try_update(id, |t| t.turns = turn)?;
     let (files, open) = d.lock().tasks.get(id).map_or((0, Vec::new()), |e| {
         let open: Vec<String> = e.task.open_questions().map(|q| q.id.clone()).collect();
         (e.task.changed_files.len(), open)
@@ -529,7 +595,7 @@ fn end_turn(
             )
         })
     };
-    d.emit(id, "turn_ended", json!({"unread": unread, "unconfirmed": unconfirmed, "blocked": blocked, "notices": notices, "turn": turn, "ok": ok, "error": error, "usage": usage, "chars": result.len(), "files": files, "open_questions": open}));
+    d.try_emit(id, "turn_ended", json!({"unread": unread, "unconfirmed": unconfirmed, "blocked": blocked, "notices": notices, "turn": turn, "ok": ok, "error": error, "usage": usage, "chars": result.len(), "files": files, "open_questions": open}))?;
     Ok(())
 }
 
@@ -580,7 +646,7 @@ fn release_or_continue(d: &Daemon, id: &str, rx: &mut mpsc::UnboundedReceiver<Cm
                 }
             }
             // Cancellation of an idle task needs no process; the daemon handles it after release.
-            Cmd::Cancel(cause) => return Next::Stop(Exit::Cancelled(cause)),
+            Cmd::Cancel(cause) => return Next::Stop(Exit::Stopped(cause)),
             Cmd::Abort => return Next::Stop(Exit::Aborted),
         }
     }
@@ -597,7 +663,7 @@ async fn cancel(backend: &mut Backend, cause: Cancellation) -> Exit {
     let _ = tokio::time::timeout(Duration::from_secs(2), backend.interrupt()).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     backend.kill();
-    Exit::Cancelled(cause)
+    Exit::Stopped(cause)
 }
 
 #[cfg(test)]
@@ -641,7 +707,7 @@ mod tests {
                 );
                 assert!(rx.try_recv().is_err());
             } else {
-                let Next::Stop(Exit::Cancelled(cause)) = release_or_continue(&f.d, "test", &mut rx)
+                let Next::Stop(Exit::Stopped(cause)) = release_or_continue(&f.d, "test", &mut rx)
                 else {
                     panic!("lost cancellation");
                 };
@@ -764,5 +830,195 @@ mod tests {
         assert!(line.ends_with("; the sandbox is off"), "{line}");
         let next = super::super::render::event_line(&events[1], Agent::Codex);
         assert!(!next.contains("sandbox"), "{next}");
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::super::tests::fixture;
+    use super::*;
+
+    #[test]
+    fn result_is_saved_before_the_turn_is_registered() {
+        let f = fixture();
+        let path = f.d.store.turn_path("test", 1);
+        std::fs::create_dir(path.with_extension("md.tmp")).unwrap();
+        assert!(end_turn(&f.d, "test", true, "answer", None, None, (0, 0)).is_err());
+        assert_eq!(f.d.lock().tasks["test"].task.turns, 0);
+        assert!(f.d.lock().tasks["test"].deliverable.is_empty());
+        std::fs::remove_dir(path.with_extension("md.tmp")).unwrap();
+        let task_tmp = path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("task.json.tmp");
+        std::fs::create_dir(&task_tmp).unwrap();
+        assert!(end_turn(&f.d, "test", true, "answer", None, None, (0, 0)).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "answer");
+        assert_eq!(f.d.lock().tasks["test"].task.turns, 0);
+        std::fs::remove_dir(task_tmp).unwrap();
+        end_turn(&f.d, "test", true, "answer", None, None, (0, 0)).unwrap();
+        assert_eq!(f.d.lock().tasks["test"].task.turns, 1);
+    }
+
+    #[test]
+    fn admission_removes_only_the_delivered_occurrence_and_failed_save_keeps_it() {
+        let f = fixture();
+        f.d.try_update("test", |t| {
+            t.pending_inputs = vec!["same".into(), "same".into(), "later".into()]
+        })
+        .unwrap();
+        delivered(&f.d, "test", &["same".into()], &[]).unwrap();
+        assert_eq!(
+            f.d.lock().tasks["test"].task.pending_inputs,
+            ["same", "later"]
+        );
+        let tmp =
+            f.d.store
+                .prompt_path("test")
+                .parent()
+                .unwrap()
+                .join("task.json.tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        assert!(delivered(&f.d, "test", &["same".into()], &[]).is_err());
+        assert_eq!(
+            f.d.lock().tasks["test"].task.pending_inputs,
+            ["same", "later"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::super::tests::{fixture, fixture_with};
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn each_execution_gets_a_full_timeout() {
+        let f = fixture();
+        assert_eq!(f.d.lock().tasks["test"].task.created_ms, 0);
+        let first = execution_deadline(Some(30)).unwrap();
+        assert_eq!(first - Instant::now(), Duration::from_secs(30));
+        tokio::time::advance(Duration::from_secs(300)).await;
+        assert_eq!(
+            execution_deadline(Some(30)).unwrap() - Instant::now(),
+            Duration::from_secs(30)
+        );
+        assert!(execution_deadline(None).is_none());
+    }
+
+    #[tokio::test]
+    async fn timeout_is_resumable_and_does_not_restart_old_queues() {
+        let f = fixture_with(&[json!({"id":"child", "parent":"task:test"})]);
+        f.d.lock().stopping = true;
+        for id in ["test", "child"] {
+            f.d.input("user", id, "saved input".into(), None, Some(Vec::new()))
+                .await
+                .unwrap();
+        }
+        f.d.interrupt_children("test");
+        finish_exit(
+            &f.d,
+            "test",
+            Exit::Stopped(Cancellation {
+                reason: "timed out".into(),
+                by: "timeout".into(),
+                interrupted: true,
+            }),
+        )
+        .unwrap();
+        {
+            let mut st = f.d.lock();
+            st.stopping = false;
+            st.running = 1;
+        }
+        f.d.actor_done("test");
+        for id in ["test", "child"] {
+            let st = f.d.lock();
+            assert_eq!(st.tasks[id].task.status, Status::Interrupted);
+            assert!(st.tasks[id].actor.is_none());
+            assert!(st.tasks[id].pending.is_empty());
+            assert_eq!(st.tasks[id].task.pending_inputs, ["saved input"]);
+            assert_eq!(st.tasks[id].deliverable.last().unwrap().kind, "interrupted");
+        }
+        f.d.lock().stopping = true;
+        f.d.input("user", "test", "resume".into(), None, Some(Vec::new()))
+            .await
+            .unwrap();
+        assert_eq!(f.d.lock().tasks["test"].pending, ["saved input", "resume"]);
+        f.d.try_cancel_tree("test", "cancelled by request", "user")
+            .unwrap();
+        assert_eq!(f.d.lock().tasks["test"].task.status, Status::Cancelled);
+        assert!(
+            f.d.input("user", "test", "no".into(), None, None)
+                .await
+                .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::super::tests::fixture;
+    use super::*;
+
+    #[test]
+    fn interruption_records_current_session_and_handshake_failure_drops_old_fingerprint() {
+        let f = fixture();
+        let path =
+            f.d.store
+                .prompt_path("test")
+                .with_file_name("native-session.jsonl");
+        std::fs::write(&path, "old").unwrap();
+        let old = Fingerprint::of(&path).unwrap();
+        f.d.try_update("test", |t| t.session_file = Some(old.clone()))
+            .unwrap();
+        begin_execution(&f.d, "test").unwrap();
+        assert!(f.d.lock().tasks["test"].task.session_file.is_none());
+        std::fs::write(&path, "old and new turn").unwrap();
+        record_session(&f.d, "test", Some(&path)).unwrap();
+        finish_exit(
+            &f.d,
+            "test",
+            Exit::Stopped(Cancellation {
+                reason: "timed out".into(),
+                by: "timeout".into(),
+                interrupted: true,
+            }),
+        )
+        .unwrap();
+        let task = f.d.lock().tasks["test"].task.clone();
+        assert_eq!(task.status, Status::Interrupted);
+        assert_ne!(task.session_file, Some(old));
+        assert_eq!(task.session_file, Fingerprint::of(&path));
+        begin_execution(&f.d, "test").unwrap();
+        record_session(&f.d, "test", None).unwrap();
+        finish_exit(&f.d, "test", Exit::Aborted).unwrap();
+        assert!(f.d.lock().tasks["test"].task.session_file.is_none());
+    }
+}
+
+#[cfg(test)]
+mod release_tests {
+    use super::super::tests::fixture;
+    use super::*;
+
+    #[test]
+    fn timeout_during_release_keeps_interrupted_status() {
+        let f = fixture();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        {
+            let mut st = f.d.lock();
+            let entry = st.tasks.get_mut("test").unwrap();
+            entry.actor = Some(tx);
+            entry.releasing = true;
+            entry.task.status = Status::Running;
+        }
+        f.d.stop_tree("test", "parent timed out", "timeout", true)
+            .unwrap();
+        settle_release(&f.d, "test", true).unwrap();
+        assert_eq!(f.d.lock().tasks["test"].task.status, Status::Interrupted);
+        assert_eq!(f.d.store.load_all()[0].status, Status::Interrupted);
     }
 }

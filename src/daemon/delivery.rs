@@ -275,12 +275,12 @@ mod tests {
     #[test]
     fn repeated_file_changes_do_not_rewrite_the_task() {
         let f = fixture();
-        f.d.file_changed("test", "a.rs");
+        f.d.file_changed("test", "a.rs").unwrap();
         assert_eq!(f.d.store.load_all()[0].changed_files, ["a.rs"]);
         let path = f.d.store.events_path("test").with_file_name("task.json");
         std::fs::write(&path, "write detector").unwrap();
         let updated = f.d.lock().tasks["test"].task.updated_ms;
-        f.d.file_changed("test", "a.rs");
+        f.d.file_changed("test", "a.rs").unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "write detector");
         assert_eq!(f.d.lock().tasks["test"].task.updated_ms, updated);
     }
@@ -293,10 +293,10 @@ mod tests {
                 .events_path("test")
                 .with_file_name("task.json.tmp");
         std::fs::create_dir(&tmp).unwrap();
-        f.d.file_changed("test", "retry.rs");
+        assert!(f.d.file_changed("test", "retry.rs").is_err());
         assert!(f.d.lock().tasks["test"].task.changed_files.is_empty());
         std::fs::remove_dir(tmp).unwrap();
-        f.d.file_changed("test", "retry.rs");
+        f.d.file_changed("test", "retry.rs").unwrap();
         assert_eq!(f.d.store.load_all()[0].changed_files, ["retry.rs"]);
     }
 }

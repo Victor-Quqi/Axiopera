@@ -222,12 +222,13 @@ impl Daemon {
         });
     }
 
-    fn clear_pending_push(&self, caller: &str) {
+    fn clear_pending_push(&self, caller: &str) -> anyhow::Result<()> {
         let mut st = self.lock();
-        st.ledger.pending_pushes.remove(caller);
-        if let Err(e) = st.ledger.save(&self.opts.home) {
-            self.log(&format!("saving push state: {e:#}"));
-        }
+        let mut ledger = st.ledger.clone();
+        ledger.pending_pushes.remove(caller);
+        ledger.save(&self.opts.home)?;
+        st.ledger = ledger;
+        Ok(())
     }
 
     async fn reconcile_push(
@@ -260,27 +261,30 @@ impl Daemon {
     ) -> anyhow::Result<()> {
         if delivered {
             for (task, turn) in pending.turns {
-                self.update(&task, |t| t.delivered = t.delivered.max(turn));
+                self.try_update(&task, |t| t.delivered = t.delivered.max(turn))?;
             }
         }
         let mut st = self.lock();
+        let mut ledger = st.ledger.clone();
         if delivered {
             for (task, seq) in pending.events {
-                let cursor = st
-                    .ledger
+                let cursor = ledger
                     .cursors
                     .entry(super::cursor_key(caller, &task))
                     .or_default();
                 *cursor = (*cursor).max(seq);
             }
+        }
+        ledger.pending_pushes.remove(caller);
+        ledger.save(&self.opts.home)?;
+        st.ledger = ledger;
+        if delivered {
             for rid in &pending.approvals {
                 if let Some(p) = st.approvals.get_mut(rid) {
                     p.delivered = true;
                 }
             }
         }
-        st.ledger.pending_pushes.remove(caller);
-        st.ledger.save(&self.opts.home)?;
         self.log(&format!(
             "{caller} push read-back: {}",
             if delivered {
@@ -418,8 +422,10 @@ impl Daemon {
             // Save before writing: a daemon crash can also lose the acknowledgement.
             {
                 let mut st = self.lock();
-                st.ledger.pending_pushes.insert(caller.to_string(), pending);
-                st.ledger.save(&self.opts.home)?;
+                let mut ledger = st.ledger.clone();
+                ledger.pending_pushes.insert(caller.to_string(), pending);
+                ledger.save(&self.opts.home)?;
+                st.ledger = ledger;
             }
             let more = taken.left > 0;
             batch = Some(taken);
@@ -434,12 +440,14 @@ impl Daemon {
         if outcome.is_ok() {
             if let Some(b) = &batch {
                 if let Err(e) = self.mark_seen(caller, &b.seen, &b.turns, &b.approvals) {
-                    self.log(&format!("saving cursors: {e:#}"));
+                    return Err(format!("saving cursors: {e:#}"));
                 }
-                self.clear_pending_push(caller);
+                self.clear_pending_push(caller)
+                    .map_err(|e| format!("saving push state: {e:#}"))?;
             }
         } else if batch.is_some() && !remote.as_ref().is_some_and(Remote::sent) {
-            self.clear_pending_push(caller);
+            self.clear_pending_push(caller)
+                .map_err(|e| format!("saving push state: {e:#}"))?;
         }
         outcome
     }

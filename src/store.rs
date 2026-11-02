@@ -1,11 +1,11 @@
 //! On-disk task state. The daemon is the only writer.
 
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -85,6 +85,10 @@ pub struct Task {
     pub changed_files: Vec<String>,
     #[serde(default)]
     pub questions: Vec<Question>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_inputs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_mail: Vec<String>,
     pub stalled: bool,
     pub detached: bool,
     pub created_ms: u64,
@@ -151,7 +155,11 @@ impl Store {
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
-        fs::remove_dir_all(self.dir(id))?;
+        match fs::remove_dir_all(self.dir(id)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         Ok(())
     }
 
@@ -160,7 +168,7 @@ impl Store {
     pub fn save_prompt(&self, id: &str, text: &str) -> Result<()> {
         let dir = self.dir(id);
         fs::create_dir_all(&dir)?;
-        fs::write(self.prompt_path(id), text)?;
+        write_synced(&self.prompt_path(id), text.as_bytes())?;
         Ok(())
     }
 
@@ -169,10 +177,23 @@ impl Store {
     }
 
     pub fn save(&self, task: &Task) -> Result<()> {
+        self.save_task(task, false)
+    }
+
+    pub fn save_durable(&self, task: &Task) -> Result<()> {
+        self.save_task(task, true)
+    }
+
+    fn save_task(&self, task: &Task, durable: bool) -> Result<()> {
         let dir = self.dir(&task.id);
         fs::create_dir_all(dir.join("turns"))?;
         let tmp = dir.join("task.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(task)?)?;
+        let bytes = serde_json::to_vec_pretty(task)?;
+        if durable {
+            write_synced(&tmp, &bytes)?;
+        } else {
+            fs::write(&tmp, bytes)?;
+        }
         fs::rename(tmp, dir.join("task.json"))?;
         Ok(())
     }
@@ -180,11 +201,21 @@ impl Store {
     pub fn append(&self, event: &Event) -> Result<()> {
         let mut f = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(self.events_path(&event.task))?;
+        self.repair_tail(&event.task, &mut f)?;
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
         f.write_all(&line)?;
+        if deliverable(&event.kind)
+            || matches!(
+                event.kind.as_str(),
+                "turn_started" | "steered" | "spawned" | "answered" | "approved" | "denied"
+            )
+        {
+            f.sync_data()?;
+        }
         Ok(())
     }
 
@@ -207,13 +238,15 @@ impl Store {
     pub fn save_message(&self, id: &str, seq: u64, text: &str) -> Result<()> {
         let path = self.message_path(id, seq);
         fs::create_dir_all(self.dir(id).join("messages"))?;
-        fs::write(path, text)?;
+        write_synced(&path, text.as_bytes())?;
         Ok(())
     }
 
     pub fn save_turn(&self, id: &str, turn: u32, text: &str) -> Result<PathBuf> {
         let path = self.turn_path(id, turn);
-        fs::write(&path, text)?;
+        let tmp = path.with_extension("md.tmp");
+        write_synced(&tmp, text.as_bytes())?;
+        fs::rename(tmp, &path)?;
         Ok(path)
     }
 
@@ -232,21 +265,174 @@ impl Store {
             .collect()
     }
 
+    /// Recover a torn last record before another append can join onto it.
+    fn repair_tail(&self, id: &str, f: &mut fs::File) -> Result<()> {
+        let len = f.metadata()?.len();
+        if len == 0 {
+            return Ok(());
+        }
+        f.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        f.read_exact(&mut last)?;
+        if last[0] == b'\n' {
+            return Ok(());
+        }
+        let mut end = len;
+        let mut tail = Vec::new();
+        let start = loop {
+            let start = end.saturating_sub(8192);
+            f.seek(SeekFrom::Start(start))?;
+            let mut block = vec![0; (end - start) as usize];
+            f.read_exact(&mut block)?;
+            if let Some(pos) = block.iter().rposition(|b| *b == b'\n') {
+                tail.extend(block[pos + 1..].iter().rev());
+                break start + pos as u64 + 1;
+            }
+            tail.extend(block.iter().rev());
+            if start == 0 {
+                break 0;
+            }
+            end = start;
+        };
+        tail.reverse();
+        if serde_json::from_slice::<Event>(&tail).is_ok() {
+            f.write_all(b"\n")?;
+        } else {
+            let backup = self
+                .dir(id)
+                .join(format!("events.tail-{}", uuid::Uuid::new_v4()));
+            write_synced(&backup, &tail)?;
+            OpenOptions::new()
+                .write(true)
+                .open(self.events_path(id))?
+                .set_len(start)?;
+        }
+        f.sync_data()?;
+        Ok(())
+    }
+
+    /// Startup scans records once without retaining non-deliverable events.
+    pub fn recover_events(&self, id: &str, mut visit: impl FnMut(Event)) -> Result<()> {
+        let mut f = match OpenOptions::new()
+            .read(true)
+            .append(true)
+            .open(self.events_path(id))
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        self.repair_tail(id, &mut f)?;
+        f.seek(SeekFrom::Start(0))?;
+        let mut reader = BufReader::new(f);
+        let mut line = Vec::new();
+        let mut error = None;
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            match serde_json::from_slice::<Event>(&line).context("invalid event record") {
+                Ok(event) if event.task == id => visit(event),
+                Ok(_) => {
+                    error.get_or_insert_with(|| {
+                        anyhow::anyhow!("event task does not match directory")
+                    });
+                }
+                Err(e) => {
+                    error.get_or_insert(e);
+                }
+            }
+        }
+        match error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    pub fn quarantine(&self, path: &Path) -> Result<PathBuf> {
+        let root = self.root.parent().unwrap().join("quarantine");
+        fs::create_dir_all(&root)?;
+        let name = path.file_name().unwrap().to_string_lossy();
+        let target = root.join(format!("{name}-{}", uuid::Uuid::new_v4()));
+        fs::rename(path, &target)?;
+        Ok(target)
+    }
+
     pub fn load_all(&self) -> Vec<Task> {
         let Ok(entries) = fs::read_dir(&self.root) else {
             return Vec::new();
         };
         entries
             .filter_map(|e| e.ok())
-            .filter_map(|e| fs::read(e.path().join("task.json")).ok())
-            .filter_map(|b| serde_json::from_slice(&b).ok())
+            .filter_map(|e| {
+                if !e.file_type().ok()?.is_dir() {
+                    return None;
+                }
+                let task: Task =
+                    serde_json::from_slice(&fs::read(e.path().join("task.json")).ok()?).ok()?;
+                (e.file_name().to_str() == Some(task.id.as_str())).then_some(task)
+            })
             .collect()
+    }
+
+    pub fn recover_tasks(&self) -> (Vec<Task>, Vec<String>) {
+        let mut tasks = Vec::new();
+        let mut errors = Vec::new();
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (tasks, errors),
+            Err(e) => {
+                errors.push(format!("reading task directories: {e:#}"));
+                return (tasks, errors);
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    errors.push(e.to_string());
+                    continue;
+                }
+            };
+            let read = || -> Result<Task> {
+                if !entry.file_type()?.is_dir() {
+                    bail!("task directory is not a real directory");
+                }
+                let task: Task =
+                    serde_json::from_slice(&fs::read(entry.path().join("task.json"))?)?;
+                if entry.file_name().to_str() != Some(task.id.as_str()) {
+                    bail!("task ID does not match directory");
+                }
+                Ok(task)
+            };
+            match read() {
+                Ok(task) => tasks.push(task),
+                Err(e)
+                    if e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() != std::io::ErrorKind::NotFound) =>
+                {
+                    errors.push(format!(
+                        "reading task directory {}: {e:#}; directory kept for retry",
+                        entry.path().display()
+                    ));
+                }
+                Err(e) => {
+                    let isolated = self.quarantine(&entry.path());
+                    errors.push(format!(
+                        "invalid task directory {}: {e:#}; quarantine: {isolated:?}",
+                        entry.path().display()
+                    ));
+                }
+            }
+        }
+        (tasks, errors)
     }
 }
 
 /// Delivery state per caller: how far it has seen each task's events, and the host sessions
 /// that take them as messages. The event sequence itself is recovered from the event logs.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct Ledger {
     pub cursors: std::collections::HashMap<String, u64>,
     #[serde(default)]
@@ -295,10 +481,17 @@ impl Ledger {
 
     pub fn save(&self, home: &Path) -> Result<()> {
         let tmp = home.join("ledger.json.tmp");
-        fs::write(&tmp, serde_json::to_vec(self)?)?;
+        write_synced(&tmp, &serde_json::to_vec(self)?)?;
         fs::rename(tmp, home.join("ledger.json"))?;
         Ok(())
     }
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut f = fs::File::create(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// Short random ID: a prefix letter (`t` task, `q` question) and base32 characters.
