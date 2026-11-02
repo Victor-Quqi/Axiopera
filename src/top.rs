@@ -1629,6 +1629,11 @@ impl Tail {
                 self.given(e.ts, queued, message);
             }
             "turn_ended" => {
+                // A turn not seen to begin, as one an agent began by itself unreported and
+                // ended before it said or did anything, began just now.
+                if !self.in_turn {
+                    self.start(e.ts);
+                }
                 self.in_turn = false;
                 self.ended_ms = e.ts;
                 self.ended_turns.extend(turn());
@@ -2649,19 +2654,24 @@ mod tests {
             NOW - 600_000,
             json!({"name": "review"}),
         );
-        t1.turns = 4;
+        t1.turns = 5;
         store.save_prompt("t1", "Review the parser.").unwrap();
         store.save(&t1).unwrap();
+        store
+            .save_turn("t1", 4, "Reader checked.\nAll fine.")
+            .unwrap();
         // More was given before the first turn began. Turn 2 began before the daemon kept
         // messages. Turn 3 the agent began with a message sent while it was at work in the
-        // background. Turn 4 it began likewise, unreported, as Claude does. Turn 5 began with a
-        // message of its own, and one was sent into it.
+        // background. Turns 4 and 5 it began likewise, unreported, as Claude does, and turn 5
+        // failed before it said anything. Turn 6 began with a message of its own, and one was
+        // sent into it.
         let given = [
             (0, "Review the parser.\n\nAlso the lexer."),
             (6, "Check the writer too."),
             (10, "Now the tests.\nAll of them."),
             (12, "Skip the fixtures."),
             (13, "And the reader."),
+            (16, "Try once more."),
         ];
         for (seq, text) in given {
             store.save_message("t1", seq, text).unwrap();
@@ -2710,12 +2720,20 @@ mod tests {
                 "turn_ended",
                 json!({"turn": 4, "ok": true}),
             ),
+            event(16, 32_000, "t1", "steered", json!({"queued": true})),
+            event(
+                17,
+                31_000,
+                "t1",
+                "turn_ended",
+                json!({"turn": 5, "ok": false, "error": "boom"}),
+            ),
             event(
                 10,
                 30_000,
                 "t1",
                 "turn_started",
-                json!({"turn": 5, "chars": 28}),
+                json!({"turn": 6, "chars": 28}),
             ),
             event(
                 11,
@@ -2753,8 +2771,11 @@ mod tests {
                 "› And the reader.",
                 "",
                 "• Reader checked.",
+                "  All fine.",
                 "",
-                "── turn 5, 30s ago",
+                "› Try once more.",
+                "",
+                "── turn 6, 30s ago",
                 "",
                 "› Now the tests.",
                 "  All of them.",
