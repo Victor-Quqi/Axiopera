@@ -1600,27 +1600,27 @@ impl Tail {
         let turn = || e.data.get("turn").and_then(Value::as_u64).map(|n| n as u32);
         match e.kind.as_str() {
             "turn_started" => {
+                // The messages that wait for a turn begin this one, so they come under its line.
+                let (queued, log) = std::mem::take(&mut self.log)
+                    .into_iter()
+                    .partition(|l| matches!(l.what, What::Given { queued: true, .. }));
+                self.log = log;
                 self.start(e.ts);
                 self.approvals.clear();
                 self.stop = None;
-                match turn() {
-                    Some(1) => self.first = message().filter(|(t, _)| !t.lines.is_empty()),
-                    Some(n) => {
-                        // Messages sent while no turn ran, as for an agent still at work in the
-                        // background, are what it began this turn with.
-                        let (queued, log) = std::mem::take(&mut self.log)
-                            .into_iter()
-                            .partition(|l| matches!(l.what, What::Given { queued: true, .. }));
-                        self.log = log;
-                        self.log(e.ts, What::Turn(n));
-                        for l in queued {
-                            if let What::Given { text, file, .. } = l.what {
-                                let queued = false;
-                                self.log(e.ts, What::Given { text, file, queued });
-                            }
-                        }
-                        self.given(e.ts, false, message);
+                let n = turn();
+                if let Some(n) = n.filter(|n| *n > 1) {
+                    self.log(e.ts, What::Turn(n));
+                }
+                for l in queued {
+                    if let What::Given { text, file, .. } = l.what {
+                        let queued = false;
+                        self.log(e.ts, What::Given { text, file, queued });
                     }
+                }
+                match n {
+                    Some(1) => self.first = message().filter(|(t, _)| !t.lines.is_empty()),
+                    Some(_) => self.given(e.ts, false, message),
                     None => {}
                 }
             }
@@ -1675,10 +1675,17 @@ impl Tail {
         }
     }
 
+    /// A turn begins. The messages that waited for one begin it, though it be one the agent
+    /// began by itself unreported, and wait no more.
     fn start(&mut self, at: u64) {
         self.in_turn = true;
         self.started_ms = at;
         self.tool_calls = 0;
+        for l in &mut self.log {
+            if let What::Given { queued, .. } = &mut l.what {
+                *queued = false;
+            }
+        }
     }
 
     /// A message given to the agent, unless it is not kept: given before the daemon kept
@@ -2642,17 +2649,19 @@ mod tests {
             NOW - 600_000,
             json!({"name": "review"}),
         );
-        t1.turns = 3;
+        t1.turns = 4;
         store.save_prompt("t1", "Review the parser.").unwrap();
         store.save(&t1).unwrap();
         // More was given before the first turn began. Turn 2 began before the daemon kept
         // messages. Turn 3 the agent began with a message sent while it was at work in the
-        // background, and turn 4 with one of its own, and one was sent into it.
+        // background. Turn 4 it began likewise, unreported, as Claude does. Turn 5 began with a
+        // message of its own, and one was sent into it.
         let given = [
             (0, "Review the parser.\n\nAlso the lexer."),
             (6, "Check the writer too."),
             (10, "Now the tests.\nAll of them."),
             (12, "Skip the fixtures."),
+            (13, "And the reader."),
         ];
         for (seq, text) in given {
             store.save_message("t1", seq, text).unwrap();
@@ -2692,12 +2701,21 @@ mod tests {
                 "turn_ended",
                 json!({"turn": 3, "ok": true}),
             ),
+            event(13, 34_000, "t1", "steered", json!({"queued": true})),
+            event(14, 33_000, "t1", "said", json!({"text": "Reader checked."})),
+            event(
+                15,
+                33_000,
+                "t1",
+                "turn_ended",
+                json!({"turn": 4, "ok": true}),
+            ),
             event(
                 10,
                 30_000,
                 "t1",
                 "turn_started",
-                json!({"turn": 4, "chars": 28}),
+                json!({"turn": 5, "chars": 28}),
             ),
             event(
                 11,
@@ -2732,7 +2750,11 @@ mod tests {
                 "",
                 "• Writer checked.",
                 "",
-                "── turn 4, 30s ago",
+                "› And the reader.",
+                "",
+                "• Reader checked.",
+                "",
+                "── turn 5, 30s ago",
                 "",
                 "› Now the tests.",
                 "  All of them.",
