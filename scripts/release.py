@@ -36,21 +36,18 @@ def package(target, binary, output):
         raise SystemExit(f"Binary reports {actual!r}; expected {expected!r}")
 
     stem = f"axiopera-v{version()}-{target}"
-    members = [(binary, name)]
-    for relative in ("LICENSE", "README.md", "README.zh-CN.md", "src/guide.md"):
-        members.append((ROOT / relative, relative))
-    members.extend((p, p.relative_to(ROOT).as_posix()) for p in sorted((ROOT / "docs").glob("*.md")))
+    members = [(binary, name), (ROOT / "LICENSE", "LICENSE")]
     output.mkdir(parents=True, exist_ok=True)
     if "windows" in target:
         archive = output / f"{stem}.zip"
         with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as packed:
             for path, relative in members:
-                packed.write(path, f"{stem}/{relative}")
+                packed.write(path, relative)
     else:
         archive = output / f"{stem}.tar.gz"
         with tarfile.open(archive, "w:gz") as packed:
             for path, relative in members:
-                info = packed.gettarinfo(str(path), arcname=f"{stem}/{relative}")
+                info = packed.gettarinfo(str(path), arcname=relative)
                 info.mode = 0o755 if relative == name else 0o644
                 info.uid = info.gid = 0
                 info.uname = info.gname = ""
