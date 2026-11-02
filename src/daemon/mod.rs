@@ -519,6 +519,7 @@ impl Daemon {
     }
 
     /// Change a task and persist it.
+    #[cfg(test)]
     pub fn update(&self, id: &str, f: impl FnOnce(&mut Task)) {
         if let Err(e) = self.update_task(id, f, false) {
             self.log(&format!("saving {id}: {e:#}"));
