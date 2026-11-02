@@ -367,6 +367,8 @@ struct View {
     /// When each session first spawned, by its caller, as seen since top started: sessions
     /// keep their order when their oldest tasks are hidden or removed.
     first_spawned: HashMap<String, u64>,
+    /// The project of each working directory of a task, found once.
+    projects: HashMap<PathBuf, Option<String>>,
 }
 
 impl View {
@@ -379,6 +381,7 @@ impl View {
             width: 0,
             id_width: 0,
             first_spawned: HashMap::new(),
+            projects: HashMap::new(),
         }
     }
 
@@ -413,6 +416,9 @@ impl View {
                     .or_insert(u64::MAX);
                 *at = (*at).min(t.created_ms);
             }
+            self.projects
+                .entry(t.cwd.clone())
+                .or_insert_with(|| project(&t.cwd));
             self.width = self.width.max(columns(&name_cell(depth, t)));
             if t.name.is_some() {
                 self.id_width = self.id_width.max(columns(&t.id));
@@ -606,6 +612,17 @@ impl View {
                 },
             )
             .collect();
+        // The projects a session's tasks work in, in the order they were spawned.
+        let mut projects: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (caller, roots) in &groups {
+            let names = projects.entry(caller).or_default();
+            for t in roots {
+                let name = self.projects.get(&t.cwd).and_then(Option::as_deref);
+                if let Some(name) = name.filter(|n| !names.contains(n)) {
+                    names.push(name);
+                }
+            }
+        }
         // Lines in order: `None` for a session's, else the task with its depth.
         let mut order: Vec<(&str, Option<(usize, &Task)>)> = Vec::new();
         for (caller, roots) in &groups {
@@ -626,9 +643,15 @@ impl View {
             let Some((depth, t)) = row else {
                 if several {
                     group = Some(rows.len());
+                    let mut segs = Vec::new();
+                    if let Some(names) = projects.get(caller).filter(|n| !n.is_empty()) {
+                        segs.push((clean(&names.join(", ")), ""));
+                        segs.push((" · ".into(), DIM));
+                    }
+                    segs.push((labels[caller].clone(), DIM));
                     rows.push(Row {
                         rank: WITH_TASKS,
-                        ..Row::new(vec![(labels[caller].clone(), DIM)])
+                        ..Row::new(segs)
                     });
                 }
                 continue;
@@ -1358,6 +1381,36 @@ fn state(t: &Task, tail: &Tail) -> (&'static str, &'static str) {
         Status::Interrupted => ("interrupted", RED),
         Status::Cancelled => ("cancelled", DIM),
     }
+}
+
+/// The project a task working in `cwd` is part of: the directory of its Git repository, the
+/// main one for a worktree, or else `cwd` itself. Its name, if it has one.
+fn project(cwd: &Path) -> Option<String> {
+    let name = |dir: &Path| Some(dir.file_name()?.to_string_lossy().into_owned());
+    for dir in cwd.ancestors() {
+        let git = dir.join(".git");
+        if git.is_dir() {
+            return name(dir);
+        }
+        let Ok(text) = fs::read_to_string(&git) else {
+            continue;
+        };
+        // A worktree's `.git` names `<repository>/.git/worktrees/<name>`, or
+        // `<repository>.git/worktrees/<name>` for a bare repository. Others, as a
+        // submodule's, are projects of their own.
+        let gitdir = text.lines().next().and_then(|l| l.strip_prefix("gitdir:"));
+        let main = gitdir
+            .map(|g| dir.join(g.trim()))
+            .and_then(|g| Some(g.parent()?.to_path_buf()))
+            .filter(|w| w.file_name().is_some_and(|n| n == "worktrees"))
+            .and_then(|w| Some(w.parent()?.to_path_buf()));
+        return match main {
+            Some(git) if git.file_name().is_some_and(|n| n == ".git") => name(git.parent()?),
+            Some(bare) => name(&bare).map(|n| n.strip_suffix(".git").unwrap_or(&n).to_string()),
+            None => name(dir),
+        };
+    }
+    name(cwd)
 }
 
 /// Who spawned a group of tasks: a host session, `user`, or a task already removed. Agents
@@ -2637,6 +2690,75 @@ And its tests.",
                 "› Skip the fixtures.",
             ],
             "{frame:#?}"
+        );
+    }
+
+    #[test]
+    fn a_session_is_shown_with_the_projects_its_tasks_work_in() {
+        let h = home();
+        let store = Store::new(&h.0);
+        let dir = |path: &str| {
+            let dir = h.0.join(path);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        };
+        // A repository, its worktree, and a worktree of a bare repository.
+        let src = dir("Axiopera/src");
+        dir("Axiopera/.git/worktrees/x");
+        let worktree = dir("wt/x");
+        let gitdir = h.0.join("Axiopera/.git/worktrees/x");
+        std::fs::write(
+            worktree.join(".git"),
+            format!(
+                "gitdir: {}
+",
+                gitdir.display()
+            ),
+        )
+        .unwrap();
+        let other = dir("Other");
+        dir("Other/.git");
+        let bare = dir("wt/y");
+        let gitdir = dir("Bare.git/worktrees/y");
+        std::fs::write(
+            bare.join(".git"),
+            format!(
+                "gitdir: {}
+",
+                gitdir.display()
+            ),
+        )
+        .unwrap();
+        for (id, caller, cwd) in [
+            ("a1", "codex:a", &src),
+            ("a2", "codex:a", &worktree),
+            ("b1", "codex:b", &other),
+            ("b2", "codex:b", &bare),
+        ] {
+            let more = json!({"cwd": cwd});
+            store.save(&task(id, caller, "idle", NOW, more)).unwrap();
+        }
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let text = view.frame(NOW, None, None).join(
+            "
+",
+        );
+        assert!(
+            text.contains(
+                "
+Axiopera · codex session a
+"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "
+Other, Bare · codex session b
+"
+            ),
+            "{text}"
         );
     }
 
