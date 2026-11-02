@@ -94,6 +94,8 @@ Codex 的 `userMessage` 可能在轮末落盘，后续模型响应才构成输�
 
 Grok 的 `_x.ai/session/interjection` 只确认入队。轮末输出注明消费确认缺口，Grok 把晚到消息排入后续 prompt。一次 prompt 内可以出现多段答复，`response_completed` 分隔答复；下一段实际输出文字后才替换已有结果。适配器在轮末保留 1 秒等待，并跟踪后台任务和 `runningPromptId`。`session/load` 的历史回放全部忽略。
 
+Grok 工具开始事件提供工具名和原始参数，后续更新可补齐规范化参数。适配器从中提取命令、搜索词、URL 或文件路径；`use_tool` 展开实际 MCP 工具名及其参数摘要。更新按调用 ID 合并到 `top` 的原记录，输出和状态更新不覆盖参数摘要。
+
 并发续接同一会话时，Claude 和 Grok 可以出现各自写入、互相看不到新轮次的情况，Codex 则拒绝第二个 writer。因此 Axiopera 在空闲时释放进程，并在续接前核对会话文件。
 
 Codex 和 Grok 内置子 agent 的终端命令分别带有独立的 `CODEX_THREAD_ID` 和 `GROK_SESSION_ID`，Axiopera 按各自线程或会话隔离收件箱；由 Axiopera 启动的宿主再开内置子 agent 时同样隔离，并保留外层任务的归属和限制。Claude 主 agent 与内置子 agent 共享原生会话身份；内置子 agent 使用 Axiopera 时，所有参与者都应使用带任务 ID 的 `wait`、`inbox`，避免取走彼此的消息。

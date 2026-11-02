@@ -787,7 +787,9 @@ impl View {
                         None,
                     ),
                 },
-                What::Tool { name, detail } => Block::Tools(vec![tool_call(name, detail, &cwd)]),
+                What::Tool { name, detail, .. } => {
+                    Block::Tools(vec![tool_call(name, detail, &cwd)])
+                }
                 What::Turn(n) => Block::Turn(format!(
                     "── turn {n}, {} ago",
                     age(now.saturating_sub(l.at))
@@ -1669,7 +1671,27 @@ impl Tail {
                 }
                 self.tool_calls += 1;
                 let (name, detail) = (text("name").into(), text("detail").into());
-                self.log(e.ts, What::Tool { name, detail });
+                self.log(
+                    e.ts,
+                    What::Tool {
+                        id: text("id").into(),
+                        name,
+                        detail,
+                    },
+                );
+            }
+            "tool_updated" => {
+                if !text("id").is_empty() {
+                    for logged in self.log.iter_mut().rev() {
+                        if let What::Tool { id, name, detail } = &mut logged.what
+                            && id == text("id")
+                        {
+                            *name = text("name").into();
+                            *detail = text("detail").into();
+                            break;
+                        }
+                    }
+                }
             }
             "approval_request" => self
                 .approvals
@@ -1723,7 +1745,11 @@ enum What {
     /// is the turn it ended, for the last message of a turn: its result.
     Said { text: String, turn: Option<u32> },
     /// A tool call: the tool's name, and what it was called on as the agent's adapter tells it.
-    Tool { name: String, detail: String },
+    Tool {
+        id: String,
+        name: String,
+        detail: String,
+    },
     /// The start of a turn after the first.
     Turn(u32),
     /// A message given to the agent after its first turn began: one that began a turn, or one
@@ -3438,6 +3464,42 @@ mod tests {
         );
         assert!(text.ends_with("\n\n• m25\n  └ Run c25"), "{text}");
         assert!(!text.contains("c5"), "{text}");
+    }
+
+    #[test]
+    fn tool_updates_replace_the_matching_row_without_counting_again() {
+        let mut tail = Tail::default();
+        for (seq, kind, data) in [
+            (
+                1,
+                "tool",
+                json!({"id": "a", "name": "use_tool", "detail": ""}),
+            ),
+            (
+                2,
+                "tool",
+                json!({"id": "b", "name": "read_file", "detail": "src/main.rs"}),
+            ),
+            (
+                3,
+                "tool_updated",
+                json!({"id": "a", "name": "web__search", "detail": "pi rpc"}),
+            ),
+            (
+                4,
+                "tool_updated",
+                json!({"id": "missing", "name": "ignored", "detail": ""}),
+            ),
+        ] {
+            tail.absorb(&event(seq, seq, "t1", kind, data), || None);
+        }
+        assert_eq!(tail.tool_calls, 2);
+        assert_eq!(tail.log.len(), 2);
+        assert!(matches!(&tail.log[0].what, What::Tool { name, detail, .. }
+            if name == "web__search" && detail == "pi rpc"));
+        assert!(matches!(&tail.log[1].what, What::Tool { name, detail, .. }
+            if name == "read_file" && detail == "src/main.rs"));
+        assert_eq!(tail.log[0].at, event(1, 1, "t1", "tool", json!({})).ts);
     }
 
     #[test]

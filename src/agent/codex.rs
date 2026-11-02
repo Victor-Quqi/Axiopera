@@ -296,6 +296,7 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
             Some("commandExecution") => {
                 let detail = clip(item["command"].as_str().unwrap_or(""), 200);
                 let _ = events.send(AgentEvent::Tool {
+                    id: None,
                     name: "shell".into(),
                     detail,
                 });
@@ -316,6 +317,7 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                     item["tool"].as_str().unwrap_or("?")
                 );
                 let _ = events.send(AgentEvent::Tool {
+                    id: None,
                     name,
                     detail: String::new(),
                 });

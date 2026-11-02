@@ -1,6 +1,6 @@
 //! Grok Build over `grok agent stdio` (ACP).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -55,6 +55,12 @@ struct State {
     loading: bool,
     /// Interjections accepted by RPC but not yet admitted by the session actor.
     interjections: HashSet<String>,
+    tools: HashMap<String, ToolCall>,
+}
+
+struct ToolCall {
+    name: String,
+    summary: (String, String),
 }
 
 pub struct Grok {
@@ -374,14 +380,63 @@ fn on_update(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
                     }
                 }
             }
-            let name = u["kind"].as_str().unwrap_or("tool").to_string();
+            let name = u["title"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| u["kind"].as_str())
+                .unwrap_or("tool");
+            let summary = tool_summary(name, u);
+            let id = u["toolCallId"].as_str().map(str::to_string);
+            if let Some(id) = &id {
+                state.lock().unwrap().tools.insert(
+                    id.clone(),
+                    ToolCall {
+                        name: name.to_string(),
+                        summary: summary.clone(),
+                    },
+                );
+            }
             let _ = events.send(AgentEvent::Tool {
-                name,
-                detail: clip(u["title"].as_str().unwrap_or(""), 200),
+                id,
+                name: summary.0,
+                detail: summary.1,
             });
         }
-        // Auto mode refuses some calls outright; the agent only sees the call fail.
-        "tool_call_update" if u["status"] == "failed" => {
+        "tool_call_update" => {
+            let mut s = state.lock().unwrap();
+            if let Some(id) = u["toolCallId"].as_str() {
+                if let Some(call) = s.tools.get_mut(id) {
+                    // Status/output-only updates must not erase the call's arguments.
+                    if !u["rawInput"].is_null()
+                        || (call.summary.1.is_empty() && u["title"].is_string())
+                    {
+                        let summary = tool_summary(&call.name, u);
+                        if summary != call.summary {
+                            let _ = events.send(AgentEvent::ToolUpdated {
+                                id: id.to_string(),
+                                name: summary.0.clone(),
+                                detail: summary.1.clone(),
+                            });
+                            call.summary = summary;
+                        }
+                    }
+                }
+                if matches!(u["status"].as_str(), Some("completed" | "failed")) {
+                    s.tools.remove(id);
+                }
+            }
+            drop(s);
+            if u["kind"] == "edit" {
+                for loc in u["locations"].as_array().into_iter().flatten() {
+                    if let Some(path) = loc["path"].as_str() {
+                        let _ = events.send(AgentEvent::FileChanged(path.to_string()));
+                    }
+                }
+            }
+            // Auto mode refuses some calls outright; the agent only sees the call fail.
+            if u["status"] != "failed" {
+                return;
+            }
             let text: String = u["content"]
                 .as_array()
                 .into_iter()
@@ -427,6 +482,43 @@ fn on_update(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
     }
 }
 
+fn tool_summary(name: &str, update: &Value) -> (String, String) {
+    let raw = &update["rawInput"];
+    let target = (name == "use_tool")
+        .then(|| raw["tool_name"].as_str())
+        .flatten();
+    let input = if name == "use_tool" && raw["tool_input"].is_object() {
+        &raw["tool_input"]
+    } else {
+        raw
+    };
+    let detail = [
+        "command",
+        "query",
+        "pattern",
+        "url",
+        "file_path",
+        "path",
+        "target_file",
+        "target_directory",
+        "tool_input_file",
+        "file",
+        "description",
+    ]
+    .iter()
+    .find_map(|key| input[*key].as_str().filter(|s| !s.is_empty()));
+    let detail = match detail {
+        Some(text) => text.to_string(),
+        None if !input.is_null() && input != &json!({}) => input.to_string(),
+        None => update["title"]
+            .as_str()
+            .filter(|title| *title != name)
+            .unwrap_or("")
+            .to_string(),
+    };
+    (clip(target.unwrap_or(name), 200), clip(&detail, 200))
+}
+
 /// The message so far, unless it was already reported.
 fn say(s: &mut State, events: &Events) {
     if !s.said && !s.text.trim().is_empty() {
@@ -450,6 +542,111 @@ mod tests {
 
     fn mark(state: &Mutex<State>, events: &Events, kind: &str) {
         update(state, events, json!({"sessionUpdate": kind}));
+    }
+
+    #[test]
+    fn tool_summaries_show_targets_and_mcp_arguments() {
+        for (name, input, expected_name, expected_detail) in [
+            (
+                "read_file",
+                json!({"target_file": "src/main.rs", "offset": 10}),
+                "read_file",
+                "src/main.rs",
+            ),
+            (
+                "list_dir",
+                json!({"target_directory": "src"}),
+                "list_dir",
+                "src",
+            ),
+            (
+                "grep",
+                json!({"pattern": "steer", "path": "src"}),
+                "grep",
+                "steer",
+            ),
+            (
+                "run_terminal_command",
+                json!({"command": "cargo test", "description": "Run tests"}),
+                "run_terminal_command",
+                "cargo test",
+            ),
+            (
+                "use_tool",
+                json!({"tool_name": "web__search", "tool_input": {"query": "pi rpc"}}),
+                "web__search",
+                "pi rpc",
+            ),
+            (
+                "use_tool",
+                json!({"tool_name": "web__search", "tool_input_file": "args.json"}),
+                "web__search",
+                "args.json",
+            ),
+            (
+                "use_tool",
+                json!({"file": "invocation.json"}),
+                "use_tool",
+                "invocation.json",
+            ),
+            (
+                "search_tool",
+                json!({"query": "search web"}),
+                "search_tool",
+                "search web",
+            ),
+            ("unknown", json!({"count": 2}), "unknown", "{\"count\":2}"),
+            ("read_file", Value::Null, "read_file", ""),
+        ] {
+            let summary = tool_summary(name, &json!({"title": name, "rawInput": input}));
+            assert_eq!(summary, (expected_name.into(), expected_detail.into()));
+        }
+    }
+
+    #[test]
+    fn tool_updates_refine_one_call_and_keep_output_out_of_the_summary() {
+        let state = Mutex::new(State::default());
+        let (events, mut rx) = mpsc::unbounded_channel();
+        update(
+            &state,
+            &events,
+            json!({
+                "sessionUpdate": "tool_call", "toolCallId": "a", "title": "use_tool",
+            }),
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentEvent::Tool { id: Some(id), name, detail })
+            if id == "a" && name == "use_tool" && detail.is_empty())
+        );
+        let refined = json!({
+            "sessionUpdate": "tool_call_update", "toolCallId": "a", "title": "web__search",
+            "rawInput": {"tool_name": "web__search", "tool_input": {"query": "steer"}},
+        });
+        update(&state, &events, refined.clone());
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentEvent::ToolUpdated { id, name, detail })
+            if id == "a" && name == "web__search" && detail == "steer")
+        );
+        update(&state, &events, refined);
+        update(
+            &state,
+            &events,
+            json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "a", "status": "completed",
+                "rawOutput": {"text": "large result"},
+            }),
+        );
+        assert!(rx.try_recv().is_err());
+        assert!(state.lock().unwrap().tools.is_empty());
+        update(
+            &state,
+            &events,
+            json!({
+                "sessionUpdate": "tool_call_update", "toolCallId": "missing", "status": "failed",
+                "content": [{"content": {"text": "Auto mode blocked this action"}}],
+            }),
+        );
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Blocked(_))));
     }
 
     fn chunk(state: &Mutex<State>, events: &Events, text: &str) {

@@ -29,6 +29,12 @@ pub enum AgentEvent {
         file: Option<PathBuf>,
     },
     Tool {
+        id: Option<String>,
+        name: String,
+        detail: String,
+    },
+    ToolUpdated {
+        id: String,
         name: String,
         detail: String,
     },

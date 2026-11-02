@@ -116,7 +116,7 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
             format!("{who} message sent to its running turn")
         }
         "input_read" => format!("{who} parent message included in the turn's model input"),
-        "tool" => match s("detail") {
+        "tool" | "tool_updated" => match s("detail") {
             detail if detail.is_empty() => format!("{who} {}", s("name")),
             detail => format!("{who} {}: {detail}", s("name")),
         },

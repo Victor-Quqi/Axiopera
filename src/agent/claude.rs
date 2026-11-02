@@ -259,7 +259,11 @@ fn on_assistant(content: &Value, events: &Events) {
                 }
             }
         }
-        let _ = events.send(AgentEvent::Tool { name, detail });
+        let _ = events.send(AgentEvent::Tool {
+            id: None,
+            name,
+            detail,
+        });
     }
 }
 

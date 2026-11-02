@@ -117,7 +117,7 @@ struct Entry {
     in_turn: bool,
     turn_started_ms: u64,
     tool_calls: u32,
-    last_tool: Option<(String, u64)>,
+    last_tool: Option<(String, u64, String)>,
     turn_ended_ms: u64,
 }
 
@@ -376,20 +376,32 @@ impl Daemon {
                     entry.in_turn = false;
                     entry.turn_ended_ms = event.ts;
                 }
-                "tool" => {
-                    // A turn the agent started by itself that its adapter did not report.
-                    if !entry.in_turn {
-                        entry.in_turn = true;
-                        entry.turn_started_ms = event.ts;
-                        entry.tool_calls = 0;
-                    }
+                "tool" | "tool_updated" => {
                     let field = |k: &str| event.data.get(k).and_then(Value::as_str).unwrap_or("");
-                    let call = match (field("name"), field("detail")) {
-                        (name, "") => name.to_string(),
-                        (name, detail) => format!("{name}: {detail}"),
-                    };
-                    entry.tool_calls += 1;
-                    entry.last_tool = Some((call, event.ts));
+                    if kind == "tool_updated" {
+                        if let Some((call, _, id)) = &mut entry.last_tool
+                            && !field("id").is_empty()
+                            && id == field("id")
+                        {
+                            *call = match (field("name"), field("detail")) {
+                                (name, "") => name.to_string(),
+                                (name, detail) => format!("{name}: {detail}"),
+                            };
+                        }
+                    } else {
+                        // A turn the agent started by itself that its adapter did not report.
+                        if !entry.in_turn {
+                            entry.in_turn = true;
+                            entry.turn_started_ms = event.ts;
+                            entry.tool_calls = 0;
+                        }
+                        let call = match (field("name"), field("detail")) {
+                            (name, "") => name.to_string(),
+                            (name, detail) => format!("{name}: {detail}"),
+                        };
+                        entry.tool_calls += 1;
+                        entry.last_tool = Some((call, event.ts, field("id").to_string()));
+                    }
                 }
                 _ => {}
             }
@@ -1872,7 +1884,7 @@ impl Daemon {
                 render::duration(now.saturating_sub(e.turn_started_ms))
             );
             match &e.last_tool {
-                Some((call, at)) => turn.push_str(&format!(
+                Some((call, at, _)) => turn.push_str(&format!(
                     ", {} tool call(s), last {} ago: {call}",
                     e.tool_calls,
                     render::duration(now.saturating_sub(*at))

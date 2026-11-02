@@ -275,7 +275,8 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                             session_file = file;
                         }
                     }
-                    AgentEvent::Tool { name, detail } => d.emit(id, "tool", json!({"name": name, "detail": detail})),
+                    AgentEvent::Tool { id: call, name, detail } => d.emit(id, "tool", json!({"id": call, "name": name, "detail": detail})),
+                    AgentEvent::ToolUpdated { id: call, name, detail } => d.emit(id, "tool_updated", json!({"id": call, "name": name, "detail": detail})),
                     AgentEvent::Said(text) => d.emit(id, "said", json!({"text": agent::clip(&text, SAID)})),
                     AgentEvent::FileChanged(path) => {
                         d.update(id, |t| {
@@ -677,6 +678,47 @@ mod tests {
         let st = f.d.lock();
         assert_eq!(st.tasks["test"].pending, ["during shutdown"]);
         assert!(st.tasks["test"].actor.is_none());
+    }
+
+    #[test]
+    fn tool_updates_preserve_progress_count_and_latest_call() {
+        let f = fixture();
+        f.d.emit(
+            "test",
+            "tool",
+            json!({"id": "a", "name": "use_tool", "detail": ""}),
+        );
+        let started = f.d.lock().tasks["test"].last_tool.as_ref().unwrap().1;
+        f.d.emit(
+            "test",
+            "tool_updated",
+            json!({"id": "a", "name": "web__search", "detail": "pi rpc"}),
+        );
+        {
+            let st = f.d.lock();
+            let entry = &st.tasks["test"];
+            assert_eq!(entry.tool_calls, 1);
+            assert_eq!(
+                entry.last_tool,
+                Some(("web__search: pi rpc".into(), started, "a".into()))
+            );
+        }
+        f.d.emit(
+            "test",
+            "tool",
+            json!({"id": "b", "name": "read_file", "detail": "src/main.rs"}),
+        );
+        f.d.emit(
+            "test",
+            "tool_updated",
+            json!({"id": "a", "name": "web__search", "detail": "older"}),
+        );
+        let st = f.d.lock();
+        assert_eq!(st.tasks["test"].tool_calls, 2);
+        assert_eq!(
+            st.tasks["test"].last_tool.as_ref().unwrap().0,
+            "read_file: src/main.rs"
+        );
     }
 
     #[test]
