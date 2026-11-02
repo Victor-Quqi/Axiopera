@@ -254,6 +254,7 @@ impl Store {
         self.dir(id).join("events.jsonl")
     }
 
+    #[cfg(test)]
     pub fn events(&self, id: &str) -> Vec<Event> {
         let Ok(f) = fs::File::open(self.events_path(id)) else {
             return Vec::new();
@@ -359,6 +360,7 @@ impl Store {
         Ok(target)
     }
 
+    #[cfg(test)]
     pub fn load_all(&self) -> Vec<Task> {
         let Ok(entries) = fs::read_dir(&self.root) else {
             return Vec::new();

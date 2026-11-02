@@ -290,11 +290,8 @@ impl Daemon {
                 tool_calls: 0,
                 last_tool: None,
                 turn_ended_ms: 0,
-                pending: if task.status.is_final() || task.detached {
-                    Vec::new()
-                } else {
-                    task.pending_inputs.clone()
-                },
+                // Persisted input becomes schedulable when a caller supplies its environment.
+                pending: Vec::new(),
                 mail: if task.status.is_final() || task.detached {
                     Vec::new()
                 } else {
@@ -1209,6 +1206,19 @@ impl Daemon {
         tier: Option<ipc::Tier>,
         env: Option<Vec<(String, String)>>,
     ) -> Result<&'static str> {
+        self.input_with_answer(caller, id, message, tier, env, None)
+            .await
+    }
+
+    async fn input_with_answer(
+        self: &Arc<Self>,
+        caller: &str,
+        id: &str,
+        message: String,
+        tier: Option<ipc::Tier>,
+        env: Option<Vec<(String, String)>>,
+        answer: Option<(&str, &str)>,
+    ) -> Result<&'static str> {
         let (reply, receive) = oneshot::channel();
         let mut input = task::Input {
             text: message,
@@ -1264,10 +1274,26 @@ impl Daemon {
             }
             let entry = st.tasks.get_mut(id).unwrap();
             let mut task = entry.task.clone();
+            if let Some((qid, answer)) = answer {
+                if identity::task_of(caller).is_some() && task.parent != caller {
+                    return refuse(ErrorCode::Invalid, format!("{id} is not your sub-task"));
+                }
+                let Some(question) = task.questions.iter_mut().find(|q| q.id == qid) else {
+                    return refuse(ErrorCode::NotFound, format!("no question {qid}"));
+                };
+                if question.answer.is_some() {
+                    return refuse(ErrorCode::Invalid, format!("{qid} is already answered"));
+                }
+                question.answer = Some(answer.to_string());
+            }
             if let Some(tier) = tier {
                 task.tier = tier;
             }
-            // Persist tier and accepted input together before changing the live entry.
+            // New input explicitly resumes a task interrupted during process release.
+            if entry.releasing && task.status == Status::Interrupted {
+                task.status = Status::Queued;
+            }
+            // Claim the answer and persist accepted input in the same snapshot.
             task.pending_inputs.push(input.text.clone());
             task.updated_ms = store::now_ms();
             self.store.save_durable(&task)?;
@@ -1355,18 +1381,16 @@ impl Daemon {
         env: Option<Vec<(String, String)>>,
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
-        // Claim the question under the lock, so two answers cannot both get through.
         let (task, question) = {
-            let mut st = self.lock();
+            let st = self.lock();
             let Some(entry) = st
                 .tasks
-                .values_mut()
+                .values()
                 .find(|e| e.task.questions.iter().any(|q| q.id == qid))
             else {
                 return refuse(ErrorCode::NotFound, format!("no question {qid}"));
             };
-            let mut saved = entry.task.clone();
-            let task = &mut saved;
+            let task = &entry.task;
             // Tasks answer only their own children; main sessions and people stand for the user.
             if identity::task_of(caller).is_some() && task.parent != caller {
                 return refuse(
@@ -1377,34 +1401,19 @@ impl Daemon {
             if task.status.is_final() {
                 return refuse(ErrorCode::Invalid, format!("{} was cancelled", task.id));
             }
-            let q = task.questions.iter_mut().find(|q| q.id == qid).unwrap();
+            let q = task.questions.iter().find(|q| q.id == qid).unwrap();
             if q.answer.is_some() {
                 return refuse(ErrorCode::Invalid, format!("{qid} is already answered"));
             }
-            q.answer = Some(answer.clone());
-            let question = q.text.clone();
-            task.updated_ms = store::now_ms();
-            self.store.save_durable(task)?;
-            let id = task.id.clone();
-            entry.task = saved;
-            (id, question)
+            (task.id.clone(), q.text.clone())
         };
         let message = format!(
             "[axiopera] Answer to your question {qid} (\"{}\"):\n{answer}",
             agent::clip(&question, 300)
         );
-        let how = match self.input(caller, &task, message, None, env).await {
-            Ok(how) => how,
-            Err(e) => {
-                // Not delivered (the task was taken over or cancelled): leave it open.
-                self.update(&task, |t| {
-                    if let Some(q) = t.questions.iter_mut().find(|q| q.id == qid) {
-                        q.answer = None;
-                    }
-                });
-                return Err(e);
-            }
-        };
+        let how = self
+            .input_with_answer(caller, &task, message, None, env, Some((qid, &answer)))
+            .await?;
         self.try_emit(&task, "answered", json!({"id": qid}))?;
         out.text(
             format!("{qid}: {how}"),

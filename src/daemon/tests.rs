@@ -1469,8 +1469,16 @@ async fn accepted_input_and_mail_survive_restart_without_starting_an_agent() {
     )
     .await
     .unwrap();
-    let again = Arc::new(Daemon::load(options(&f.home), None));
-    assert_eq!(again.lock().tasks["test"].pending, ["first", "second"]);
+    let mut opts = options(&f.home);
+    opts.concurrency = 1;
+    let again = Arc::new(Daemon::load(opts, None));
+    {
+        let st = again.lock();
+        assert!(st.tasks["test"].pending.is_empty());
+        assert_eq!(st.tasks["test"].task.pending_inputs, ["first", "second"]);
+        assert!(again.at_limit(&st, "codex:other").is_none());
+        assert!(!again.live(&st, "codex:host", &[]));
+    }
     assert_eq!(again.lock().tasks["test"].mail.len(), 1);
     again.schedule("test");
     assert!(again.lock().tasks["test"].actor.is_none());
@@ -1485,6 +1493,102 @@ async fn accepted_input_and_mail_survive_restart_without_starting_an_agent() {
     );
     assert_eq!(again.collect(u64::MAX).unwrap(), 1);
     assert!(again.lock().tasks.contains_key("test"));
+}
+
+#[tokio::test]
+async fn input_during_interrupted_release_schedules_a_fresh_actor() {
+    let f = fixture();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    {
+        let mut st = f.d.lock();
+        st.running = 1;
+        let entry = st.tasks.get_mut("test").unwrap();
+        entry.actor = Some(tx);
+        entry.releasing = true;
+        entry.task.status = Status::Running;
+    }
+    f.d.stop_tree("test", "parent timed out", "timeout", true)
+        .unwrap();
+    f.d.input(
+        "codex:host",
+        "test",
+        "continue".into(),
+        None,
+        Some(Vec::new()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.d.lock().tasks["test"].task.status, Status::Queued);
+    f.d.actor_done("test");
+    let mut st = f.d.lock();
+    assert!(st.tasks["test"].actor.is_some());
+    assert_eq!(st.tasks["test"].pending, ["continue"]);
+    assert_eq!(st.running, 1);
+    // The current-thread runtime has not polled the actor; prevent any CLI startup.
+    st.tasks.get_mut("test").unwrap().env = None;
+}
+
+#[tokio::test]
+async fn answers_and_their_input_are_committed_together() {
+    let f = fixture();
+    f.d.lock().stopping = true;
+    f.d.try_update("test", |t| {
+        t.questions.push(store::Question {
+            id: "qtest".into(),
+            text: "Which option?".into(),
+            answer: None,
+            asked_ms: 0,
+        });
+    })
+    .unwrap();
+    let tmp = f.home.join("tasks/test/task.json.tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    let mut output = Vec::new();
+    assert!(
+        f.d.reply(
+            "codex:host",
+            "qtest",
+            "first".into(),
+            None,
+            &mut Out::new(&mut output)
+        )
+        .await
+        .is_err()
+    );
+    {
+        let st = f.d.lock();
+        assert!(st.tasks["test"].task.questions[0].answer.is_none());
+        assert!(st.tasks["test"].task.pending_inputs.is_empty());
+    }
+    assert!(output.is_empty());
+    std::fs::remove_dir(tmp).unwrap();
+    let (first, second) = tokio::join!(
+        f.d.input_with_answer(
+            "codex:host",
+            "test",
+            "first".into(),
+            None,
+            None,
+            Some(("qtest", "first"))
+        ),
+        f.d.input_with_answer(
+            "codex:host",
+            "test",
+            "second".into(),
+            None,
+            None,
+            Some(("qtest", "second"))
+        )
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+    let again = Daemon::load(options(&f.home), None);
+    let st = again.lock();
+    let task = &st.tasks["test"].task;
+    assert_eq!(task.pending_inputs.len(), 1);
+    assert_eq!(
+        task.questions[0].answer.as_ref(),
+        task.pending_inputs.first()
+    );
 }
 
 #[tokio::test]

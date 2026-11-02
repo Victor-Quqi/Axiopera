@@ -259,15 +259,24 @@ impl Daemon {
         pending: PendingPush,
         delivered: bool,
     ) -> anyhow::Result<()> {
+        let mut st = self.lock();
         if delivered {
             for (task, turn) in pending.turns {
-                self.try_update(&task, |t| t.delivered = t.delivered.max(turn))?;
+                if let Some(entry) = st.tasks.get_mut(&task) {
+                    let mut task = entry.task.clone();
+                    task.delivered = task.delivered.max(turn);
+                    task.updated_ms = crate::store::now_ms();
+                    self.store.save_durable(&task)?;
+                    entry.task = task;
+                }
             }
         }
-        let mut st = self.lock();
         let mut ledger = st.ledger.clone();
         if delivered {
             for (task, seq) in pending.events {
+                if !st.tasks.contains_key(&task) {
+                    continue;
+                }
                 let cursor = ledger
                     .cursors
                     .entry(super::cursor_key(caller, &task))
@@ -631,6 +640,23 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert!(events.iter().any(|e| is_news(e, "codex:host")));
         assert_eq!(events[0].kind, "cancelled");
+    }
+
+    #[test]
+    fn settling_a_push_does_not_resurrect_collected_tasks_or_cursors() {
+        let f = fixture();
+        let pending = PendingPush {
+            marker: "receipt".into(),
+            events: vec![("gone".into(), 8), ("test".into(), 9)],
+            turns: vec![("gone".into(), 1), ("test".into(), 1)],
+            approvals: Vec::new(),
+        };
+        f.d.settle_push("codex:host", pending, true).unwrap();
+        let st = f.d.lock();
+        assert!(!st.tasks.contains_key("gone"));
+        assert!(!st.ledger.cursors.contains_key("codex:host|gone"));
+        assert_eq!(st.ledger.cursors["codex:host|test"], 9);
+        assert_eq!(st.tasks["test"].task.delivered, 1);
     }
 
     #[test]
