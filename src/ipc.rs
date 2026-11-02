@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 
 /// Bump on incompatible wire types or caller identity semantics.
-pub const PROTOCOL: u32 = 5;
+pub const PROTOCOL: u32 = 6;
 
 /// Longest accepted line; task descriptions and environments travel inline.
 const MAX_LINE: usize = 16 << 20;
@@ -84,7 +84,10 @@ pub enum Request {
     Inbox {
         tasks: Vec<String>,
     },
-    Watch,
+    Watch {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        status: bool,
+    },
     Status {
         task: Option<String>,
         all: bool,

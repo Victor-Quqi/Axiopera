@@ -20,7 +20,9 @@ Get results
 @claude exits, run `axiopera inbox`, and start `axiopera wait` again while sub-tasks still run.
 @claude Native subagents and teammates share their parent's inbox,
 @claude so all pass task IDs to wait and inbox.
-@codex The output of spawn says how results reach you.
+@codex After spawning or resuming tasks, run `axiopera watch --status` unless it is already running.
+@codex Let your shell tool yield a background session so the user can see progress; the command
+@codex exits when no tasks run. Receive results as directed by spawn.
 @grok Before you spawn, start `axiopera watch --caller grok:<session>` with your monitor tool,
 @grok persistent, unless it is running; start it again if told it ended while sub-tasks run.
 @grok For each line it prints, run `axiopera inbox`.

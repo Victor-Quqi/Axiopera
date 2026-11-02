@@ -901,6 +901,103 @@ async fn a_sub_agents_watch_ends_a_minute_after_its_work_is_done_and_taken() {
     host.abort();
 }
 
+#[tokio::test(start_paused = true)]
+async fn status_watch_tracks_work_without_taking_news_and_exits_after_release() {
+    let f = fixture_with(&[
+        json!({"id": "old"}),
+        json!({"id": "other", "parent": "codex:other"}),
+    ]);
+    f.d.update("test", |t| t.status = Status::Queued);
+    f.d.lock()
+        .tasks
+        .get_mut("test")
+        .unwrap()
+        .pending
+        .push("start".into());
+    let (other_actor, _other_rx) = mpsc::unbounded_channel();
+    f.d.lock().tasks.get_mut("other").unwrap().actor = Some(other_actor);
+    let (client, mut server) = tokio::io::duplex(1 << 16);
+    let d = f.d.clone();
+    let watcher = tokio::spawn(async move {
+        d.watch_status("codex:host", &mut Out::new(&mut server))
+            .await
+    });
+    let mut reader = ipc::Reader::new(client);
+    let Some(Reply::Out { text, data }) = reader.read::<Reply>().await.unwrap() else {
+        panic!("no queued status");
+    };
+    assert!(text.contains("queued"), "{text}");
+    assert_eq!(data["id"], "test");
+
+    let (actor, _rx) = mpsc::unbounded_channel();
+    {
+        let mut st = f.d.lock();
+        let e = st.tasks.get_mut("test").unwrap();
+        e.pending.clear();
+        e.actor = Some(actor);
+    }
+    f.d.update("test", |t| t.status = Status::Running);
+    f.d.emit(
+        "test",
+        "tool",
+        json!({"name": "Bash", "detail": "cargo test"}),
+    );
+    let Some(Reply::Out { text, .. }) = reader.read::<Reply>().await.unwrap() else {
+        panic!("no progress");
+    };
+    assert!(
+        text.contains("1 tool call(s)") && text.contains("cargo test"),
+        "{text}"
+    );
+
+    f.d.update("test", |t| {
+        t.status = Status::Idle;
+        t.turns = 1;
+    });
+    f.d.emit("test", "turn_ended", json!({"turn": 1, "status": "idle"}));
+    let Some(Reply::Out { text, .. }) = reader.read::<Reply>().await.unwrap() else {
+        panic!("no background work status");
+    };
+    assert!(text.contains("background work still runs"), "{text}");
+    assert!(!watcher.is_finished());
+    assert_eq!(f.d.unseen(&f.d.lock(), "codex:host", &[]).len(), 1);
+
+    // Delivery may race the display; neither delivery nor unread news controls its lifetime.
+    let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
+    f.d.mark_seen("codex:host", &events, &[("test".into(), 1)], &[])
+        .unwrap();
+    f.d.emit("test", "stalled", json!({"quiet_secs": 600}));
+    f.d.lock().tasks.get_mut("test").unwrap().actor = None;
+    let Some(Reply::Out { text, .. }) = reader.read::<Reply>().await.unwrap() else {
+        panic!("no final status");
+    };
+    assert!(
+        text.contains("idle") && !text.contains("background work"),
+        "{text}"
+    );
+    let Some(Reply::Out { text, .. }) = reader.read::<Reply>().await.unwrap() else {
+        panic!("no end marker");
+    };
+    assert_eq!(text, "no running sub-tasks");
+    assert_eq!(watcher.await.unwrap().unwrap(), ipc::exit::OK);
+    assert_eq!(f.d.unseen(&f.d.lock(), "codex:host", &[]).len(), 1);
+    assert_eq!(f.d.lock().tasks["test"].task.delivered, 1);
+    assert!(reader.read::<Reply>().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn status_watch_with_no_work_exits_immediately() {
+    let f = fixture();
+    let mut buf = Vec::new();
+    assert_eq!(
+        f.d.watch_status("codex:host", &mut Out::new(&mut buf))
+            .await
+            .unwrap(),
+        ipc::exit::OK
+    );
+    assert_eq!(replies(&buf), "no running sub-tasks");
+}
+
 #[test]
 fn the_request_log_keeps_argument_names_and_ages_out_with_gc() {
     let f = fixture();

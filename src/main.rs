@@ -95,9 +95,12 @@ enum Command {
         /// Only these tasks (default: all of yours).
         tasks: Vec<String>,
     },
-    /// A line for each piece of news from your sub-tasks, until stopped; for a sub-agent, until a
-    /// minute after its sub-tasks are done and their news taken. Takes nothing.
+    /// By default, print sub-task news until stopped; for a sub-agent, until a minute after its
+    /// sub-tasks are done and their news taken. Takes nothing.
     Watch {
+        /// Show progress until no sub-tasks are running or queued.
+        #[arg(long)]
+        status: bool,
         /// Whose sub-tasks, e.g. `grok:<session>`: Grok's monitor tool starts commands without
         /// the session's GROK_SESSION_ID.
         #[arg(long)]
@@ -369,9 +372,9 @@ async fn run(cli: Cli) -> Result<i32> {
             timeout_ms: timeout.map(|d| d.as_millis() as u64),
         },
         Command::Inbox { tasks } => Request::Inbox { tasks },
-        Command::Watch { caller: c } => {
+        Command::Watch { caller: c, status } => {
             caller = c;
-            Request::Watch
+            Request::Watch { status }
         }
         Command::Status { task, all } => Request::Status { task, all },
         Command::Log { task, tail } => Request::Log { task, tail },
@@ -584,6 +587,9 @@ mod tests {
         let claude = guide(Some(Agent::Claude), "claude:s0");
         assert!(claude.contains("\n  Run `axiopera wait` as a background command"));
         assert!(!claude.contains("Codex:") && !claude.contains("watch --caller"));
+        let codex = guide(Some(Agent::Codex), "codex:s0");
+        assert!(codex.contains("`axiopera watch --status`"));
+        assert!(!claude.contains("watch --status"));
         let grok = guide(Some(Agent::Grok), "grok:s1");
         assert!(grok.contains("`axiopera watch --caller grok:s1`"));
         assert!(!grok.contains("background command"));
@@ -593,6 +599,23 @@ mod tests {
         assert!(sub_agent.contains("`axiopera watch --caller task:t1`"));
         let native = guide(Some(Agent::Grok), "task:t1/grok:child");
         assert!(native.contains("`axiopera watch --caller task:t1/grok:child`"));
+    }
+
+    #[test]
+    fn watch_status_keeps_the_caller_option() {
+        let cli =
+            Cli::try_parse_from(["axiopera", "watch", "--status", "--caller", "codex:s0"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Watch { status: true, caller: Some(c) } if c == "codex:s0")
+        );
+        let cli = Cli::try_parse_from(["axiopera", "watch"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Watch {
+                status: false,
+                caller: None
+            }
+        ));
     }
 
     #[test]

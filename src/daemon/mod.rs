@@ -638,7 +638,7 @@ impl Daemon {
         // Commands that block indefinitely stop then; the others run to completion.
         let result = if matches!(
             env.request,
-            Request::Wait { .. } | Request::Watch | Request::Models { .. }
+            Request::Wait { .. } | Request::Watch { .. } | Request::Models { .. }
         ) {
             tokio::select! {
                 r = self.dispatch(env, &mut out) => Some(r),
@@ -808,7 +808,8 @@ impl Daemon {
                 }
                 Ok(ipc::exit::OK)
             }
-            Request::Watch => self.watch(&caller, out).await,
+            Request::Watch { status: true } => self.watch_status(&caller, out).await,
+            Request::Watch { status: false } => self.watch(&caller, out).await,
             Request::Status { task, all } => self.status(&caller, task.as_deref(), all, out).await,
             Request::Log { task, tail } => self.log_cmd(&caller, &task, tail, out).await,
             Request::Result { task, turn, force } => {
@@ -2496,6 +2497,54 @@ impl Daemon {
         }
     }
 
+    /// Keep a host-owned background terminal visible for as long as its sub-tasks run.
+    async fn watch_status<W: AsyncWrite + Unpin>(
+        &self,
+        caller: &str,
+        out: &mut Out<'_, W>,
+    ) -> Result<i32> {
+        let mut seen = HashMap::new();
+        let mut tick = tokio::time::interval(WATCH_GAP);
+        loop {
+            tick.tick().await;
+            let (rows, live) = {
+                let st = self.lock();
+                let mut entries: Vec<_> = st
+                    .tasks
+                    .values()
+                    .filter(|e| {
+                        e.task.parent == caller
+                            && (e.actor.is_some()
+                                || !e.pending.is_empty()
+                                || seen.contains_key(&e.task.id))
+                    })
+                    .collect();
+                entries.sort_by_key(|e| (e.task.created_ms, &e.task.id));
+                let rows = entries
+                    .iter()
+                    .map(|e| {
+                        (
+                            e.task.id.clone(),
+                            self.status_text(&st, e, caller),
+                            serde_json::to_value(&e.task),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (rows, self.live(&st, caller, &[]))
+            };
+            for (id, text, data) in rows {
+                if seen.get(&id) != Some(&text) {
+                    out.text(text.clone(), data?).await?;
+                    seen.insert(id, text);
+                }
+            }
+            if !live {
+                out.text("no running sub-tasks", Value::Null).await?;
+                return Ok(ipc::exit::OK);
+            }
+        }
+    }
+
     /// Whether `inbox` would hand the event to the caller.
     fn concerns(&self, e: &Event, caller: &str) -> bool {
         if e.kind == "approval_request" {
@@ -2530,15 +2579,7 @@ impl Daemon {
                 "no tasks".to_string()
             } else {
                 rows.iter()
-                    .map(|e| {
-                        let mut line =
-                            render::status_line(&e.task, e.actor.is_some() && !e.releasing);
-                        let progress = self.progress(&st, e, caller);
-                        if !progress.is_empty() {
-                            line.push_str(&format!("  ({progress})"));
-                        }
-                        line
-                    })
+                    .map(|e| self.status_text(&st, e, caller))
                     .collect::<Vec<_>>()
                     .join("\n")
             };
@@ -2547,6 +2588,15 @@ impl Daemon {
         };
         out.text(text, data).await?;
         Ok(ipc::exit::OK)
+    }
+
+    fn status_text(&self, st: &State, e: &Entry, caller: &str) -> String {
+        let mut line = render::status_line(&e.task, e.actor.is_some() && !e.releasing);
+        let progress = self.progress(st, e, caller);
+        if !progress.is_empty() {
+            line.push_str(&format!("  ({progress})"));
+        }
+        line
     }
 
     async fn log_cmd<W: AsyncWrite + Unpin>(
