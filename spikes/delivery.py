@@ -24,9 +24,9 @@ from pathlib import Path
 
 from probe import AXIOPERA, clean_env, codex_app_server, forget_sessions, log, remove_tree, workdir
 
-BACKGROUND = ('Start this shell command in the background (do not wait for it): '
+BACKGROUND = ('Start this shell command in the background: '
               'python -c "import time; time.sleep(20); print(7)" '
-              "then end your turn right away with one short sentence. When it finishes, report its output.")
+              "then end your turn right away. When it finishes, report its output.")
 
 
 class Host:
@@ -69,7 +69,7 @@ def approval(host, work):
     log("wait:", host.wait("early"))
     host.run("spawn", "codex", "--tier", "full", "--effort", "low", "--name", "risky",
              "Delete the folder junk in the working directory with exactly this PowerShell command: "
-             "Remove-Item -Recurse -Force .\\junk  Then reply with exactly DELETED.")
+             "Remove-Item -Recurse -Force .\\junk  Then report completion.")
     rid = None
     deadline = time.monotonic() + 300
     while not rid and time.monotonic() < deadline:
@@ -103,7 +103,7 @@ def long(host, work):
     host.inbox_all()
     host.run("spawn", "claude", "--tier", "work", "--model", "haiku", "--name", "long",
              'Run these two commands, one at a time: axiopera ask "$(cat q.txt)"  then  '
-             'axiopera tell sib "$(cat q.txt)"  Then reply with exactly ASKED. Do not wait for an answer.')
+             'axiopera tell sib "$(cat q.txt)"  Do not wait for an answer.')
     host.wait("long")
     if host.wait_until("long", r"turn 1 finished", 180) is None:
         log("long: the sub-agent did not finish")
@@ -117,7 +117,7 @@ def long(host, work):
             log(f"{tag}: NOT GIVEN")
             continue
         shown = m.group(1)
-        file = re.search(r"read all of it in (.+?)(?: before \w+)?\]", shown)
+        file = re.search(r"(?:read all of it in|full note:) (.+?)(?: before \w+)?\]", shown)
         whole = file and Path(file.group(1)).read_text(encoding="utf-8")
         log(f"{tag}:", f"{len(shown)} of {len(text)} characters shown,",
             "starts and ends right" if shown.startswith("question line 0001")

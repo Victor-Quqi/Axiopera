@@ -51,7 +51,7 @@ def main(agent):
         if agent == "codex":
             extra = ["--effort", "low"]
         call("spawn", agent, "--tier", "read", "--name", "probe", *extra,
-             f"Remember this marker for later: {marker}. Reply with it. Do not use tools.")
+             f"Marker: {marker}. Do not use tools.")
         first = settled(1)
         original_session = first["session"]
         assert first["tier"] == "read" and original_session
@@ -59,7 +59,7 @@ def main(agent):
 
         call("send", "probe", "--tier", "full",
              "Write the marker from my first message into marker.txt in the current directory, "
-             "using your file editing tool. Then reply DONE.")
+             "using your file editing tool.")
         second = settled(2)
         assert second["session"] == original_session and second["tier"] == "full"
         assert (work / "marker.txt").read_text(encoding="utf-8").strip() == marker

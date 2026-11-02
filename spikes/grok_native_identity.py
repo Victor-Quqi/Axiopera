@@ -190,13 +190,13 @@ def run_case(root, nested):
     for kind in ("MCPS", "HOOKS", "SKILLS", "RULES", "AGENTS"):
         env[f"GROK_CLAUDE_{kind}_ENABLED"] = "0"
     prompt = (
-        "Test native subagent identity. In this working directory, run `python capture.py parent` "
+        "In this working directory, run `python capture.py parent` "
         "with your terminal tool. Then use your native spawn_subagent tool to start exactly one "
-        "general-purpose child in this same directory. Its entire task is: run `python capture.py child` "
+        "general-purpose child in this same directory. Its task is: run `python capture.py child` "
         "with the terminal tool, wait until the command exits and prints 'Live inbox checked.', then report completion. "
-        "Wait for that child to finish, then reply DONE. If the helper fails, report the error and stop; do not edit it. "
+        "Wait for that child to finish, then report completion. If the helper fails, report the error and stop; do not edit it. "
         "The helper records identity and dispatches a one-message Axiopera probe; do not print environment variables or "
-        "read agent configuration. Use native subagent tools for delegation."
+        "read agent configuration."
     )
     rpc = None
     try:

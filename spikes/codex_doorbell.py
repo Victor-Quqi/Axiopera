@@ -69,7 +69,7 @@ def main():
         log("host thread", tid)
 
         # Idle host: it ends its turn, then a reminder should start the next one.
-        ask(host, tid, f"Run this command and show me what it printed, then end your turn: {spawn.format('alpha', 'ALPHA')}")
+        ask(host, tid, f"Run this command, then end your turn: {spawn.format('alpha', 'ALPHA')}")
         t = wait_idle(host, tid, 1, 180)
         receipt = [i.get("aggregatedOutput") or "" for i in t[0].get("items", [])
                    if i.get("type") == "commandExecution" and "spawn" in str(i.get("command"))]

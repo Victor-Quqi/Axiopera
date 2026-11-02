@@ -12,12 +12,12 @@ import time
 
 from probe import claude_stream, claude_user, forget_sessions, grok_acp, log, remove_tree, workdir
 
-TASK = ('Start this shell command in the background (do not wait for it): python -c "import time; time.sleep(20); print(7)" '
-        "then end your turn right away with one short sentence. When it finishes, report its output.")
-BUSY = ('Start this shell command in the background (do not wait for it): python -c "import time; time.sleep(15); print(7)" '
+TASK = ('Start this shell command in the background: python -c "import time; time.sleep(20); print(7)" '
+        "then end your turn right away. When it finishes, report its output.")
+BUSY = ('Start this shell command in the background: python -c "import time; time.sleep(15); print(7)" '
         'Then, without checking on it, run this foreground command five times, one call at a time: '
         'python -c "import time; time.sleep(6)" '
-        "After each call, say in one short line whether the background command has finished and what it printed, "
+        "After each call, say whether the background command has finished and what it printed, "
         "as far as you know at that moment. Then end your turn.")
 TASK = BUSY if "busy" in sys.argv else TASK
 WINDOW = 120 if "busy" in sys.argv else 75

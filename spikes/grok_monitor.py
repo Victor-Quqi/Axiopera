@@ -82,12 +82,12 @@ def main():
         log("host session", sid)
 
         # Busy host: the line arrives after one of its commands.
-        host.prompt("Do these one at a time. 1. Run `axiopera guide`, then start the watch command "
-                    "it gives for Grok with your monitor tool, persistent; for each line it prints, "
+        host.prompt("1. Run `axiopera guide --host grok`, then start the watch command "
+                    "it gives with your monitor tool, persistent; for each line it prints, "
                     "run `axiopera inbox`. "
                     f"2. Run {SPAWN.format('alpha', 'ALPHA')} "
                     "3. Run python -c \"import time; time.sleep(15)\" up to four times, one call at a "
-                    "time, and follow any instructions that arrive between calls. Then end your turn.", 300)
+                    "time. Then end your turn.", 300)
         log("busy:", "collected in the same prompt" if host.took("ALPHA") else "NOT collected")
         host.pump(15)
 

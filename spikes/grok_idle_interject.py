@@ -9,7 +9,7 @@ cwd = workdir("grok-idle")
 rpc = grok_acp(cwd)
 try:
     sid = rpc.call("session/new", {"cwd": str(cwd), "mcpServers": [], "_meta": {"yoloMode": True}})["sessionId"]
-    r = rpc.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "Say hi in two words."}]}, 120)
+    r = rpc.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "Say hi."}]}, 120)
     log("prompt 1:", r.get("stopReason"))
     while rpc.next(2) is not ...:
         pass
@@ -26,7 +26,7 @@ try:
         detail = u.get("content", {}).get("text", "") if isinstance(u.get("content"), dict) else ""
         log("event:", kind, repr(detail[:60]), sorted(k for k in u if k not in ("sessionUpdate", "content")))
     # A normal prompt afterwards: is the session still usable?
-    r = rpc.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "Say bye in two words."}]}, 120)
+    r = rpc.call("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text": "Say bye."}]}, 120)
     log("prompt 2:", r.get("stopReason"))
 finally:
     rpc.close()

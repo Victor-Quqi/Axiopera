@@ -8,7 +8,7 @@ from pathlib import Path
 from probe import (claude_stream, claude_user, codex_app_server, grok_acp,
                    forget_sessions, log, remove_tree, workdir)
 
-TASK = 'Write numbers 1 to 180, one per line. Do not use tools. Include START-RECEIPT in the first line.'
+TASK = 'Write numbers 1 to 180, one per line. Do not use tools.'
 MESSAGES = ['After finishing, reply with RECEIPT-ONE.', 'Also include RECEIPT-TWO in your final reply.']
 
 

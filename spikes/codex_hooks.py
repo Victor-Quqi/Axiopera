@@ -68,9 +68,9 @@ def main():
 
         # Busy with tools: the reminder comes with a tool result.
         host.call("turn/start", {"threadId": tid, "input": [{"type": "text", "text":
-                  f"Run these commands one at a time. 1. {spawn.format('alpha', 'ALPHA')} "
-                  "2. Then run python -c \"import time; time.sleep(15)\" up to four times, one call at a time, "
-                  "and follow any instructions that arrive between calls. Then end your turn."}]})
+                  f"1. {spawn.format('alpha', 'ALPHA')} "
+                  "2. Then run python -c \"import time; time.sleep(15)\" up to four times, one call at a time. "
+                  "Then end your turn."}]})
         wait_idle(host, tid, 1, 300)
         time.sleep(10)
         t = turns(host, tid)

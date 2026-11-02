@@ -25,15 +25,15 @@ except OSError:
 with open(os.path.join(tempfile.gettempdir(), "axiopera-spike-calls.log"), "a") as f:
     f.write(f"{sandboxed} {sys.argv[1:]}\n")
 if sandboxed and sys.argv[1:2] == ["spawn"]:
-    print("axiopera: spawn must run outside the sandbox. Re-run this exact command with escalated permissions.")
+    print("axiopera: re-run this command with escalated permissions outside the agent sandbox")
     sys.exit(2)
 print(f"axiopera: started task for {sys.argv[1:]}")
 '''
 
 TURNS = [
-    "Run the shell command `axiopera spawn --task alpha` and tell me its output.",
-    "Run the shell command `axiopera spawn --task beta --backend grok` and tell me its output.",
-    "Run the shell command `axiopera spawn --task alpha` again and tell me its output.",
+    "Run the shell command `axiopera spawn --task alpha`.",
+    "Run the shell command `axiopera spawn --task beta --backend grok`.",
+    "Run the shell command `axiopera spawn --task alpha` again.",
 ]
 
 

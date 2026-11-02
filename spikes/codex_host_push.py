@@ -189,7 +189,7 @@ def main():
         other.call("turn/start", {"threadId": tid, "approvalPolicy": "on-request", "approvalsReviewer": "user",
                                   "sandboxPolicy": {"type": "readOnly"},
                                   "input": [{"type": "text", "text":
-                   "Run exactly this shell command once: `mkdir approved`. Do nothing else."}]})
+                   "Run exactly this shell command once: `mkdir approved`. Stop after this attempt."}]})
         other.close()
         mark = len(tui.screen)
         asked = False

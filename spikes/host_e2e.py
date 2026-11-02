@@ -19,11 +19,11 @@ from pathlib import Path
 
 from probe import AXIOPERA, CLAUDE, CODEX, GROK, clean_env, forget_sessions, log, remove_tree, workdir
 
-PROMPT = """Use the `axiopera` CLI to delegate work to other coding agents. Run `axiopera guide --host {host}` first to learn how.
+PROMPT = """Use the `axiopera` CLI to delegate work to other coding agents. Run `axiopera guide --host {host}` first.
 Then, with every sub-agent at tier read:
-1. Delegate three tiny tasks at once: Claude (model haiku) replies with exactly ALPHA, Codex (effort low) replies with exactly BRAVO, Grok replies with exactly CHARLIE.
+1. Delegate three tasks at once: Claude (model haiku) replies with exactly ALPHA, Codex (effort low) replies with exactly BRAVO, Grok replies with exactly CHARLIE.
 2. Collect all three replies.
-3. Ask the Claude sub-agent a follow-up: reply with exactly DELTA. Collect that reply.
+3. Ask the Claude sub-agent to reply with exactly DELTA, then collect its reply.
 4. Delegate to Grok: write the numbers 1 to 500 in English words, one per line. Cancel it right away.
 5. Report every reply you collected, and the output of `axiopera status`."""
 

@@ -21,7 +21,7 @@ MODES = {
     "yolo": {"yoloMode": True},
 }
 RETRY = ("If the tool call is blocked or denied, retry the identical command until you have made 4 attempts "
-         "(stop early only if it actually executes). Do not modify it and do not try alternatives. "
+         "(stop early only if it actually executes). Do not try alternatives. "
          "Finally report, for each attempt, the exact message the tool returned.")
 
 

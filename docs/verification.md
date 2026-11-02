@@ -47,8 +47,8 @@
 | [宿主通知](backends.md#宿主通知)：Codex 推送通道，以及 TUI 退出后会话的卸载时间 | `codex_host_push.py`；手动实验：TUI 退出后轮询 `thread/loaded/list`，daemon 0.160.0 和 `--remote` 连接的 0.164.0 app-server 各一次；源码 0.162.0 [config_toml.rs](https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/config/src/config_toml.rs#L346-L348)、0.164.0 [config_toml.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/config/src/config_toml.rs#L349-L352) |
 | [宿主通知](backends.md#宿主通知)：只开关 feature 的 `-c` 不让 TUI 离开共享 daemon | 源码 Codex 0.164.0 [daemon_startup.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/tui/src/daemon_startup.rs#L90-L126) |
 | [宿主通知](backends.md#宿主通知)：Codex 门铃，包括宿主自行 `inbox` 后撤回提醒；app-server 客户端会话的来源为 `vscode` | `codex_doorbell.py` |
-| [宿主通知](backends.md#宿主通知)：Codex 插件 hook 在工具调用之后提醒，隐藏的工具仍可由 hook 调用；不调工具时由本轮之后的门铃提醒 | `codex_hooks.py`：hook 和 MCP 服务器经线程配置提供；手动实验：在桌面端安装并信任插件后新建会话复测，缓存中插件的 `mcp.json` 临时直接设了 `AXIOPERA_HOME` |
-| [宿主通知](backends.md#宿主通知)：Grok monitor 在工具调用之后和空闲时送达 `watch` 的输出，以及它的速率和行长限制；monitor 启动的命令没有 `GROK_SESSION_ID` | `grok_monitor.py`；手动实验：同一命令经 monitor 和终端工具各运行一次；源码 [Grok monitor rate_limiter.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/rate_limiter.rs)、[event.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/event.rs) |
+| [宿主通知](backends.md#宿主通知)：Codex 插件 hook 在工具调用之后提醒，隐藏的工具仍可由 hook 调用；不调工具时由本轮之后的门铃提醒 | `codex_hooks.py`：hook 和 MCP 服务器经线程配置提供；原提示额外要求服从工具调用之间到达的指令，删去该句后的自主收件行为尚未复测；手动实验：在桌面端安装并信任插件后新建会话复测，缓存中插件的 `mcp.json` 临时直接设了 `AXIOPERA_HOME` |
+| [宿主通知](backends.md#宿主通知)：Grok monitor 在工具调用之后和空闲时送达 `watch` 的输出，以及它的速率和行长限制；monitor 启动的命令没有 `GROK_SESSION_ID` | `grok_monitor.py`：原提示额外要求服从调用间指令，删去该句后的自主收件行为尚未复测；手动实验：同一命令经 monitor 和终端工具各运行一次；源码 [Grok monitor rate_limiter.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/rate_limiter.rs)、[event.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/event.rs) |
 | [Skill 与 Codex 插件](usage.md#skill-与-codex-插件)：skill 的读取位置 | Grok 在隔离的主目录中用 `grok inspect` 实测；文档 [Claude skills](https://code.claude.com/docs/en/skills)；源码 [Codex host_roots.rs](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/ext/skills/src/host_roots.rs) |
 | [Skill 与 Codex 插件](usage.md#skill-与-codex-插件)：Codex 插件的安装、卸载和卸载后的残留，包括 hook 的信任记录和内容基线 | 手动实验：在临时 `CODEX_HOME` 中和桌面端分别安装、信任和卸载，再运行 `axiopera plugin cleanup`；源码 Codex 0.164.0 [plugin_trust.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/hooks/src/engine/plugin_trust.rs#L51-L117) |
 | [Skill 与 Codex 插件](usage.md#skill-与-codex-插件)：卸载不结束已打开会话中的 hook 进程 | 手动实验：桌面端 |
@@ -60,6 +60,8 @@
 | [宿主通知](backends.md#宿主通知)：不向 Claude inbox socket 推送 | 手动实验；文档 [Claude 跨会话消息](https://code.claude.com/docs/en/cross-session-messaging) |
 | [宿主通知](backends.md#宿主通知)：Windows 上 Codex 的退出码 | 手动实验；源码 [Codex shell.rs](https://github.com/openai/codex/blob/ce0323f2f2d3b25e82806cd555237da3db4e1897/codex-rs/core/src/shell.rs#L34-L40) |
 | [daemon 生命周期](design.md#daemon-生命周期)：Windows 进程存活、Job 取消和命名管道权限 | `daemon_job.py`、`ipc_sandbox.py`、`winproc/` |
+
+提示词审查后的协议核对：`question_receipts_match_the_task_answer_route` 验证主会话与原生子会话的回执、实际回答队列和查询；`grok_spawn_receipts_use_the_callers_monitor` 验证 Grok 宿主、任务及混合原生会话的收件指引。拒绝原因按只读限制、审批通道断开和后端缺少批准选项分别表述。探针提示已删冗余和额外行为引导，历史实测对应原提示；新版仅作语法与本地断言核对，尚未重新调用真实模型。
 
 ## 探针
 

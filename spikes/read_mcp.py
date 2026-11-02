@@ -84,13 +84,13 @@ def claude(cwd):
             if "--initialize" in sys.argv:
                 p.send({"type": "control_request", "request_id": "init", "request": {"subtype": "initialize"}})
             p.send(claude_user(
-                "Run this permission probe. Attempt each item once, even if an earlier item fails; "
+                "Attempt each item once, even if an earlier item fails; "
                 "do not use alternative tools or retry denied actions. "
                 "1. Read sample.txt with Read. 2. Glob *.txt. 3. Grep probe in sample.txt. "
                 "4. Bash: cat sample.txt. 5. Bash: axiopera --version. "
                 "6. Bash: mkdir blocked-directory. "
                 f"7. Call all three MCP tools from {SERVER}: read, unmarked, destructive. "
-                "Finish with a short table of outcomes."))
+                "Report each outcome."))
             pending = {}
             end = time.monotonic() + 180
             while time.monotonic() < end:
@@ -145,7 +145,7 @@ def claude(cwd):
 
 def respond_claude(p, m, allowed):
     behavior = {"behavior": "allow", "updatedInput": m["request"].get("input", {})} if allowed else {
-        "behavior": "deny", "message": "Denied by the read-tier probe. Continue with the next item."}
+        "behavior": "deny", "message": "Denied by the read-tier probe."}
     p.send({"type": "control_response", "response": {
         "subtype": "success", "request_id": m["request_id"], "response": behavior}})
 
@@ -154,7 +154,7 @@ def grok(cwd):
     def reject(_rpc, m):
         log("grok request", m["method"])
         return {"outcome": {"outcome": "selected", "optionId": "reject-once"},
-                "_meta": {"followup_message": "Denied by probe; continue."}}
+                "_meta": {"followup_message": "Denied by probe."}}
 
     env = clean_env(**{f"GROK_CLAUDE_{k}_ENABLED": "0" for k in ("MCPS", "HOOKS", "SKILLS", "RULES", "AGENTS")})
     for disabled in ([], [f"{SERVER}__unmarked", f"mcp__{SERVER}__destructive"]):
@@ -174,7 +174,7 @@ def grok(cwd):
             reply = rpc.call_async("session/prompt", {"sessionId": sid, "prompt": [{"type": "text", "text":
                 f"Use search_tool to find all tools from {SERVER}, then attempt each once with use_tool: "
                 "read, unmarked, destructive. All return a fixed string. Continue after failures. "
-                "Do not call other tools. Report their results briefly."}]})
+                "Do not call other tools. Report their results."}]})
             end = time.monotonic() + 120
             while time.monotonic() < end:
                 if not reply.empty():
@@ -214,7 +214,7 @@ def daemon(cwd):
                          "--timeout", "3m", "--cwd", str(cwd),
                          f"Call these three MCP tools from {SERVER} once each: read, unmarked, destructive. "
                          "Continue after refusals. Then use Bash once to run mkdir blocked-directory. "
-                         "Do not retry or use other tools. Report results briefly."))
+                         "Do not retry or use other tools."))
         end = time.monotonic() + 180
         while time.monotonic() < end:
             records = list(home.glob("tasks/*/task.json"))

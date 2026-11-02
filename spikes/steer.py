@@ -13,11 +13,11 @@ from probe import (claude_stream, forget_sessions, claude_user, codex_app_server
 
 RUNS = 6
 TASK = (
-    f'Run this shell command {RUNS} times, strictly one tool call at a time, waiting for each to '
-    'finish before starting the next: python -c "import time; time.sleep(12)"\n'
+    f'Run this shell command {RUNS} times, one tool call at a time, waiting for each to '
+    'finish: python -c "import time; time.sleep(12)"\n'
     "After each run write one short line `run N done`.\n"
-    "Messages from me may arrive while you work. Whenever you see one, put its exact token "
-    "(like TOKEN-XXXX) in your very next line of text, then continue the runs.\n"
+    "When you receive a message from me, put its exact token "
+    "in your very next line of text, then continue the runs.\n"
     f"After all {RUNS} runs, end with `ALL DONE` followed by every token you received, in arrival order."
 )
 SCHEDULE = [(6, "TOKEN-A1"), (20, "TOKEN-B2"), (34, "TOKEN-C3"), (34.5, "TOKEN-D4"), (60, "TOKEN-E5")]
@@ -139,7 +139,7 @@ def main(kind):
             while pending and pending[0][0] <= now:
                 _, tok = pending.pop(0)
                 sent[tok] = now
-                log(f"steer {tok}:", agent.steer(f"Message from the user: {tok}"))
+                log(f"steer {tok}:", agent.steer(tok))
             for tok in sent:
                 if tok not in seen and tok in agent.text:
                     seen[tok] = time.monotonic() - t0
@@ -150,7 +150,7 @@ def main(kind):
         # Race: steer right after the turn ended.
         agent.turn_done.clear()
         sent[LATE] = time.monotonic() - t0
-        log(f"late steer {LATE}:", agent.steer(f"Message from the user: {LATE}"))
+        log(f"late steer {LATE}:", agent.steer(LATE))
         agent.turn_done.wait(90)
         time.sleep(1)
         for tok in sent:

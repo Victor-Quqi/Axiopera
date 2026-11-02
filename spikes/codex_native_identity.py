@@ -97,14 +97,14 @@ def run_case(root, nested):
                     PATH=f"{AXIOPERA.parent}{os.pathsep}{os.environ['PATH']}")
     env.pop("AXIOPERA_TASK_ID", None)
     prompt = (
-        "Test native subagent identity. Run `python capture.py parent` in this working directory. "
+        "Run `python capture.py parent` in this working directory. "
         "Then use your native spawn_agent tool to start exactly one child in this same directory. "
-        "The child's entire task is: run `python capture.py child`, wait until it exits and prints "
+        "The child's task is: run `python capture.py child`, wait until it exits and prints "
         "'Live inbox checked.', then report completion. "
-        "Wait for the child to finish, then reply DONE. This explicitly authorizes native delegation. "
+        "Wait for the child to finish, then report completion. "
         "If the helper fails, report the error and stop; do not edit it. "
         "The helper captures identity and dispatches a one-message Axiopera probe; do not print environment variables, read agent "
-        "configuration, or alter identity variables. Use native subagent tools for delegation."
+        "configuration, or alter identity variables."
     )
     rpc = None
     try:

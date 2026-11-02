@@ -41,7 +41,7 @@ def read_heartbeat(path):
 
 def launch(kind, cwd):
     hb = cwd / "heartbeat.txt"
-    prompt = f'Run exactly this shell command once and report its output: "{WINPROC}" launch "{hb}" 40'
+    prompt = f'Run exactly this shell command once: "{WINPROC}" launch "{hb}" 40'
     t = time.monotonic()
     p = subprocess.run(host_argv(kind, prompt), cwd=cwd, env=clean_env(), capture_output=True, timeout=300,
                        stdin=subprocess.DEVNULL)

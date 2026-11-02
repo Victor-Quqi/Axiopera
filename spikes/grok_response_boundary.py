@@ -28,7 +28,7 @@ def main():
             "sessionId": sid,
             "prompt": [{"type": "text", "text": (
                 "Do not use any tools. Output exactly 60 lines, numbered 1 to 60. "
-                "Each line must be: N. FIRST-ANSWER. No introduction or conclusion."
+                "Each line must be: N. FIRST-ANSWER."
             )}],
         })
         log("prompt submitted")
@@ -59,7 +59,7 @@ def main():
                     if text and not injected:
                         interjection = rpc.call_async("_x.ai/interject", {
                             "sessionId": sid, "interjectionId": str(uuid.uuid4()),
-                            "text": "Replace the requested list with exactly SECOND-ANSWER. Do not use tools.",
+                            "text": "Replace the requested list with exactly SECOND-ANSWER.",
                         })
                         injected = True
                         log("interjected after first text chunk")
