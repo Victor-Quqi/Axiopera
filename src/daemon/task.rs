@@ -1185,7 +1185,7 @@ mod request_tests {
         tx.send(Cmd::Mail(text.into())).unwrap();
     }
 
-    fn assert_reaped(dir: &Path) {
+    async fn assert_reaped(dir: &Path) {
         let pid: u32 = std::fs::read_to_string(dir.join("pid"))
             .unwrap()
             .parse()
@@ -1205,11 +1205,14 @@ mod request_tests {
             }
         }
         #[cfg(unix)]
-        assert_eq!(
-            unsafe { libc::kill(pid as i32, 0) },
-            -1,
-            "fake peer is still running"
-        );
+        // Dropping a backend during its handshake lets Tokio reap the killed child asynchronously.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while unsafe { libc::kill(pid as i32, 0) } == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fake peer was not reaped");
     }
 
     #[tokio::test]
@@ -1308,7 +1311,7 @@ mod request_tests {
                     Fingerprint::of(&dir.join("session.jsonl"))
                 );
             }
-            assert_reaped(&dir);
+            assert_reaped(&dir).await;
         }
     }
 
@@ -1356,7 +1359,7 @@ mod request_tests {
         backend.shutdown().await;
         let requests = std::fs::read_to_string(directory(&f).join("requests")).unwrap();
         assert_eq!(requests.matches("unread-mail").count(), 1);
-        assert_reaped(&directory(&f));
+        assert_reaped(&directory(&f)).await;
     }
 
     #[tokio::test]
@@ -1420,6 +1423,6 @@ mod request_tests {
             ]
         );
         assert!(f.d.lock().tasks["test"].task.pending_inputs.is_empty());
-        assert_reaped(&dir);
+        assert_reaped(&dir).await;
     }
 }

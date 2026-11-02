@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context;
 use tokio::time::Instant;
 
 use serde_json::Value;
@@ -255,15 +256,11 @@ impl Daemon {
         let Some(pending) = pending else {
             return Ok(());
         };
-        let found =
-            tokio::time::timeout(PROBE, remote.contains_message(thread, &pending.marker)).await;
-        let delivered = match found {
-            Ok(Ok(found)) => found,
-            other => {
-                self.log(&format!("{caller} push read-back failed ({other:?}); treating the written batch as delivered"));
-                true
-            }
-        };
+        let delivered =
+            tokio::time::timeout(PROBE, remote.contains_message(thread, &pending.marker))
+                .await
+                .context("push read-back timed out; retry later")?
+                .context("push read-back failed; retry later")?;
         self.settle_push(caller, pending, delivered)
     }
 
@@ -320,30 +317,24 @@ impl Daemon {
     }
 
     pub(super) async fn reconcile_before_take(&self, caller: &str) -> anyhow::Result<()> {
-        let pair = {
+        let host = {
             let st = self.lock();
             st.ledger
                 .pending_pushes
                 .get(caller)
+                .and_then(|_| st.ledger.codex_hosts.get(caller))
                 .cloned()
-                .zip(st.ledger.codex_hosts.get(caller).cloned())
         };
-        if let Some((pending, host)) = pair {
-            match tokio::time::timeout(
+        if let Some(host) = host {
+            let mut remote = tokio::time::timeout(
                 PROBE,
                 Remote::connect(&host.exe, host.codex_home.as_deref()),
             )
             .await
-            {
-                Ok(Ok(mut remote)) => {
-                    self.reconcile_push(caller, &host.thread, &mut remote)
-                        .await?
-                }
-                _ => {
-                    self.log(&format!("{caller} push read-back unavailable; treating the written batch as delivered"));
-                    self.settle_push(caller, pending, true)?;
-                }
-            }
+            .context("push read-back connection timed out; retry later")?
+            .context("push read-back connection failed; retry later")?;
+            self.reconcile_push(caller, &host.thread, &mut remote)
+                .await?;
         }
         Ok(())
     }
@@ -881,6 +872,74 @@ mod capability_cache_tests {
         host
     }
 
+    #[tokio::test]
+    async fn inbox_keeps_an_unconfirmed_batch_when_read_back_is_unavailable() {
+        let f = crate::daemon::tests::fixture();
+        registered_host(&f, false);
+        f.d.store
+            .save_turn("test", 1, "undelivered result")
+            .unwrap();
+        f.d.try_update("test", |t| t.turns = 1).unwrap();
+        f.d.try_emit(
+            "test",
+            "turn_ended",
+            serde_json::json!({"turn": 1, "ok": true}),
+        )
+        .unwrap();
+        {
+            let mut st = f.d.lock();
+            let seq = st.seq;
+            st.ledger.pending_pushes.insert(
+                "codex:host".into(),
+                PendingPush {
+                    marker: "saved-before-send".into(),
+                    events: vec![("test".into(), seq)],
+                    turns: vec![("test".into(), 1)],
+                    approvals: vec![],
+                },
+            );
+            st.ledger.save(&f.d.opts.home).unwrap();
+        }
+        let before = std::fs::read(f.d.opts.home.join("ledger.json")).unwrap();
+        let restored = Arc::new(
+            Daemon::load(super::super::options(f.d.opts.home.clone()).unwrap(), None).unwrap(),
+        );
+        let mut output = Vec::new();
+        for _ in 0..2 {
+            let error = restored
+                .inbox("codex:host", &[], &mut super::super::Out::new(&mut output))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("retry later"));
+            assert!(output.is_empty());
+            let st = restored.lock();
+            assert_eq!(st.tasks["test"].task.delivered, 0);
+            assert!(st.ledger.cursors.is_empty());
+            assert_eq!(
+                st.ledger.pending_pushes["codex:host"].marker,
+                "saved-before-send"
+            );
+            assert_eq!(restored.unseen(&st, "codex:host", &[]).len(), 1);
+        }
+        assert_eq!(
+            std::fs::read(f.d.opts.home.join("ledger.json")).unwrap(),
+            before
+        );
+        // A successful retry that finds no receipt makes the original result available.
+        let pending = restored.lock().ledger.pending_pushes["codex:host"].clone();
+        restored.settle_push("codex:host", pending, false).unwrap();
+        restored
+            .inbox("codex:host", &[], &mut super::super::Out::new(&mut output))
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8(output)
+                .unwrap()
+                .contains("undelivered result")
+        );
+        assert_eq!(restored.lock().tasks["test"].task.delivered, 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn invalidated_pushes_probe_again_and_persist_either_route() {
         for doorbell in [false, true] {
@@ -974,11 +1033,10 @@ mod capability_cache_tests {
         assert!(outcome.is_err());
         let ledger = crate::store::Ledger::load(&f.d.opts.home).unwrap();
         assert!(ledger.codex_hosts["codex:host"].doorbell);
-        // Unavailable read-back follows the existing assumption that a written batch arrived.
-        assert!(ledger.pending_pushes.is_empty());
-        assert_eq!(ledger.cursors["codex:host|test"], 1);
+        assert!(ledger.pending_pushes.contains_key("codex:host"));
+        assert!(ledger.cursors.is_empty());
         assert_eq!(ledger.doorbells["codex:host"], "existing-reminder");
-        assert_eq!(f.d.lock().tasks["test"].task.delivered, 1);
+        assert_eq!(f.d.lock().tasks["test"].task.delivered, 0);
     }
 
     #[tokio::test]
