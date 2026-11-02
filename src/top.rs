@@ -1637,10 +1637,13 @@ impl Tail {
                 self.in_turn = false;
                 self.ended_ms = e.ts;
                 self.ended_turns.extend(turn());
-                // Its last message, if said in it, is its result.
+                // Its last message, if said in it, is its result. One that is already a result
+                // was said in a turn before, in the same millisecond as this began.
                 let since = self.started_ms;
                 let last = self.log.iter_mut().rev().take_while(|l| l.at >= since);
-                if let Some(What::Said { turn: of, .. }) = last
+                if let Some(What::Said {
+                    turn: of @ None, ..
+                }) = last
                     .map(|l| &mut l.what)
                     .find(|w| matches!(w, What::Said { .. }))
                 {
@@ -2783,6 +2786,54 @@ mod tests {
                 "",
                 "› Skip the fixtures.",
             ],
+            "{frame:#?}"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_says_nothing_has_no_result_of_the_one_before() {
+        let h = home();
+        let store = Store::new(&h.0);
+        let mut t1 = task("t1", "claude:s1", "idle", NOW - 600_000, json!({}));
+        t1.turns = 3;
+        store.save(&t1).unwrap();
+        store.save_turn("t1", 1, "Done.\nFully.").unwrap();
+        store.save_turn("t1", 3, "").unwrap();
+        // Turn 2, unreported, and turn 3 end without a word, in the same millisecond as turn 1.
+        for e in [
+            event(0, 60_000, "t1", "turn_started", json!({"turn": 1})),
+            event(1, 50_000, "t1", "said", json!({"text": "Done."})),
+            event(
+                2,
+                50_000,
+                "t1",
+                "turn_ended",
+                json!({"turn": 1, "ok": true}),
+            ),
+            event(
+                3,
+                50_000,
+                "t1",
+                "turn_ended",
+                json!({"turn": 2, "ok": false}),
+            ),
+            event(4, 50_000, "t1", "turn_started", json!({"turn": 3})),
+            event(
+                5,
+                40_000,
+                "t1",
+                "turn_ended",
+                json!({"turn": 3, "ok": true}),
+            ),
+        ] {
+            store.append(&e).unwrap();
+        }
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let frame = view.task_frame("t1", NOW, None, false);
+        assert_eq!(
+            frame[2..],
+            ["• Done.", "  Fully.", "", "── turn 3, 50s ago"],
             "{frame:#?}"
         );
     }
