@@ -66,7 +66,7 @@ enum Command {
         /// A short name to refer to the task by.
         #[arg(long)]
         name: Option<String>,
-        /// Cancel the task after this long, e.g. 30m.
+        /// Interrupt each execution after this long, e.g. 30m; send resumes with a fresh limit.
         #[arg(long, value_parser = parse_duration)]
         timeout: Option<Duration>,
     },

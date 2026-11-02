@@ -50,7 +50,7 @@ stall_minutes = 10
 approval_timeout_minutes = 2
 ```
 
-`concurrency` 是同时运行的顶层任务上限，所有会话共用，嵌套任务不计入。它用于防止失控派发：达到上限时新的 `spawn` 直接报错，不排队；已有任务经 `send` 或 `reply` 开始的新一轮不受限制。持续没有事件达到 `stall_minutes` 时，任务标为 stalled 并通知调用方；任务继续运行。`spawn --timeout` 才会在到期时取消任务。
+`concurrency` 是同时运行的顶层任务上限，所有会话共用，嵌套任务不计入。它用于防止失控派发：达到上限时新的 `spawn` 直接报错，不排队；已有任务经 `send` 或 `reply` 开始的新一轮不受限制。持续没有事件达到 `stall_minutes` 时，任务标为 stalled 并通知调用方；任务继续运行。`spawn --timeout` 在每次启动执行达到时限后中断任务及仍在执行的子任务，状态为 `interrupted`；用 `send` 在原生会话中续接，新一次执行重新计时。手动 `cancel` 的任务保持不可续接。
 
 每个 backend 可以设置默认模型和可执行文件路径。例如：
 
