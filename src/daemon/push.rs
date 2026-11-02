@@ -280,7 +280,7 @@ impl Daemon {
                     let mut task = entry.task.clone();
                     task.delivered = task.delivered.max(turn);
                     task.updated_ms = crate::store::now_ms();
-                    self.store.save_durable(&task)?;
+                    self.store.save(&task)?;
                     entry.task = task;
                 }
             }

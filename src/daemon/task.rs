@@ -196,7 +196,7 @@ fn finish_exit(d: &Daemon, id: &str, exit: Exit) -> Result<()> {
     })();
     if let Some(entry) = d.lock().tasks.get_mut(id) {
         // Final state and queue cleanup must precede accepting input for a new process.
-        // Restore unread durable mail before this actor drops its receiver.
+        // Restore unread saved mail before this actor drops its receiver.
         entry.releasing = true;
         entry.mail = entry.task.pending_mail.clone();
     }
@@ -591,7 +591,7 @@ async fn start_turn(d: &Daemon, id: &str, backend: &mut Backend, inputs: &[Strin
     Ok(())
 }
 
-// Backend admission and this durable removal cannot be atomic: a crash between them replays input.
+// Backend admission and saving this removal cannot be atomic: a crash between them replays input.
 fn delivered(d: &Daemon, id: &str, inputs: &[String], mail: &[String]) -> Result<()> {
     d.try_update(id, |task| {
         for (queue, sent) in [
@@ -1281,7 +1281,7 @@ mod request_tests {
             if let Some(confirmation) = confirmation {
                 assert!(confirmation.await.is_err());
             }
-            // During startup the existing loop acknowledges durable queueing, never admission.
+            // During startup the existing loop acknowledges saved queueing, never admission.
             if hang == "initialize" {
                 assert_eq!(later.await.unwrap(), "queued for a new turn");
             } else {

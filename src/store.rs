@@ -168,7 +168,7 @@ impl Store {
     pub fn save_prompt(&self, id: &str, text: &str) -> Result<()> {
         let dir = self.dir(id);
         fs::create_dir_all(&dir)?;
-        write_synced(&self.prompt_path(id), text.as_bytes())?;
+        fs::write(self.prompt_path(id), text)?;
         Ok(())
     }
 
@@ -177,23 +177,11 @@ impl Store {
     }
 
     pub fn save(&self, task: &Task) -> Result<()> {
-        self.save_task(task, false)
-    }
-
-    pub fn save_durable(&self, task: &Task) -> Result<()> {
-        self.save_task(task, true)
-    }
-
-    fn save_task(&self, task: &Task, durable: bool) -> Result<()> {
         let dir = self.dir(&task.id);
         fs::create_dir_all(dir.join("turns"))?;
         let tmp = dir.join("task.json.tmp");
         let bytes = serde_json::to_vec_pretty(task)?;
-        if durable {
-            write_synced(&tmp, &bytes)?;
-        } else {
-            fs::write(&tmp, bytes)?;
-        }
+        fs::write(&tmp, bytes)?;
         fs::rename(tmp, dir.join("task.json"))?;
         Ok(())
     }
@@ -208,14 +196,6 @@ impl Store {
         let mut line = serde_json::to_vec(event)?;
         line.push(b'\n');
         f.write_all(&line)?;
-        if deliverable(&event.kind)
-            || matches!(
-                event.kind.as_str(),
-                "turn_started" | "steered" | "spawned" | "answered" | "approved" | "denied"
-            )
-        {
-            f.sync_data()?;
-        }
         Ok(())
     }
 
@@ -238,14 +218,14 @@ impl Store {
     pub fn save_message(&self, id: &str, seq: u64, text: &str) -> Result<()> {
         let path = self.message_path(id, seq);
         fs::create_dir_all(self.dir(id).join("messages"))?;
-        write_synced(&path, text.as_bytes())?;
+        fs::write(&path, text)?;
         Ok(())
     }
 
     pub fn save_turn(&self, id: &str, turn: u32, text: &str) -> Result<PathBuf> {
         let path = self.turn_path(id, turn);
         let tmp = path.with_extension("md.tmp");
-        write_synced(&tmp, text.as_bytes())?;
+        fs::write(&tmp, text)?;
         fs::rename(tmp, &path)?;
         Ok(path)
     }
@@ -302,13 +282,12 @@ impl Store {
             let backup = self
                 .dir(id)
                 .join(format!("events.tail-{}", uuid::Uuid::new_v4()));
-            write_synced(&backup, &tail)?;
+            fs::write(&backup, &tail)?;
             OpenOptions::new()
                 .write(true)
                 .open(self.events_path(id))?
                 .set_len(start)?;
         }
-        f.sync_data()?;
         Ok(())
     }
 
@@ -478,17 +457,10 @@ impl Ledger {
 
     pub fn save(&self, home: &Path) -> Result<()> {
         let tmp = home.join("ledger.json.tmp");
-        write_synced(&tmp, &serde_json::to_vec(self)?)?;
+        fs::write(&tmp, serde_json::to_vec(self)?)?;
         fs::rename(tmp, home.join("ledger.json"))?;
         Ok(())
     }
-}
-
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut f = fs::File::create(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    Ok(())
 }
 
 /// Short random ID: a prefix letter (`t` task, `q` question) and base32 characters.

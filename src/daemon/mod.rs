@@ -276,7 +276,7 @@ impl Daemon {
             {
                 let previous_fingerprint = task.session_file.take();
                 task.status = Status::Interrupted;
-                if let Err(e) = store.save_durable(&task) {
+                if let Err(e) = store.save(&task) {
                     errors.push(format!("recovering timed out task {}: {e:#}", task.id));
                     task.status = Status::Cancelled;
                     task.session_file = previous_fingerprint;
@@ -521,16 +521,12 @@ impl Daemon {
     /// Change a task and persist it.
     #[cfg(test)]
     pub fn update(&self, id: &str, f: impl FnOnce(&mut Task)) {
-        if let Err(e) = self.update_task(id, f, false) {
+        if let Err(e) = self.try_update(id, f) {
             self.log(&format!("saving {id}: {e:#}"));
         }
     }
 
     fn try_update(&self, id: &str, f: impl FnOnce(&mut Task)) -> Result<()> {
-        self.update_task(id, f, true)
-    }
-
-    fn update_task(&self, id: &str, f: impl FnOnce(&mut Task), durable: bool) -> Result<()> {
         let mut st = self.lock();
         let Some(entry) = st.tasks.get_mut(id) else {
             return Err(anyhow!("no task {id}"));
@@ -539,11 +535,7 @@ impl Daemon {
         f(&mut task);
         task.updated_ms = store::now_ms();
         // Saved under the lock, so concurrent updates reach the disk in order.
-        if durable {
-            self.store.save_durable(&task)?;
-        } else {
-            self.store.save(&task)?;
-        }
+        self.store.save(&task)?;
         entry.task = task;
         Ok(())
     }
@@ -1023,7 +1015,7 @@ impl Daemon {
             updated_ms: now,
         };
         self.store.save_prompt(&id, &s.task)?;
-        self.store.save_durable(&task)?;
+        self.store.save(&task)?;
         {
             let mut st = self.lock();
             // Again under the lock that adds the task, so spawns at once cannot pass it together.
@@ -1303,7 +1295,7 @@ impl Daemon {
             // Claim the answer and persist accepted input in the same snapshot.
             task.pending_inputs.push(input.text.clone());
             task.updated_ms = store::now_ms();
-            self.store.save_durable(&task)?;
+            self.store.save(&task)?;
             if entry.actor.is_none()
                 || (entry.releasing && entry.task.status == Status::Interrupted)
             {
@@ -1507,7 +1499,7 @@ impl Daemon {
             let mut task = entry.task.clone();
             task.pending_mail.push(message.clone());
             task.updated_ms = store::now_ms();
-            self.store.save_durable(&task)?;
+            self.store.save(&task)?;
             entry.task = task;
             if let (Some(actor), false) = (&entry.actor, entry.releasing) {
                 match actor.send(Cmd::Mail(message)) {
@@ -1569,7 +1561,7 @@ impl Daemon {
             let mut task = entry.task.clone();
             task.detached = true;
             task.updated_ms = store::now_ms();
-            self.store.save_durable(&task)?;
+            self.store.save(&task)?;
             entry.task = task;
             entry.pending.clear();
             entry.mail.clear();
@@ -1767,9 +1759,7 @@ impl Daemon {
         }
         let file = self.store.text_path(task, kind, name);
         std::fs::create_dir_all(file.parent().unwrap())?;
-        let mut saved = File::create(&file)?;
-        saved.write_all(text.as_bytes())?;
-        saved.sync_all()?;
+        std::fs::write(&file, text)?;
         data["file"] = json!(file);
         Ok(())
     }
@@ -1881,7 +1871,7 @@ impl Daemon {
                 Status::Cancelled
             };
             task.updated_ms = store::now_ms();
-            self.store.save_durable(&task)?;
+            self.store.save(&task)?;
             entry.task = task;
             entry.pending.clear();
             // An actor letting go of its process no longer reads commands.
@@ -2385,7 +2375,7 @@ impl Daemon {
                 let mut task = entry.task.clone();
                 task.delivered = task.delivered.max(*turn);
                 task.updated_ms = store::now_ms();
-                self.store.save_durable(&task)?;
+                self.store.save(&task)?;
                 entry.task = task;
             }
         }

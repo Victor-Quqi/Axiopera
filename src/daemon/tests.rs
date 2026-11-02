@@ -1758,20 +1758,3 @@ fn transient_task_or_event_read_failure_preserves_cursors_for_retry() {
         assert_eq!(again.lock().seq, events[0].seq);
     }
 }
-
-#[test]
-#[ignore = "local disk timing, no agent processes"]
-fn event_flush_cost() {
-    let f = fixture();
-    for kind in ["tool", "failed"] {
-        let start = Instant::now();
-        for _ in 0..1000 {
-            f.d.try_emit("test", kind, json!({})).unwrap();
-        }
-        eprintln!("1000 {kind} events: {:?}", start.elapsed());
-    }
-    let start = Instant::now();
-    let mut count = 0;
-    f.d.store.recover_events("test", |_| count += 1).unwrap();
-    eprintln!("streamed {count} events: {:?}", start.elapsed());
-}
