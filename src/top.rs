@@ -612,17 +612,6 @@ impl View {
                 },
             )
             .collect();
-        // The projects a session's tasks work in, in the order they were spawned.
-        let mut projects: HashMap<&str, Vec<&str>> = HashMap::new();
-        for (caller, roots) in &groups {
-            let names = projects.entry(caller).or_default();
-            for t in roots {
-                let name = self.projects.get(&t.cwd).and_then(Option::as_deref);
-                if let Some(name) = name.filter(|n| !names.contains(n)) {
-                    names.push(name);
-                }
-            }
-        }
         // Lines in order: `None` for a session's, else the task with its depth.
         let mut order: Vec<(&str, Option<(usize, &Task)>)> = Vec::new();
         for (caller, roots) in &groups {
@@ -633,6 +622,15 @@ impl View {
                 if let Some(kids) = children.get(t.id.as_str()) {
                     stack.extend(kids.iter().rev().map(|k| (depth + 1, *k)));
                 }
+            }
+        }
+        // The projects its listed tasks work in, sub-tasks' too, in the order they are listed.
+        let mut projects: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (caller, row) in &order {
+            let names = projects.entry(caller).or_default();
+            let name = row.and_then(|(_, t)| self.projects.get(&t.cwd)?.as_deref());
+            if let Some(name) = name.filter(|n| !names.contains(n)) {
+                names.push(name);
             }
         }
         let several = groups.len() > 1;
@@ -752,11 +750,10 @@ impl View {
 
         // What it was given first, then what its agent said and did, in that order.
         let mut blocks: Vec<(u64, Block)> = Vec::new();
-        match &tail.prompt {
-            Some(text) => blocks.push((
-                0,
-                Block::task(text.shown(), Some(self.store.prompt_path(id))),
-            )),
+        let prompt = || Some((tail.prompt.as_ref()?, self.store.prompt_path(id)));
+        let first = tail.first.as_ref().map(|(t, f)| (t, f.clone()));
+        match first.or_else(prompt) {
+            Some((text, file)) => blocks.push((0, Block::task(text.shown(), Some(file)))),
             None if tail.log.is_empty() => blocks.push((
                 0,
                 Block::task(
@@ -795,7 +792,7 @@ impl View {
                     "── turn {n}, {} ago",
                     age(now.saturating_sub(l.at))
                 )),
-                What::Given { text, file } => Block::task(text.shown(), Some(file.clone())),
+                What::Given { text, file, .. } => Block::task(text.shown(), Some(file.clone())),
             };
             blocks.push((l.at, block));
         }
@@ -1549,6 +1546,9 @@ struct Tail {
     stop: Option<(&'static str, String)>,
     /// `prompt.md`, read once.
     prompt: Option<Text>,
+    /// The message that began the first turn, and its file: the task text, with what was
+    /// given before the turn began.
+    first: Option<(Text, PathBuf)>,
     /// Results by turn: the latest, and those of the turns whose last messages are kept; and
     /// whether each is whole, read after its turn ended.
     results: BTreeMap<u32, (Text, bool)>,
@@ -1569,6 +1569,7 @@ impl Tail {
             approvals: Vec::new(),
             stop: None,
             prompt: None,
+            first: None,
             results: BTreeMap::new(),
             ended_turns: BTreeSet::new(),
         }
@@ -1602,13 +1603,31 @@ impl Tail {
                 self.start(e.ts);
                 self.approvals.clear();
                 self.stop = None;
-                // The first turn's message is the task text, shown first.
-                if let Some(n) = turn().filter(|n| *n > 1) {
-                    self.log(e.ts, What::Turn(n));
-                    self.given(e.ts, message);
+                match turn() {
+                    Some(1) => self.first = message().filter(|(t, _)| !t.lines.is_empty()),
+                    Some(n) => {
+                        // Messages sent while no turn ran, as for an agent still at work in the
+                        // background, are what it began this turn with.
+                        let (queued, log) = std::mem::take(&mut self.log)
+                            .into_iter()
+                            .partition(|l| matches!(l.what, What::Given { queued: true, .. }));
+                        self.log = log;
+                        self.log(e.ts, What::Turn(n));
+                        for l in queued {
+                            if let What::Given { text, file, .. } = l.what {
+                                let queued = false;
+                                self.log(e.ts, What::Given { text, file, queued });
+                            }
+                        }
+                        self.given(e.ts, false, message);
+                    }
+                    None => {}
                 }
             }
-            "steered" => self.given(e.ts, message),
+            "steered" => {
+                let queued = e.data.get("queued") == Some(&Value::Bool(true));
+                self.given(e.ts, queued, message);
+            }
             "turn_ended" => {
                 self.in_turn = false;
                 self.ended_ms = e.ts;
@@ -1664,9 +1683,9 @@ impl Tail {
 
     /// A message given to the agent, unless it is not kept: given before the daemon kept
     /// them.
-    fn given(&mut self, at: u64, message: impl FnOnce() -> Option<(Text, PathBuf)>) {
+    fn given(&mut self, at: u64, queued: bool, message: impl FnOnce() -> Option<(Text, PathBuf)>) {
         if let Some((text, file)) = message().filter(|(t, _)| !t.lines.is_empty()) {
-            self.log(at, What::Given { text, file });
+            self.log(at, What::Given { text, file, queued });
         }
     }
 
@@ -1692,9 +1711,14 @@ enum What {
     Tool { name: String, detail: String },
     /// The start of a turn after the first.
     Turn(u32),
-    /// A message given to the agent after its task text: one that began a turn, or one sent
-    /// into a turn. `file` has all of it.
-    Given { text: Text, file: PathBuf },
+    /// A message given to the agent after its first turn began: one that began a turn, or one
+    /// sent into a turn. `file` has all of it. `queued` while it waits for a turn to begin
+    /// with, having been sent while none ran.
+    Given {
+        text: Text,
+        file: PathBuf,
+        queued: bool,
+    },
 }
 
 /// One line from its pieces. Given a width, it is cut to fit and colored, and a line whose
@@ -2618,20 +2642,29 @@ mod tests {
             NOW - 600_000,
             json!({"name": "review"}),
         );
-        t1.turns = 2;
+        t1.turns = 3;
         store.save_prompt("t1", "Review the parser.").unwrap();
         store.save(&t1).unwrap();
-        // Turn 2 began before the daemon kept messages; turn 3 after, and one was sent into it.
-        store
-            .save_message(
-                "t1",
-                6,
-                "Now the writer.
-And its tests.",
-            )
-            .unwrap();
-        store.save_message("t1", 8, "Skip the fixtures.").unwrap();
+        // More was given before the first turn began. Turn 2 began before the daemon kept
+        // messages. Turn 3 the agent began with a message sent while it was at work in the
+        // background, and turn 4 with one of its own, and one was sent into it.
+        let given = [
+            (0, "Review the parser.\n\nAlso the lexer."),
+            (6, "Check the writer too."),
+            (10, "Now the tests.\nAll of them."),
+            (12, "Skip the fixtures."),
+        ];
+        for (seq, text) in given {
+            store.save_message("t1", seq, text).unwrap();
+        }
         for e in [
+            event(
+                0,
+                95_000,
+                "t1",
+                "turn_started",
+                json!({"turn": 1, "chars": 36}),
+            ),
             event(1, 90_000, "t1", "said", json!({"text": "Read it."})),
             event(
                 2,
@@ -2649,21 +2682,31 @@ And its tests.",
                 "turn_ended",
                 json!({"turn": 2, "ok": true}),
             ),
+            event(6, 45_000, "t1", "steered", json!({"queued": true})),
+            event(7, 40_000, "t1", "turn_started", json!({"turn": 3})),
+            event(8, 35_000, "t1", "said", json!({"text": "Writer checked."})),
             event(
-                6,
+                9,
+                35_000,
+                "t1",
+                "turn_ended",
+                json!({"turn": 3, "ok": true}),
+            ),
+            event(
+                10,
                 30_000,
                 "t1",
                 "turn_started",
-                json!({"turn": 3, "chars": 29}),
+                json!({"turn": 4, "chars": 28}),
             ),
             event(
-                7,
+                11,
                 20_000,
                 "t1",
                 "tool",
                 json!({"name": "Read", "detail": "src/w.rs"}),
             ),
-            event(8, 10_000, "t1", "steered", json!({"queued": false})),
+            event(12, 10_000, "t1", "steered", json!({"queued": false})),
         ] {
             store.append(&e).unwrap();
         }
@@ -2675,16 +2718,24 @@ And its tests.",
             [
                 "› Review the parser.",
                 "",
+                "  Also the lexer.",
+                "",
                 "• Read it.",
                 "",
                 "── turn 2, 55s ago",
                 "",
                 "• Read it again.",
                 "",
-                "── turn 3, 30s ago",
+                "── turn 3, 40s ago",
                 "",
-                "› Now the writer.",
-                "  And its tests.",
+                "› Check the writer too.",
+                "",
+                "• Writer checked.",
+                "",
+                "── turn 4, 30s ago",
+                "",
+                "› Now the tests.",
+                "  All of them.",
                 "  └ Read src/w.rs",
                 "",
                 "› Skip the fixtures.",
@@ -2702,36 +2753,24 @@ And its tests.",
             std::fs::create_dir_all(&dir).unwrap();
             dir
         };
-        // A repository, its worktree, and a worktree of a bare repository.
+        let worktree_of = |dir: &Path, gitdir: &Path| {
+            let text = format!("gitdir: {}\n", gitdir.display());
+            std::fs::write(dir.join(".git"), text).unwrap();
+        };
+        // Repositories, a worktree of one, and a worktree of a bare repository.
         let src = dir("Axiopera/src");
-        dir("Axiopera/.git/worktrees/x");
         let worktree = dir("wt/x");
-        let gitdir = h.0.join("Axiopera/.git/worktrees/x");
-        std::fs::write(
-            worktree.join(".git"),
-            format!(
-                "gitdir: {}
-",
-                gitdir.display()
-            ),
-        )
-        .unwrap();
+        worktree_of(&worktree, &dir("Axiopera/.git/worktrees/x"));
+        let third = dir("Third");
+        dir("Third/.git");
         let other = dir("Other");
         dir("Other/.git");
         let bare = dir("wt/y");
-        let gitdir = dir("Bare.git/worktrees/y");
-        std::fs::write(
-            bare.join(".git"),
-            format!(
-                "gitdir: {}
-",
-                gitdir.display()
-            ),
-        )
-        .unwrap();
+        worktree_of(&bare, &dir("Bare.git/worktrees/y"));
         for (id, caller, cwd) in [
             ("a1", "codex:a", &src),
             ("a2", "codex:a", &worktree),
+            ("a3", "task:a1", &third),
             ("b1", "codex:b", &other),
             ("b2", "codex:b", &bare),
         ] {
@@ -2740,26 +2779,13 @@ And its tests.",
         }
         let mut view = View::new(&h.0, false);
         view.refresh();
-        let text = view.frame(NOW, None, None).join(
-            "
-",
-        );
+        let text = view.frame(NOW, None, None).join("\n");
+        // A sub-task's project too, in the order the tasks are listed.
         assert!(
-            text.contains(
-                "
-Axiopera · codex session a
-"
-            ),
+            text.contains("\nAxiopera, Third · codex session a\n"),
             "{text}"
         );
-        assert!(
-            text.contains(
-                "
-Other, Bare · codex session b
-"
-            ),
-            "{text}"
-        );
+        assert!(text.contains("\nOther, Bare · codex session b\n"), "{text}");
     }
 
     #[test]
