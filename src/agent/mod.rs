@@ -92,7 +92,11 @@ fn ask_approval(
         detail,
         reply,
     }));
-    async move { rx.await.unwrap_or_else(|_| Decision::Deny(REFUSED.into())) }
+    async move {
+        rx.await.unwrap_or_else(|_| {
+            Decision::Deny("Refused by axiopera: the approval channel closed.".into())
+        })
+    }
 }
 
 /// Environment an agent needs on top of its caller's.
@@ -162,14 +166,13 @@ fn protocol_text(spec: &StartSpec) -> String {
         "run `axiopera ask \"<question>\"`"
     };
     format!(
-        "You are a sub-agent started through axiopera (task {}) by another coding agent, your \
-         parent. Your final message of each turn is returned to the parent verbatim, so make it \
-         a complete, self-contained report of what you did and found.\n\
+        "You are an axiopera sub-agent working for a parent. The parent receives your final \
+         message from each turn. Include the outcome and the context it needs to act. Long \
+         results may first arrive as a tail excerpt with a path to the full text.\n\
          If you need a decision or information that only your parent has, {ask} and keep \
-         working on everything that does not depend on the answer; do not wait or poll for it. \
-         The answer arrives as a new message, during this turn or in a new one. If nothing is \
-         left to do without it, end your turn and say what you are waiting for.",
-        spec.task_id
+         working on what does not depend on the answer; do not wait or poll for it. Answers \
+         arrive in this task's main session, during its current turn or in a new one. If \
+         blocked on the answer, end your turn and state the dependency."
     )
 }
 
@@ -218,10 +221,7 @@ pub fn is_axiopera_command(command: &str) -> bool {
     quote.is_none() && !rest.contains(['\n', '\r'])
 }
 
-pub const REFUSED: &str = "Refused by axiopera: your permission tier does not allow this action without \
-                       approval, and nobody can approve it. Continue without it, or explain in your \
-                       final report why it is needed. Plain `axiopera` commands, such as \
-                       `axiopera ask`, are always allowed.";
+pub const REFUSED: &str = "Refused by axiopera: read tier does not allow this action.";
 
 pub enum Backend {
     Claude(claude::Claude),

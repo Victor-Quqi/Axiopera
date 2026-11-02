@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use super::rpc::{Incoming, Rpc};
-use super::{AgentEvent, Decision, Events, Proc, REFUSED, StartSpec, Steer, clip, protocol_text};
+use super::{AgentEvent, Decision, Events, Proc, StartSpec, Steer, clip, protocol_text};
 use crate::ipc::Tier;
 
 /// Grok imports Claude Code's MCP servers, hooks, skills, rules and agents unless told not to.
@@ -104,7 +104,7 @@ impl Grok {
                 "autoMode": false,
                 "agentProfile": {
                     "name": "axiopera-read",
-                    "description": "Read-only sub-agent started by axiopera.",
+                    "description": "Read-only sub-agent.",
                     "disallowedTools": READ_TIER_DISALLOWED,
                 },
             }),
@@ -280,7 +280,8 @@ async fn pump(
                         }),
                         (Decision::Approve, None) => json!({
                             "outcome": {"outcome": "selected", "optionId": reject},
-                            "_meta": {"followup_message": REFUSED},
+                            "_meta": {"followup_message":
+                                "Refused by axiopera: the backend offered no one-time approval option."},
                         }),
                     };
                     let _ = rpc.respond(id, reply).await;

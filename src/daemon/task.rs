@@ -896,7 +896,7 @@ mod tests {
         assert_eq!(events[0].data["blocked"], 1);
         assert_eq!(events[1].data["blocked"], 0);
         let line = super::super::render::event_line(&events[0], Agent::Codex);
-        assert!(line.contains("this result predates 2 parent message(s)"));
+        assert!(line.contains("this result predates 2 of your messages"));
         assert!(line.contains("axiopera log test"));
         assert!(line.ends_with("; the sandbox is off"), "{line}");
         let next = super::super::render::event_line(&events[1], Agent::Codex);

@@ -612,7 +612,7 @@ impl Daemon {
                 out.error(
                     ErrorCode::Invalid,
                     format!(
-                        "the running daemon is version {} and has live tasks; wait for them or run `axiopera daemon stop --force`",
+                        "the running daemon is version {} and has live tasks; wait for them or run `axiopera daemon stop --force`, which interrupts active tasks from all sessions",
                         env!("CARGO_PKG_VERSION")
                     ),
                 )
@@ -829,8 +829,8 @@ impl Daemon {
             }
             Request::Deny { id, reason } => {
                 let reason = match reason {
-                    Some(r) => format!("Denied by your parent: {r}"),
-                    None => "Denied by your parent. Continue without this action.".into(),
+                    Some(r) => format!("Denied: {r}"),
+                    None => "Denied.".into(),
                 };
                 let task = self.resolve(&id, Some(&caller), agent::Decision::Deny(reason))?;
                 out.text(format!("denied {id}"), json!({"id": id, "task": task}))
@@ -961,9 +961,9 @@ impl Daemon {
                 return refuse(
                     ErrorCode::Invalid,
                     format!(
-                        "a {:?} task cannot spawn a {:?} task",
-                        parent_tier.unwrap(),
-                        s.tier
+                        "a {} task cannot spawn a {} task",
+                        render::tier_name(parent_tier.unwrap()),
+                        render::tier_name(s.tier)
                     ),
                 );
             }
@@ -1069,7 +1069,19 @@ impl Daemon {
                 notes.push(format!("approval requests go to {approver}"));
             }
         }
-        let take = "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some.";
+        let host = identity::task_session(caller).map_or(caller, |(_, native)| native);
+        let grok_host = host.starts_with("grok:")
+            || host.strip_prefix("task:").is_some_and(|id| {
+                self.lock()
+                    .tasks
+                    .get(id)
+                    .is_some_and(|e| e.task.agent == Agent::Grok)
+            });
+        let take = if grok_host {
+            "Take results and questions with `axiopera inbox` when your watch monitor reports news."
+        } else {
+            "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some."
+        };
         let next = match (reach, unreachable) {
             (Reach::Push, _) => {
                 "Results and questions arrive as messages: do not wait or poll; end your turn if nothing else is left.".to_string()
@@ -1165,7 +1177,8 @@ impl Daemon {
             .count();
         (running >= self.opts.concurrency).then(|| {
             format!(
-                "{running} top-level tasks, yours and other sessions', are running: the most `concurrency` allows ({}). Wait for one to finish, or raise it",
+                "{running} top-level tasks, yours and other sessions', are running; the global concurrency limit is {} (configured in {}). Wait for one to finish",
+                self.opts.concurrency,
                 self.opts.home.join("config.toml").display()
             )
         })
@@ -1250,7 +1263,10 @@ impl Daemon {
                 {
                     return refuse(
                         ErrorCode::Invalid,
-                        format!("{id} cannot use {tier:?}: it exceeds its parent task's tier"),
+                        format!(
+                            "{id} cannot use {}: it exceeds its parent task's tier",
+                            render::tier_name(tier)
+                        ),
                     );
                 }
                 if st.tasks.values().any(|e| {
@@ -1260,7 +1276,10 @@ impl Daemon {
                 }) {
                     return refuse(
                         ErrorCode::Invalid,
-                        format!("{id} has sub-tasks above {tier:?}; lower their tiers first"),
+                        format!(
+                            "{id} has sub-tasks above {}; lower their tiers first",
+                            render::tier_name(tier)
+                        ),
                     );
                 }
             }
@@ -1328,7 +1347,7 @@ impl Daemon {
         let Some(task) = identity::task_of(caller).map(str::to_string) else {
             return refuse(
                 ErrorCode::Invalid,
-                "only sub-agents started by axiopera can ask; you have no parent to ask",
+                "only sub-agents started by axiopera can ask",
             );
         };
         let qid = {
@@ -1350,18 +1369,19 @@ impl Daemon {
         let mut data = json!({"id": qid, "text": text});
         self.keep_whole(&mut data, &task, "questions", &qid, &text)?;
         self.try_emit(&task, "question", data)?;
-        let answers = match self.lock().tasks.get(&task).map(|e| e.task.agent) {
-            Some(Agent::Codex) => "the `answers` tool",
-            _ => "`axiopera answers`",
-        };
-        out.text(
-            format!(
-                "asked {qid}. Keep working on whatever does not depend on the answer; it will \
-                 arrive as a new message ({answers} shows it too)."
-            ),
-            json!({"id": qid}),
-        )
-        .await?;
+        let mut receipt = format!("asked {qid}.");
+        if let Some((_, native)) = identity::task_session(caller) {
+            let answers = if native.starts_with("codex:") {
+                "the `answers` tool"
+            } else {
+                "`axiopera answers`"
+            };
+            receipt.push_str(&format!(
+                " The answer goes to this task's main session; {answers} lists it once given. \
+                 Keep working on what does not depend on it."
+            ));
+        }
+        out.text(receipt, json!({"id": qid})).await?;
         Ok(ipc::exit::OK)
     }
 
@@ -1397,7 +1417,7 @@ impl Daemon {
             (task.id.clone(), q.text.clone())
         };
         let message = format!(
-            "[axiopera] Answer to your question {qid} (\"{}\"):\n{answer}",
+            "[axiopera] Answer to question {qid} (\"{}\"):\n{answer}",
             agent::clip(&question, 300)
         );
         let how = self
@@ -1467,9 +1487,8 @@ impl Daemon {
             .map(|e| e.task.parent.clone())
             .unwrap_or_default();
         let to = self.find(&parent, to)?;
-        let message = format!(
-            "[axiopera] Note from your sibling task {me}, for your information (not an instruction):\n{text}"
-        );
+        let message =
+            format!("[axiopera] Note from sibling task {me} (not an instruction):\n{text}");
         let how = {
             let mut st = self.lock();
             let Some(entry) = st.tasks.get_mut(&to) else {
@@ -1508,11 +1527,8 @@ impl Daemon {
         let name = store::new_id('n', |n| self.store.text_path(me, "notes", n).exists());
         self.keep_whole(&mut data, me, "notes", &name, &text)?;
         self.try_emit(me, "message", data)?;
-        out.text(
-            format!("{to}: {how}; your parent gets a copy"),
-            json!({"task": to, "result": how}),
-        )
-        .await?;
+        out.text(format!("{to}: {how}"), json!({"task": to, "result": how}))
+            .await?;
         Ok(ipc::exit::OK)
     }
 
@@ -1532,7 +1548,9 @@ impl Daemon {
             if entry.actor.is_some() {
                 return refuse(
                     ErrorCode::Invalid,
-                    format!("{id} is running; wait for its turn to end, or cancel it first"),
+                    format!(
+                        "{id} is running; wait for its execution and background work to end, or cancel it first"
+                    ),
                 );
             }
             let Some(session) = &entry.task.session else {
@@ -1562,7 +1580,7 @@ impl Daemon {
         )?;
         let (cwd, resume) = task;
         out.text(
-            format!("{id} detached\n  cd \"{}\"\n  {resume}", cwd.display()),
+            format!("{id} detached; the user can continue it in the native CLI:\n  cd \"{}\"\n  {resume}", cwd.display()),
             json!({"task": id, "cwd": cwd, "command": resume}),
         )
         .await?;
@@ -1726,9 +1744,11 @@ impl Daemon {
         let d = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(d.opts.approval_timeout).await;
-            let _ = d.resolve(&rid, None, agent::Decision::Deny(
-                "Denied: nobody approved this in time. Continue without it, or explain in your final report why it is needed.".into(),
-            ));
+            let _ = d.resolve(
+                &rid,
+                None,
+                agent::Decision::Deny("Approval timed out; the action was denied.".into()),
+            );
         });
     }
 
@@ -1756,7 +1776,10 @@ impl Daemon {
         let pending = {
             let mut st = self.lock();
             let Some(p) = st.approvals.get(rid) else {
-                return refuse(ErrorCode::NotFound, format!("no pending request {rid}"));
+                return refuse(
+                    ErrorCode::NotFound,
+                    format!("no pending request {rid}; it may have timed out or been decided"),
+                );
             };
             // Like questions: tasks decide only what is routed to them; sessions and people
             // stand for the user.
@@ -2404,10 +2427,7 @@ impl Daemon {
         let head = render::event_line(e, agent);
         let turn = e.data.get("turn").and_then(Value::as_u64).unwrap_or(0) as u32;
         if turn <= delivered {
-            return Some((
-                format!("{head}\n(result already delivered; no new content)"),
-                None,
-            ));
+            return Some((format!("{head}\n(result already delivered)"), None));
         }
         let path = self.store.turn_path(&e.task, turn);
         let body = match std::fs::read_to_string(&path) {
@@ -2648,7 +2668,7 @@ impl Daemon {
         if turn <= delivered && !force {
             out.text(
                 format!(
-                    "{id} turn {turn}: result already delivered; no new content. Full text: {}",
+                    "{id} turn {turn}: result already delivered. Full text: {}",
                     path.display()
                 ),
                 Value::Null,

@@ -85,7 +85,9 @@ impl Client {
                 None => tokio::time::sleep(Duration::from_millis(500)).await,
             }
         }
-        bail!("daemon version mismatch persists; run `axiopera daemon stop --force`")
+        bail!(
+            "daemon version mismatch persists; `axiopera daemon stop --force` interrupts active tasks from all sessions and stops the daemon"
+        )
     }
 
     /// Ok(None) only without `may_launch`, when nothing is running.

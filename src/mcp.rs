@@ -76,17 +76,16 @@ fn tools() -> Value {
     json!([
         {
             "name": "ask",
-            "description": "Ask your parent agent something only it can answer. Returns at once; \
-                the answer arrives later as a new message.",
+            "description": "Ask your parent agent something only it can answer. Returns at once.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"question": text("The question, with the context your parent needs to answer it.")},
+                "properties": {"question": text("Question and context needed to answer it.")},
                 "required": ["question"],
             },
         },
         {
             "name": "tell",
-            "description": "Send a note to a sibling task (another sub-agent of your parent). \
+            "description": "Send a note to another task of your parent. \
                 It reaches the sibling as information, not as an instruction: in its current \
                 turn, or with its next one if it is idle; it does not start a turn. Your parent \
                 gets a copy.",
@@ -94,7 +93,7 @@ fn tools() -> Value {
                 "type": "object",
                 "properties": {
                     "to": text("The sibling's task ID or name."),
-                    "message": text("The note."),
+                    "message": {"type": "string"},
                 },
                 "required": ["to", "message"],
             },

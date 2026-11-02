@@ -91,9 +91,12 @@ pub fn capability_notes(agent: Agent, tier: Tier) -> Vec<String> {
             Agent::Codex | Agent::Claude => {
                 "MCP: only tools marked read-only without a destructive hint are allowed".into()
             }
-            Agent::Grok => "MCP: unavailable; search_tool and use_tool are hidden".into(),
+            Agent::Grok => "MCP: unavailable".into(),
         });
-        notes.push("other requests needing approval are refused".into());
+        notes.push(match agent {
+            Agent::Grok => "shell commands other than plain axiopera commands are refused".into(),
+            _ => "other requests needing approval are refused".into(),
+        });
     }
     notes
 }
@@ -139,7 +142,7 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
             let mut line = format!("{who} turn {} {status}", n("turn"));
             if n("unread") > 0 {
                 line.push_str(&format!(
-                    "; this result predates {} parent message(s); queued for a following turn",
+                    "; this result predates {} of your messages; queued for a following turn",
                     n("unread")
                 ));
             }
@@ -177,7 +180,7 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
         }
         "cancelled" => format!("{who} cancelled: {}", s("reason")),
         "interrupted" => format!(
-            "{who} interrupted: {}; continue with `axiopera send {} \"...\"`",
+            "{who} interrupted: {}; continue with `axiopera send {} \"continue\"`",
             s("reason"),
             e.task
         ),
@@ -233,12 +236,17 @@ pub fn tagged(tag: &str, text: &str) -> String {
 }
 
 /// The start and end of a text within `max_tokens`, with how much is left out and where the
-/// whole text is; `then` ends the advice to read it.
+/// whole text is; nonempty `then` requires reading it before that action.
 pub fn excerpt(text: &str, max_tokens: usize, path: &Path, then: &str) -> String {
     let total = text.chars().count();
+    let read = if then.is_empty() {
+        "full note:"
+    } else {
+        "read all of it in"
+    };
     let note = |omitted: usize| {
         format!(
-            "\n…[{omitted} of {total} characters omitted; read all of it in {}{then}]…\n",
+            "\n…[{omitted} of {total} characters omitted; {read} {}{then}]…\n",
             path.display()
         )
     };
@@ -365,6 +373,11 @@ mod tests {
         assert!(out.starts_with("START") && out.ends_with("END"));
         assert!(out.contains("characters omitted; read all of it in r1.txt before deciding"));
         assert!(tokens(&out) <= 1_000);
+        let note = excerpt(&text, 1_000, Path::new("note.txt"), "");
+        assert!(note.contains("full note: note.txt"));
+        assert!(!note.contains("read all"));
+        assert!(note.starts_with("START") && note.ends_with("END"));
+        assert!(tokens(&note) <= 1_000);
     }
 
     #[test]

@@ -4,17 +4,20 @@ Use axiopera for a different agent or model, or for work that must continue afte
 session ends.
 
 Dispatch
-  axiopera spawn codex "Fix the failing test in tests/parser.rs; run cargo test before finishing."
+  axiopera spawn codex "Fix the failing test in tests/parser.rs."
   axiopera spawn claude --tier read --name review -f task.md
-  Tiers: read (look, don't change; MCP: read-only tools only, none on Grok),
+  Tiers: read (read-only; requests needing approval are refused;
+              MCP: read-only tools only, none on Grok; Grok shell: plain axiopera commands only),
          work (default: the agent's own auto mode), full (the agent's full-access mode).
   Options: --model, --effort, --name (use it instead of the ID), --cwd, --timeout 30m.
+  Tasks share your working directory unless --cwd selects another; axiopera creates no copy.
+  Give parallel writers separate git worktrees via --cwd.
   A timeout interrupts the task; send resumes its session with a fresh time limit.
   axiopera models <agent> lists --model IDs and --effort values; --json includes descriptions.
 
 Get results
-  axiopera inbox           takes what your sub-tasks have for you: results, questions, approval
-                           requests and problems. Each is handed over once. Never blocks.
+  axiopera inbox           collects results, questions, approval requests and problems from
+                           your sub-tasks. Each is handed over once. Never blocks.
   axiopera wait            blocks until there is something new, lists it, and takes nothing.
 @claude Run `axiopera wait` as a background command (teammates of team-lead: foreground). When it
 @claude exits, run `axiopera inbox`, and start `axiopera wait` again while sub-tasks still run.
@@ -32,19 +35,19 @@ Get results
 Continue a task
   axiopera send <task> "Also update the docs."    steers the running turn, or starts a new turn
                                                    in the same session if it already finished.
-  Results note when they may predate your message; late messages are handled in the next turn.
+  Messages confirmed as queued are handled in a following turn.
   Cancelled tasks can also resume with send or reply; their cancelled children stay stopped
   until continued separately.
-  Add --tier full to change permissions when idle.
+  send --tier <read|work|full> changes permissions when idle.
 
 Answer questions
-  Questions arrive like results; sub-agents can keep working until you answer.
+  Sub-agents can keep working on independent work until you answer.
   axiopera reply <question> "Use port 8080."      reaches it mid-turn, or resumes it.
   Approval requests pause the sub-agent until you decide; unanswered requests are denied
-  after the approval timeout (2 minutes by default) and the sub-agent goes on without it.
+  after the approval timeout (2 minutes by default), ending the wait for approval.
   axiopera approve <request>      axiopera deny <request> --reason "Use a dry run instead."
 
-For long messages, use `send <task> -f msg.md` or `reply <question> -f answer.md`; use `-` to read stdin.
+Use `send <task> -f msg.md` or `reply <question> -f answer.md`; use `-` to read stdin.
 
 Sub-agents can talk to each other: give them each other's task IDs and tell them to run
 `axiopera tell <task> "..."` (Codex sub-agents have it as the `tell` tool). You get a copy of
@@ -52,5 +55,6 @@ every note.
 
 Inspect and stop
   axiopera status           your sub-tasks       axiopera log <task>      recent events
-  axiopera result <task>    latest turn result   axiopera cancel <task>   stop it and its children
-  axiopera detach <task>    hand it to the user: prints the native command to continue it
+  axiopera result <task>    latest turn result; --force to read it again
+  axiopera cancel <task>    stop it and its children
+  axiopera detach <task>    stop driving it and print the native command for the user

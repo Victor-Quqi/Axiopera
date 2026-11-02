@@ -29,7 +29,7 @@ use ipc::{Agent, Request, Tier};
     about = "Dispatch coding agents as sub-agents of each other"
 )]
 struct Cli {
-    /// Print structured JSON instead of text.
+    /// Print structured JSON.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -48,7 +48,7 @@ enum Command {
     /// Start a sub-agent on a task. Returns at once with its task ID.
     Spawn {
         agent: Agent,
-        /// The task. Use `-f FILE`, or `-` to read it from stdin.
+        /// Use `-f FILE`, or `-` to read it from stdin.
         task: Vec<String>,
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
@@ -63,7 +63,7 @@ enum Command {
         /// Working directory (default: the current one).
         #[arg(long)]
         cwd: Option<PathBuf>,
-        /// A short name to refer to the task by.
+        /// A name to refer to the task by.
         #[arg(long)]
         name: Option<String>,
         /// Interrupt each execution after this long, e.g. 30m; send resumes with a fresh limit.
@@ -76,7 +76,7 @@ enum Command {
         /// Change permissions when resuming an idle task in the same session.
         #[arg(long, value_enum)]
         tier: Option<Tier>,
-        /// The message. Use `-f FILE`, or `-` to read it from stdin.
+        /// Use `-f FILE`, or `-` to read it from stdin.
         message: Vec<String>,
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
@@ -109,12 +109,12 @@ enum Command {
     /// List your sub-tasks, or show one.
     Status {
         task: Option<String>,
-        /// All tasks, not only yours.
+        /// Tasks from all callers.
         #[arg(long)]
         all: bool,
     },
-    /// For people: every task, what it was given and what it is doing, redrawn each second
-    /// until Ctrl-C. Reads the data directory only, so it changes nothing for the agents.
+    /// For people: every task, what it was given and what it is doing, redrawn
+    /// until Ctrl-C. Reads task files without consuming events.
     Top {
         /// Show only this task, in detail: its ID, or its name if no other task has it.
         task: Option<String>,
@@ -138,14 +138,15 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Stop a task and its children. Use send to continue them later.
+    /// Stop a task and its children. Use send to resume each task separately.
     Cancel { task: String },
-    /// For sub-agents: ask your parent a question. Returns at once; keep working.
+    /// For sub-agents: ask your parent a question. Returns at once; keep working on what does
+    /// not depend on the answer.
     Ask { question: Vec<String> },
     /// Answer a sub-agent's question.
     Reply {
         id: String,
-        /// The answer. Use `-f FILE`, or `-` to read it from stdin.
+        /// Use `-f FILE`, or `-` to read it from stdin.
         answer: Vec<String>,
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
@@ -163,9 +164,9 @@ enum Command {
     },
     /// For sub-agents: send a note to a sibling task. Your parent gets a copy.
     Tell { to: String, message: Vec<String> },
-    /// Hand a task over to you: axiopera stops driving it and prints the native resume command.
+    /// Hand a task over to the user: axiopera stops driving it and prints the native resume command.
     Detach { task: String },
-    /// Remove stopped tasks and the request log now; the daemon does it by itself after 30 days.
+    /// Remove stopped tasks and the request log now; the daemon does it after 30 days without activity.
     Gc {
         /// Keep what was active within this many days.
         #[arg(long, default_value_t = 0)]
@@ -189,7 +190,7 @@ enum Command {
         #[command(subcommand)]
         command: DaemonCommand,
     },
-    /// The Codex plugin.
+    /// Manage the Codex plugin.
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
@@ -261,7 +262,7 @@ fn task_text(words: Vec<String>, file: Option<PathBuf>) -> Result<String> {
             s
         }
         (None, words) if !words.is_empty() => words.join(" "),
-        _ => bail!("give the text as arguments, with -f FILE, or as - for stdin"),
+        _ => bail!("give the text using one source: arguments, -f FILE, or - for stdin"),
     };
     if text.trim().is_empty() {
         bail!("the text is empty");
@@ -570,7 +571,7 @@ mod tests {
                 let expected = if words.is_empty() {
                     format!("reading {}", missing.display())
                 } else {
-                    "give the text as arguments, with -f FILE, or as - for stdin".into()
+                    "give the text using one source: arguments, -f FILE, or - for stdin".into()
                 };
                 assert_eq!(error, expected);
             }

@@ -247,7 +247,7 @@ async fn tier_changes_respect_task_ownership_and_parent_child_limits() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(error.contains("sub-tasks above Read"), "{error}");
+    assert!(error.contains("sub-tasks above read"), "{error}");
     assert_eq!(f.d.lock().tasks["test"].task.tier, ipc::Tier::Full);
     // Idle children can still resume at their saved tier and also prevent a downgrade.
     f.d.lock().tasks.get_mut("kid").unwrap().pending.clear();
@@ -404,7 +404,7 @@ async fn native_callers_keep_the_owning_tasks_depth_and_tier_limits() {
         timeout_secs: None,
     };
     for (caller, expected) in [
-        (native, "cannot spawn a Work task"),
+        (native, "cannot spawn a work task"),
         ("task:kid/codex:native", "two levels deep"),
     ] {
         let error =
@@ -457,6 +457,87 @@ async fn native_callers_receive_approvals_under_the_owning_tasks_tier() {
     f.d.resolve(&rid, Some(native), agent::Decision::Approve)
         .unwrap();
     assert!(matches!(decision.await.unwrap(), agent::Decision::Approve));
+}
+
+#[tokio::test]
+async fn question_receipts_match_the_task_answer_route() {
+    for caller in ["task:test", "task:test/codex:child", "task:test/grok:child"] {
+        let f = fixture();
+        f.d.lock().stopping = true;
+        let mut output = Vec::new();
+        f.d.ask(caller, "Which port?".into(), &mut Out::new(&mut output))
+            .await
+            .unwrap();
+        let qid = f.d.lock().tasks["test"].task.questions[0].id.clone();
+        let receipt = replies(&output);
+        if caller == "task:test" {
+            assert_eq!(receipt, format!("asked {qid}."));
+        } else {
+            assert!(receipt.contains("this task's main session"), "{receipt}");
+            let tool = if caller.contains("/codex:") {
+                "the `answers` tool"
+            } else {
+                "`axiopera answers`"
+            };
+            assert!(receipt.contains(tool), "{receipt}");
+        }
+        f.d.reply(
+            "codex:host",
+            &qid,
+            "8080".into(),
+            Some(vec![]),
+            &mut Out::new(&mut Vec::new()),
+        )
+        .await
+        .unwrap();
+        assert!(f.d.lock().tasks["test"].pending[0].contains(&format!("Answer to question {qid}")));
+        output.clear();
+        f.d.answers(caller, &mut Out::new(&mut output))
+            .await
+            .unwrap();
+        assert!(replies(&output).contains("answer: 8080"));
+    }
+}
+
+#[tokio::test]
+async fn grok_spawn_receipts_use_the_callers_monitor() {
+    let mut f = fixture_with(&[json!({"id": "grok", "agent": "grok"})]);
+    Arc::get_mut(&mut f.d).unwrap().opts.agents.claude.path =
+        Some(std::env::current_exe().unwrap());
+    f.d.lock().stopping = true;
+    for (caller, monitor) in [
+        ("grok:host", true),
+        ("task:grok", true),
+        ("task:test/grok:child", true),
+        ("task:grok/codex:child", false),
+        ("user", false),
+    ] {
+        let spawn = ipc::Spawn {
+            agent: Agent::Claude,
+            tier: ipc::Tier::Read,
+            task: "fixture only".into(),
+            cwd: f.home.clone(),
+            name: None,
+            model: None,
+            effort: None,
+            timeout_secs: None,
+        };
+        let mut output = Vec::new();
+        f.d.spawn(caller, spawn, vec![], &mut Out::new(&mut output))
+            .await
+            .unwrap();
+        let receipt = replies(&output);
+        assert_eq!(
+            receipt.contains("watch monitor"),
+            monitor,
+            "{caller}: {receipt}"
+        );
+        assert_eq!(
+            receipt.contains("`axiopera wait`"),
+            !monitor,
+            "{caller}: {receipt}"
+        );
+    }
 }
 
 #[test]
