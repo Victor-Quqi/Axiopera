@@ -103,6 +103,7 @@ pub async fn run(home: &Path, task: Option<&str>, all: bool) -> Result<i32> {
         open: focus.clone(),
         chosen: focus,
         keys: keys.is_some(),
+        ..Ui::default()
     };
     let _ansi = platform::Ansi::enable();
     // The alternate screen leaves the shell's scrollback as it was. Without autowrap, a line
@@ -177,6 +178,10 @@ async fn stopped() {
 enum Key {
     Up,
     Down,
+    PageUp,
+    PageDown,
+    Home,
+    End,
     Open,
     Back,
     /// `q`: back from a task, or quit from the list.
@@ -231,7 +236,20 @@ fn key_at(bytes: &[u8]) -> Option<(Option<Key>, usize)> {
                 .take_while(|b| (0x20..0x40).contains(*b))
                 .count();
             match *tail.get(params)? {
-                end @ 0x40..=0x7e => (arrow(end), 2 + params + 1),
+                end @ 0x40..=0x7e => {
+                    let key = if end == b'~' {
+                        match tail[..params].split(|b| *b == b';').next() {
+                            Some(b"1" | b"7") => Some(Key::Home),
+                            Some(b"4" | b"8") => Some(Key::End),
+                            Some(b"5") => Some(Key::PageUp),
+                            Some(b"6") => Some(Key::PageDown),
+                            _ => None,
+                        }
+                    } else {
+                        arrow(end)
+                    };
+                    (key, 2 + params + 1)
+                }
                 _ => (None, 2 + params),
             }
         }
@@ -248,13 +266,15 @@ fn key_at(bytes: &[u8]) -> Option<(Option<Key>, usize)> {
     })
 }
 
-/// The key an arrow's last byte stands for: right opens, left goes back.
+/// The key a cursor sequence's last byte stands for: right opens, left goes back.
 fn arrow(b: u8) -> Option<Key> {
     match b {
         b'A' => Some(Key::Up),
         b'B' => Some(Key::Down),
         b'C' => Some(Key::Open),
         b'D' => Some(Key::Back),
+        b'H' => Some(Key::Home),
+        b'F' => Some(Key::End),
         _ => None,
     }
 }
@@ -282,6 +302,7 @@ fn read_keys(send: tokio::sync::mpsc::UnboundedSender<Vec<u8>>) {
 }
 
 /// What a person looks at: the list or one task, and the task chosen in the list.
+#[derive(Default)]
 struct Ui {
     /// The task shown alone, if any.
     open: Option<String>,
@@ -289,10 +310,13 @@ struct Ui {
     chosen: Option<String>,
     /// Whether keys can be read: without them nothing is chosen.
     keys: bool,
+    list_top: usize,
+    page: usize,
 }
 
 impl Ui {
     fn draw(&mut self, view: &View, now: u64, size: (usize, usize)) -> Vec<String> {
+        self.page = size.1.saturating_sub(3).max(1);
         if let Some(id) = &self.open {
             return view.task_frame(id, now, Some(size), self.keys);
         }
@@ -304,7 +328,12 @@ impl Ui {
         if !self.chosen.as_ref().is_some_and(|c| ids.contains(c)) {
             self.chosen = ids.into_iter().next();
         }
-        view.frame(now, Some(size), self.chosen.as_deref())
+        view.list_frame(
+            now,
+            Some(size),
+            self.chosen.as_deref(),
+            Some(&mut self.list_top),
+        )
     }
 
     /// Follows a key. Returns false when it quits.
@@ -325,6 +354,38 @@ impl Ui {
                     _ => 0,
                 };
                 self.chosen = ids.into_iter().nth(next);
+            }
+            (Key::PageUp | Key::PageDown | Key::Home | Key::End, None) => {
+                self.list_top = match key {
+                    Key::Home => 0,
+                    Key::End => usize::MAX,
+                    Key::PageUp => self.list_top.saturating_sub(self.page),
+                    _ => self.list_top.saturating_add(self.page),
+                };
+                let rows = view.table(now).0;
+                let at = rows
+                    .iter()
+                    .position(|r| r.id.is_some() && r.id == self.chosen)
+                    .unwrap_or(0);
+                let target = match key {
+                    Key::Home => 0,
+                    Key::End => rows.len().saturating_sub(1),
+                    Key::PageUp => at.saturating_sub(self.page),
+                    _ => at
+                        .saturating_add(self.page)
+                        .min(rows.len().saturating_sub(1)),
+                };
+                // A session header is not selectable; cross it in the direction of travel.
+                let next = if matches!(key, Key::PageUp | Key::End) {
+                    rows.iter()
+                        .take(target + 1)
+                        .rev()
+                        .find_map(|r| r.id.clone())
+                        .or_else(|| rows.iter().find_map(|r| r.id.clone()))
+                } else {
+                    rows.iter().skip(target).find_map(|r| r.id.clone())
+                };
+                self.chosen = next;
             }
             _ => {}
         }
@@ -509,6 +570,16 @@ impl View {
     /// A line for each task: fitted to `size` with colors, or whole and plain without it. The
     /// `chosen` task's line is marked and always shown.
     fn frame(&self, now: u64, size: Option<(usize, usize)>, chosen: Option<&str>) -> Vec<String> {
+        self.list_frame(now, size, chosen, None)
+    }
+
+    fn list_frame(
+        &self,
+        now: u64,
+        size: Option<(usize, usize)>,
+        chosen: Option<&str>,
+        scroll: Option<&mut usize>,
+    ) -> Vec<String> {
         let (mut rows, hidden) = self.table(now);
         let count = |s: Status| self.tasks.values().filter(|t| t.status == s).count();
         let approvals: usize = self
@@ -552,7 +623,29 @@ impl View {
             None => lines.extend(rows.into_iter().map(|r| r.segs)),
             Some((_, height)) => {
                 let room = height.saturating_sub(lines.len());
-                lines.extend(choose(rows, room));
+                if let Some(top) = scroll {
+                    let total = rows.len();
+                    let footer = total > room && room > 1;
+                    let page = room.saturating_sub(usize::from(footer)).max(1);
+                    *top = (*top).min(total.saturating_sub(page));
+                    if let Some(at) = rows.iter().position(|r| r.chosen) {
+                        *top = (*top).min(at).max(at.saturating_sub(page - 1));
+                    }
+                    lines.extend(rows.into_iter().skip(*top).take(page).map(|r| r.segs));
+                    if footer {
+                        lines.push(vec![(
+                            format!(
+                                "  rows {}–{}/{}  PgUp/PgDn page  Home/End",
+                                *top + 1,
+                                (*top + page).min(total),
+                                total
+                            ),
+                            DIM,
+                        )]);
+                    }
+                } else {
+                    lines.extend(choose(rows, room));
+                }
             }
         }
         finish(&lines, size)
@@ -3263,8 +3356,16 @@ mod tests {
         let mut input = Input::default();
         assert_eq!(
             input.feed(b"\x1b[A\x1b[B\x1bOC\x1b[1;5D\x1b[5~\rkjq\x1b\x03\x7fx"),
-            [Up, Down, Open, Back, Open, Up, Down, Q, Back, Quit, Back]
+            [
+                Up, Down, Open, Back, PageUp, Open, Up, Down, Q, Back, Quit, Back
+            ]
         );
+        assert_eq!(
+            input.feed(b"\x1b[6~\x1b[H\x1b[F\x1bOH\x1bOF\x1b[1~\x1b[4~\x1b[7~\x1b[8~"),
+            [PageDown, Home, End, Home, End, Home, End, Home, End]
+        );
+        assert!(input.feed(b"\x1b[6").is_empty());
+        assert_eq!(input.feed(b"~"), [PageDown]);
         // An escape sequence split between reads is one key; an escape alone is Esc once no
         // more comes, and the start of a sequence that never ends is nothing.
         assert!(input.feed(b"\x1b").is_empty() && input.waiting());
@@ -3312,6 +3413,7 @@ mod tests {
             open: None,
             chosen: None,
             keys: true,
+            ..Ui::default()
         };
         let plain = |ui: &mut Ui, view: &View| -> Vec<String> {
             ui.draw(view, NOW, (80, 6))
@@ -3320,8 +3422,7 @@ mod tests {
                 .collect()
         };
 
-        // The first task is chosen, marked across the window, and shown though the older
-        // tasks give way to the one that waits.
+        // The first task is chosen and marked; the visible rows stay contiguous.
         let frame = ui.draw(&view, NOW, (80, 6));
         assert_eq!(ui.chosen.as_deref(), Some("t0"));
         assert!(frame[2].starts_with("\x1b[7m  t0 "), "{frame:#?}");
@@ -3331,8 +3432,22 @@ mod tests {
             "{shown:#?}"
         );
         assert_eq!(columns(&shown[2]), 79, "{shown:#?}");
-        assert!(shown[3].starts_with("  t5 ") && shown[4].starts_with("  ask "));
-        assert_eq!(shown[5], "  …and 4 more task(s)");
+        assert!(shown[3].starts_with("  t1 ") && shown[4].starts_with("  t2 "));
+        assert!(shown[5].starts_with("  rows 1–3/7"));
+
+        ui.press(PageDown, &view, NOW);
+        let shown = plain(&mut ui, &view);
+        assert_eq!(ui.chosen.as_deref(), Some("t3"));
+        assert!(shown[2].starts_with("  t3 ") && shown[4].starts_with("  t5 "));
+        ui.press(End, &view, NOW);
+        let shown = plain(&mut ui, &view);
+        assert!(shown[2].starts_with("  t4 ") && shown[4].starts_with("  ask "));
+        ui.press(PageUp, &view, NOW);
+        let shown = plain(&mut ui, &view);
+        assert_eq!(ui.chosen.as_deref(), Some("t3"));
+        assert!(shown[2].starts_with("  t1 ") && shown[4].starts_with("  t3 "));
+        ui.press(Home, &view, NOW);
+        plain(&mut ui, &view);
 
         // Up and down move through the list in its order, and stop at its ends.
         for (key, chosen) in [(Down, "t1"), (Up, "t0"), (Up, "t0")] {
@@ -3379,6 +3494,65 @@ mod tests {
         let shown = plain(&mut ui, &view);
         assert!(!shown[0].contains("choose"), "{shown:#?}");
         assert!(!shown.iter().any(|l| columns(l) == 79), "{shown:#?}");
+    }
+
+    #[test]
+    fn list_pages_cross_session_headers_and_fit_after_resize() {
+        let h = home();
+        let store = Store::new(&h.0);
+        for (i, id) in ["a0", "a1", "a2", "a3", "b0", "b1", "b2", "b3"]
+            .into_iter()
+            .enumerate()
+        {
+            store
+                .save(&task(
+                    id,
+                    if i < 4 { "codex:a" } else { "codex:b" },
+                    "idle",
+                    NOW - 100 + i as u64,
+                    json!({}),
+                ))
+                .unwrap();
+        }
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let mut ui = Ui {
+            keys: true,
+            ..Ui::default()
+        };
+        ui.draw(&view, NOW, (80, 5));
+        assert_eq!(ui.chosen.as_deref(), Some("a0"));
+        ui.press(Key::PageDown, &view, NOW);
+        ui.draw(&view, NOW, (80, 5));
+        assert_eq!(ui.chosen.as_deref(), Some("a2"));
+        ui.press(Key::PageDown, &view, NOW);
+        ui.draw(&view, NOW, (80, 5));
+        assert_eq!(ui.chosen.as_deref(), Some("b0"));
+        ui.press(Key::Up, &view, NOW);
+        assert_eq!(ui.chosen.as_deref(), Some("a3"));
+        for height in [1, 2, 3, 4, 30] {
+            let frame = ui.draw(&view, NOW, (40, height));
+            assert!(frame.len() <= height);
+            if height >= 3 {
+                assert!(
+                    frame.iter().any(|s| strip_sgr(s).starts_with("  a3 ")),
+                    "{frame:?}"
+                );
+            }
+        }
+        for id in ["a0", "a1", "a2", "a3", "b0", "b1", "b2", "b3"] {
+            store.remove(id).unwrap();
+        }
+        view.refresh();
+        for key in [Key::PageUp, Key::PageDown, Key::Home, Key::End] {
+            ui.press(key, &view, NOW);
+            assert!(ui.chosen.is_none());
+            assert!(
+                ui.draw(&view, NOW, (80, 5))
+                    .iter()
+                    .any(|s| s.contains("no tasks"))
+            );
+        }
     }
 
     /// A line broken into pieces of up to `room` columns, where `break_at` finds a place.
