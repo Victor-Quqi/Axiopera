@@ -7,10 +7,10 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Result, bail};
 use serde_json::Value;
@@ -121,7 +121,7 @@ pub async fn run(home: &Path, task: Option<&str>, all: bool) -> Result<i32> {
             .or_else(env_size)
             .unwrap_or(FALLBACK_SIZE);
         // Synchronized output keeps the old and new selection from appearing mid-frame.
-        let lines = ui.draw(&view, store::now_ms(), size);
+        let lines = ui.draw(&mut view, store::now_ms(), size);
         let output = redraw(&previous, &lines, last_size != Some(size), size.1);
         if !output.is_empty()
             && let Err(e) = show(&output)
@@ -329,7 +329,7 @@ struct Ui {
 }
 
 impl Ui {
-    fn draw(&mut self, view: &View, now: u64, size: (usize, usize)) -> Vec<String> {
+    fn draw(&mut self, view: &mut View, now: u64, size: (usize, usize)) -> Vec<String> {
         self.page = size.1.saturating_sub(3).max(1);
         if let Some(id) = &self.open {
             return view.task_view(
@@ -343,6 +343,7 @@ impl Ui {
         if !self.keys {
             return view.frame(now, Some(size), None);
         }
+        view.load_list(now);
         // The first task when the chosen one is gone or none was.
         let rows = view.table(now).0;
         if !self.list_paused {
@@ -550,9 +551,33 @@ fn env_size() -> Option<(usize, usize)> {
     Some((get("COLUMNS")?, get("LINES").unwrap_or(FALLBACK_SIZE.1)))
 }
 
+/// Full timestamp precision matters for same-size writes within one refresh interval.
+#[derive(Debug, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    modified: SystemTime,
+    created: Option<SystemTime>,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let m = fs::metadata(path).ok()?;
+        Some(Self {
+            len: m.len(),
+            modified: m.modified().ok()?,
+            created: m.created().ok(),
+        })
+    }
+}
+
 /// What has been read of the data directory so far.
 struct View {
     store: Store,
+    root: PathBuf,
+    task_stamps: HashMap<String, FileStamp>,
+    detail: Option<(String, Tail)>,
+    list_ready: bool,
+    detail_ready: bool,
     all: bool,
     tasks: HashMap<String, Task>,
     tails: HashMap<String, Tail>,
@@ -573,6 +598,11 @@ impl View {
     fn new(home: &Path, all: bool) -> View {
         View {
             store: Store::new(home),
+            root: home.join("tasks"),
+            task_stamps: HashMap::new(),
+            detail: None,
+            list_ready: false,
+            detail_ready: false,
             all,
             tasks: HashMap::new(),
             tails: HashMap::new(),
@@ -583,22 +613,59 @@ impl View {
         }
     }
 
-    /// Read every task again, and what was added since the last refresh.
+    /// Keep the task index complete; unchanged snapshots need no read or JSON parse.
     fn refresh(&mut self) {
-        let mut tasks: HashMap<String, Task> = self
-            .store
-            .load_all()
-            .into_iter()
-            .map(|t| (t.id.clone(), t))
-            .collect();
-        // Only a removed task is forgotten. One whose `task.json` cannot be read for a moment,
-        // as while the daemon replaces it, stays as last read instead of leaving the screen.
-        for (id, t) in std::mem::take(&mut self.tasks) {
-            if !tasks.contains_key(&id) && self.store.exists(&id) {
-                tasks.insert(id, t);
+        self.list_ready = false;
+        self.detail_ready = false;
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            if !self.root.exists() {
+                self.tasks.clear();
+                self.task_stamps.clear();
+                self.tails.clear();
+                self.detail = None;
+            }
+            return;
+        };
+        let mut changed = false;
+        let mut present = HashSet::new();
+        for entry in entries.flatten() {
+            let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            present.insert(id.clone());
+            let path = entry.path().join("task.json");
+            let Some(stamp) = FileStamp::of(&path) else {
+                continue;
+            };
+            if self.task_stamps.get(&id) == Some(&stamp) {
+                continue;
+            }
+            // Retain the previous snapshot during replacement or a partial write; retry it.
+            if let Some(t) = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Task>(&bytes).ok())
+                .filter(|t| t.id == id)
+            {
+                changed = true;
+                self.tasks.insert(id.clone(), t);
+                self.task_stamps.insert(id, stamp);
             }
         }
-        self.tasks = tasks;
+        let previous = self.tasks.len();
+        self.tasks
+            .retain(|id, _| present.contains(id) || self.store.exists(id));
+        if !changed && previous == self.tasks.len() {
+            return;
+        }
+        self.task_stamps.retain(|id, _| self.tasks.contains_key(id));
+        self.tails.retain(|id, _| self.tasks.contains_key(id));
+        if self
+            .detail
+            .as_ref()
+            .is_some_and(|(id, _)| !self.tasks.contains_key(id))
+        {
+            self.detail = None;
+        }
         for t in self.tasks.values() {
             let mut depth = 1;
             let mut root = t;
@@ -620,54 +687,61 @@ impl View {
                 self.id_width = self.id_width.max(columns(&t.id));
             }
         }
-        let store = &self.store;
-        self.tails.retain(|id, _| store.exists(id));
-        for (id, t) in &self.tasks {
-            // `prompt.md` is written before `task.json`, so it is whole once the task is there.
-            let tail = self.tails.entry(id.clone()).or_insert_with(|| Tail {
-                prompt: read_text(&self.store.prompt_path(id)),
-                ..Tail::default()
-            });
-            for e in tail.read(&store.events_path(id)) {
-                tail.absorb(&e, || {
-                    let path = store.message_path(id, e.seq);
-                    Some((read_text(&path)?, path))
-                });
-            }
-            // The results of the turns whose last messages are kept, and the latest.
-            let mut wanted: Vec<u32> = tail
-                .log
-                .iter()
-                .filter_map(|l| match l.what {
-                    What::Said { turn, .. } => turn,
-                    _ => None,
-                })
-                .collect();
-            if t.turns > 0 {
-                wanted.push(t.turns);
-            }
-            wanted.sort_unstable();
-            wanted.dedup();
-            tail.results.retain(|n, _| wanted.contains(n));
-            // The daemon counts a turn before writing its result, and says the turn ended after:
-            // till then the result may be missing or being written, even once a later turn has
-            // begun, and it is read again when its size changes. Without the turn's end in the
-            // events, as of a task from before they told it, it is never known whole.
-            for n in wanted {
-                let path = self.store.turn_path(id, n);
-                let ended = tail.ended_turns.contains(&n);
-                match tail.results.get_mut(&n) {
-                    Some((_, true)) => {}
-                    Some((r, whole)) if fs::metadata(&path).is_ok_and(|m| m.len() == r.len) => {
-                        *whole = ended
-                    }
-                    _ => match read_text(&path) {
-                        Some(r) => drop(tail.results.insert(n, (r, ended))),
-                        None => drop(tail.results.remove(&n)),
-                    },
+    }
+
+    fn shown(&self, now: u64) -> HashSet<&str> {
+        let mut shown: HashSet<&str> = self
+            .tasks
+            .values()
+            .filter(|t| self.all || active(t) || now.saturating_sub(t.updated_ms) < RECENT_MS)
+            .map(|t| t.id.as_str())
+            .collect();
+        for id in shown.clone() {
+            let mut up = self.parent(&self.tasks[id]);
+            while let Some(p) = up {
+                if !shown.insert(&p.id) {
+                    break;
                 }
+                up = self.parent(p);
             }
         }
+        shown
+    }
+
+    fn load_list(&mut self, now: u64) {
+        if self.list_ready {
+            return;
+        }
+        self.list_ready = true;
+        self.detail_ready = false;
+        let shown: HashSet<String> = self.shown(now).into_iter().map(str::to_owned).collect();
+        self.tails.retain(|id, _| shown.contains(id));
+        for id in shown {
+            self.tails
+                .entry(id.clone())
+                .or_default()
+                .refresh(&self.store, &self.tasks[&id], false);
+        }
+    }
+
+    fn load_detail(&mut self, id: &str) {
+        let same = self.detail.as_ref().is_some_and(|(loaded, _)| loaded == id);
+        if same && self.detail_ready {
+            return;
+        }
+        self.detail_ready = true;
+        self.list_ready = false;
+        let Some(t) = self.tasks.get(id) else {
+            return;
+        };
+        if !same {
+            self.detail = Some((id.to_owned(), Tail::default()));
+        }
+        self.detail
+            .as_mut()
+            .unwrap()
+            .1
+            .refresh(&self.store, t, true);
     }
 
     /// A task by its ID, or by its name when no other task has it.
@@ -704,7 +778,13 @@ impl View {
 
     /// A line for each task: fitted to `size` with colors, or whole and plain without it. The
     /// `chosen` task's line is marked and always shown.
-    fn frame(&self, now: u64, size: Option<(usize, usize)>, chosen: Option<&str>) -> Vec<String> {
+    fn frame(
+        &mut self,
+        now: u64,
+        size: Option<(usize, usize)>,
+        chosen: Option<&str>,
+    ) -> Vec<String> {
+        self.load_list(now);
         self.list_frame(now, size, chosen, None)
     }
 
@@ -798,22 +878,7 @@ impl View {
     /// A line for each task, sub-tasks under their parent, and with several sessions a line
     /// for each above the tasks it spawned. Also returns how many stopped tasks are left out.
     fn table(&self, now: u64) -> (Vec<Row>, usize) {
-        let mut shown: HashSet<&str> = self
-            .tasks
-            .values()
-            .filter(|t| self.all || active(t) || now.saturating_sub(t.updated_ms) < RECENT_MS)
-            .map(|t| t.id.as_str())
-            .collect();
-        // A shown sub-task brings its ancestors, so that it appears where it belongs.
-        for id in shown.clone() {
-            let mut up = self.parent(&self.tasks[id]);
-            while let Some(p) = up {
-                if !shown.insert(&p.id) {
-                    break;
-                }
-                up = self.parent(p);
-            }
-        }
+        let shown = self.shown(now);
         let hidden = self.tasks.len() - shown.len();
         let mut sorted: Vec<&Task> = shown.iter().map(|id| &self.tasks[*id]).collect();
         sorted.sort_by_key(|t| (Reverse(t.created_ms), t.id.as_str()));
@@ -931,7 +996,7 @@ impl View {
     /// latest last, as much as the window holds. With `keys`, its title says how to go back to
     /// the list.
     fn task_frame(
-        &self,
+        &mut self,
         id: &str,
         now: u64,
         size: Option<(usize, usize)>,
@@ -941,13 +1006,14 @@ impl View {
     }
 
     fn task_view(
-        &self,
+        &mut self,
         id: &str,
         now: u64,
         size: Option<(usize, usize)>,
         keys: bool,
         scroll: Option<&mut Scroll>,
     ) -> Vec<String> {
+        self.load_detail(id);
         // The way back is told however narrow the window: the title gives way to it.
         let width = size.map(|(w, _)| w);
         let back = |title: Vec<Seg>| match keys {
@@ -958,7 +1024,7 @@ impl View {
             let gone = format!("{id} is gone: it was removed, by gc or by hand");
             return finish(&[back(vec![(gone, DIM)])], size);
         };
-        let tail = self.tail(id);
+        let tail = &self.detail.as_ref().unwrap().1;
         let (state, color) = state(t, tail);
         let agent = format!(
             "{}/{}",
@@ -1801,6 +1867,7 @@ fn break_at(piece: &[char], next: char) -> Option<usize> {
 struct Tail {
     /// Bytes of `events.jsonl` read, up to the end of the last whole line.
     offset: u64,
+    stamp: Option<FileStamp>,
     in_turn: bool,
     started_ms: u64,
     ended_ms: u64,
@@ -1829,6 +1896,7 @@ impl Tail {
     const fn empty() -> Tail {
         Tail {
             offset: 0,
+            stamp: None,
             in_turn: false,
             started_ms: 0,
             ended_ms: 0,
@@ -1844,22 +1912,91 @@ impl Tail {
         }
     }
 
-    /// The events appended since the last read. A line still being written waits for the
-    /// next read.
-    fn read(&mut self, path: &Path) -> Vec<Event> {
-        let mut bytes = Vec::new();
-        let read = File::open(path).and_then(|mut f| {
-            f.seek(SeekFrom::Start(self.offset))?;
-            f.read_to_end(&mut bytes)
+    fn refresh(&mut self, store: &Store, t: &Task, detail: bool) {
+        self.read(&store.events_path(&t.id), |e| {
+            if !detail {
+                return None;
+            }
+            let path = store.message_path(&t.id, e.seq);
+            Some((read_text(&path)?, path))
         });
-        let Some(end) = read.ok().and(bytes.iter().rposition(|&b| b == b'\n')) else {
-            return Vec::new();
+        if detail && self.prompt.is_none() {
+            self.prompt = read_text(&store.prompt_path(&t.id));
+        }
+        // The results of the turns whose last messages are kept, and the latest.
+        let mut wanted: Vec<u32> = self
+            .log
+            .iter()
+            .filter_map(|l| match l.what {
+                What::Said { turn, .. } => turn,
+                _ => None,
+            })
+            .collect();
+        if !detail {
+            wanted.clear();
+        }
+        if t.turns > 0 && (detail || self.words.is_none()) {
+            wanted.push(t.turns);
+        }
+        wanted.sort_unstable();
+        wanted.dedup();
+        self.results.retain(|n, _| wanted.contains(n));
+        // The daemon counts a turn before writing its result, and says the turn ended after:
+        // till then the result may be missing or being written, even once a later turn has
+        // begun, and it is read again when its size changes. Without the turn's end in the
+        // events, as of a task from before they told it, it is never known whole.
+        for n in wanted {
+            let path = store.turn_path(&t.id, n);
+            let ended = self.ended_turns.contains(&n);
+            match self.results.get_mut(&n) {
+                Some((_, true)) => {}
+                Some((r, whole)) if fs::metadata(&path).is_ok_and(|m| m.len() == r.len) => {
+                    *whole = ended
+                }
+                _ => match read_text(&path) {
+                    Some(r) => drop(self.results.insert(n, (r, ended))),
+                    None => drop(self.results.remove(&n)),
+                },
+            }
+        }
+    }
+
+    /// Consume one complete record at a time, bounded by the size observed at open.
+    fn read(&mut self, path: &Path, message: impl Fn(&Event) -> Option<(Text, PathBuf)>) {
+        let Some(stamp) = FileStamp::of(path) else {
+            return;
         };
-        self.offset += end as u64 + 1;
-        bytes[..end]
-            .split(|&b| b == b'\n')
-            .filter_map(|l| serde_json::from_slice(l).ok())
-            .collect()
+        if self.stamp.as_ref() == Some(&stamp) {
+            return;
+        }
+        let Ok(mut file) = File::open(path) else {
+            return;
+        };
+        if self.stamp.as_ref().is_some_and(|old| {
+            stamp.len < self.offset || stamp.len <= old.len || stamp.created != old.created
+        }) {
+            *self = Self::default();
+        }
+        if file.seek(SeekFrom::Start(self.offset)).is_err() {
+            return;
+        }
+        let mut reader = BufReader::new(file.take(stamp.len.saturating_sub(self.offset)));
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) if line.last() != Some(&b'\n') => break,
+                Ok(n) => {
+                    self.offset += n as u64;
+                    if let Ok(e) = serde_json::from_slice::<Event>(&line) {
+                        self.absorb(&e, || message(&e));
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+        self.stamp = Some(stamp);
     }
 
     /// Follows the daemon's own account of turns in `Daemon::emit`. `message` reads the message
@@ -2576,6 +2713,7 @@ mod tests {
         let mut state = |e: Event| {
             store.append(&e).unwrap();
             view.refresh();
+            view.load_list(NOW);
             let t = &view.tasks["t1"];
             let tail = view.tail("t1");
             let lines: Vec<String> = details(t, tail)
@@ -2692,6 +2830,7 @@ mod tests {
             ))
             .unwrap();
         view.refresh();
+        view.load_list(NOW);
         let t = &view.tasks["t1"];
         assert_eq!(details(t, view.tail("t1"))[0].text, "boom");
         // The last message of each turn, said in it, is its result.
@@ -2937,6 +3076,7 @@ mod tests {
         view.refresh();
         assert_eq!(view.frame(NOW, Some((100, 10)), None), frame);
         // The daemon may leave the stalled mark on a task that stopped.
+        view.load_list(NOW);
         assert_eq!(state(&view.tasks["t0"], view.tail("t0")).0, "cancelled");
     }
 
@@ -3318,42 +3458,42 @@ mod tests {
             keys: true,
             ..Ui::default()
         };
-        let draw = |ui: &mut Ui, view: &View| {
+        let draw = |ui: &mut Ui, view: &mut View| {
             ui.draw(view, NOW, (80, 6))
                 .iter()
                 .map(|s| strip_sgr(s))
                 .collect::<Vec<_>>()
         };
-        assert!(draw(&mut ui, &view)[2].contains("codex session a"));
+        assert!(draw(&mut ui, &mut view)[2].contains("codex session a"));
         store
             .save(&task("new", "codex:b", "idle", NOW, json!({})))
             .unwrap();
         view.refresh();
-        let frame = draw(&mut ui, &view);
+        let frame = draw(&mut ui, &mut view);
         assert_eq!(ui.chosen.as_deref(), Some("new"));
         assert!(frame[2].contains("codex session b"));
         ui.press(Key::Down, &view, NOW);
-        draw(&mut ui, &view);
+        draw(&mut ui, &mut view);
         ui.press(Key::Down, &view, NOW);
-        draw(&mut ui, &view);
+        draw(&mut ui, &mut view);
         assert_eq!(ui.chosen.as_deref(), Some("t1"));
         store
             .save(&task("newer", "codex:b", "idle", NOW + 1, json!({})))
             .unwrap();
         view.refresh();
-        draw(&mut ui, &view);
+        draw(&mut ui, &mut view);
         assert_eq!(ui.chosen.as_deref(), Some("t1"));
         ui.press(Key::Up, &view, NOW);
-        let frame = draw(&mut ui, &view);
+        let frame = draw(&mut ui, &mut view);
         assert!(frame[2].contains("codex session a"), "{frame:?}");
         ui.press(Key::Home, &view, NOW);
-        draw(&mut ui, &view);
+        draw(&mut ui, &mut view);
         assert!(!ui.list_paused);
         store
             .save(&task("latest", "codex:c", "idle", NOW + 2, json!({})))
             .unwrap();
         view.refresh();
-        let frame = draw(&mut ui, &view);
+        let frame = draw(&mut ui, &mut view);
         assert_eq!(ui.chosen.as_deref(), Some("latest"));
         assert!(frame[2].contains("codex session c"));
     }
@@ -3382,35 +3522,35 @@ mod tests {
             keys: true,
             ..Ui::default()
         };
-        let selected_row = |ui: &mut Ui, view: &View| {
+        let selected_row = |ui: &mut Ui, view: &mut View| {
             ui.draw(view, NOW, (80, 9))
                 .iter()
                 .position(|line| line.contains("\x1b[7m"))
                 .unwrap()
         };
-        selected_row(&mut ui, &view);
+        selected_row(&mut ui, &mut view);
         for _ in 0..3 {
             ui.press(Key::Down, &view, NOW);
-            selected_row(&mut ui, &view);
+            selected_row(&mut ui, &mut view);
         }
         assert_eq!(ui.chosen.as_deref(), Some("t8"));
-        let before = selected_row(&mut ui, &view);
+        let before = selected_row(&mut ui, &mut view);
         for (id, parent, at) in [("new", "user", NOW), ("revived", "codex:old", NOW + 1)] {
             store
                 .save(&task(id, parent, "idle", at, json!({})))
                 .unwrap();
             view.refresh();
-            assert_eq!(selected_row(&mut ui, &view), before);
+            assert_eq!(selected_row(&mut ui, &mut view), before);
             assert_eq!(ui.chosen.as_deref(), Some("t8"));
         }
         assert_eq!(view.order(NOW)[0], "revived");
         ui.press(Key::Home, &view, NOW);
-        selected_row(&mut ui, &view);
+        selected_row(&mut ui, &mut view);
         assert_eq!(ui.chosen.as_deref(), Some("revived"));
         assert_eq!(ui.list_top, 0);
         store.remove("revived").unwrap();
         view.refresh();
-        selected_row(&mut ui, &view);
+        selected_row(&mut ui, &mut view);
         assert_eq!(ui.chosen.as_deref(), Some("old"));
     }
 
@@ -3850,7 +3990,7 @@ mod tests {
             keys: true,
             ..Ui::default()
         };
-        let plain = |ui: &mut Ui, view: &View| -> Vec<String> {
+        let plain = |ui: &mut Ui, view: &mut View| -> Vec<String> {
             ui.draw(view, NOW, (80, 6))
                 .iter()
                 .map(|l| strip_sgr(l))
@@ -3858,10 +3998,10 @@ mod tests {
         };
 
         // The first task is chosen and marked; the visible rows stay contiguous.
-        let frame = ui.draw(&view, NOW, (80, 6));
+        let frame = ui.draw(&mut view, NOW, (80, 6));
         assert_eq!(ui.chosen.as_deref(), Some("t0"));
         assert!(frame[3].starts_with("\x1b[7m  t0 "), "{frame:#?}");
-        let shown = plain(&mut ui, &view);
+        let shown = plain(&mut ui, &mut view);
         assert!(
             shown[0].ends_with("  ↑↓ choose  Enter open  q quit"),
             "{shown:#?}"
@@ -3872,18 +4012,18 @@ mod tests {
         assert!(shown[5].starts_with("  rows 1–3/8"));
 
         ui.press(PageDown, &view, NOW);
-        let shown = plain(&mut ui, &view);
+        let shown = plain(&mut ui, &mut view);
         assert_eq!(ui.chosen.as_deref(), Some("t3"));
         assert!(shown[2].starts_with("  t2 ") && shown[4].starts_with("  t4 "));
         ui.press(End, &view, NOW);
-        let shown = plain(&mut ui, &view);
+        let shown = plain(&mut ui, &mut view);
         assert!(shown[2].starts_with("  t4 ") && shown[4].starts_with("  ask "));
         ui.press(PageUp, &view, NOW);
-        let shown = plain(&mut ui, &view);
+        let shown = plain(&mut ui, &mut view);
         assert_eq!(ui.chosen.as_deref(), Some("t3"));
         assert!(shown[2].starts_with("  t1 ") && shown[4].starts_with("  t3 "));
         ui.press(Home, &view, NOW);
-        plain(&mut ui, &view);
+        plain(&mut ui, &mut view);
 
         // Up and down move through the list in its order, and stop at its ends.
         for (key, chosen) in [(Down, "t1"), (Up, "t0"), (Up, "t0")] {
@@ -3897,7 +4037,7 @@ mod tests {
 
         // Enter opens it; scrolling keeps it open, and Esc returns to the selected task.
         ui.press(Open, &view, NOW);
-        let one = plain(&mut ui, &view);
+        let one = plain(&mut ui, &mut view);
         assert!(
             one[0].starts_with("ask  tw codex/work  waiting") && one[0].ends_with("  Esc back")
         );
@@ -3919,15 +4059,15 @@ mod tests {
         ui.open = None;
         store.remove("tw").unwrap();
         view.refresh();
-        plain(&mut ui, &view);
+        plain(&mut ui, &mut view);
         assert_eq!(ui.chosen.as_deref(), Some("t0"));
 
         // Without keys, as when they can no longer be read, no line is marked and the title
         // tells of no keys.
         ui.keys = false;
-        let frame = ui.draw(&view, NOW, (80, 6));
+        let frame = ui.draw(&mut view, NOW, (80, 6));
         assert!(!frame.iter().any(|l| l.contains("\x1b[7m")), "{frame:#?}");
-        let shown = plain(&mut ui, &view);
+        let shown = plain(&mut ui, &mut view);
         assert!(!shown[0].contains("choose"), "{shown:#?}");
         assert!(!shown.iter().any(|l| columns(l) == 79), "{shown:#?}");
     }
@@ -3956,18 +4096,18 @@ mod tests {
             keys: true,
             ..Ui::default()
         };
-        ui.draw(&view, NOW, (80, 5));
+        ui.draw(&mut view, NOW, (80, 5));
         assert_eq!(ui.chosen.as_deref(), Some("a0"));
         ui.press(Key::PageDown, &view, NOW);
-        ui.draw(&view, NOW, (80, 5));
+        ui.draw(&mut view, NOW, (80, 5));
         assert_eq!(ui.chosen.as_deref(), Some("a2"));
         ui.press(Key::PageDown, &view, NOW);
-        ui.draw(&view, NOW, (80, 5));
+        ui.draw(&mut view, NOW, (80, 5));
         assert_eq!(ui.chosen.as_deref(), Some("b0"));
         ui.press(Key::Up, &view, NOW);
         assert_eq!(ui.chosen.as_deref(), Some("a3"));
         for height in [1, 2, 3, 4, 30] {
-            let frame = ui.draw(&view, NOW, (40, height));
+            let frame = ui.draw(&mut view, NOW, (40, height));
             assert!(frame.len() <= height);
             if height >= 3 {
                 assert!(
@@ -3984,7 +4124,7 @@ mod tests {
             ui.press(key, &view, NOW);
             assert!(ui.chosen.is_none());
             assert!(
-                ui.draw(&view, NOW, (80, 5))
+                ui.draw(&mut view, NOW, (80, 5))
                     .iter()
                     .any(|s| s.contains("no tasks"))
             );
@@ -4023,32 +4163,32 @@ mod tests {
             keys: true,
             ..Ui::default()
         };
-        let draw = |ui: &mut Ui, view: &View| {
+        let draw = |ui: &mut Ui, view: &mut View| {
             ui.draw(view, NOW, (80, 8))
                 .iter()
                 .map(|s| strip_sgr(s))
                 .collect::<Vec<_>>()
         };
-        let live = draw(&mut ui, &view);
+        let live = draw(&mut ui, &mut view);
         assert!(live.iter().any(|s| s.contains("latest before")));
         assert!(live[7].contains("live"));
 
         ui.press(Key::PageUp, &view, NOW);
-        let paused = draw(&mut ui, &view);
+        let paused = draw(&mut ui, &mut view);
         assert!(!paused.iter().any(|s| s.contains("latest before")));
         assert!(paused[7].contains("paused"));
         store
             .append(&event(2, 0, "t1", "said", json!({"text": "latest after"})))
             .unwrap();
         view.refresh();
-        let refreshed = draw(&mut ui, &view);
+        let refreshed = draw(&mut ui, &mut view);
         assert_eq!(paused[1..7], refreshed[1..7]);
 
         // Every rendered line is reachable, including the middle of a single long message.
         ui.press(Key::Home, &view, NOW);
         let mut read = String::new();
         for _ in 0..10 {
-            read.push_str(&draw(&mut ui, &view).join("\n"));
+            read.push_str(&draw(&mut ui, &mut view).join("\n"));
             ui.press(Key::PageDown, &view, NOW);
         }
         for i in 0..40 {
@@ -4056,13 +4196,13 @@ mod tests {
         }
         assert!(ui.detail.top.is_none());
         assert!(
-            draw(&mut ui, &view)
+            draw(&mut ui, &mut view)
                 .iter()
                 .any(|s| s.contains("latest after"))
         );
         ui.press(Key::Home, &view, NOW);
         for height in [1, 2, 3, 8, 80] {
-            let frame = ui.draw(&view, NOW, (24, height));
+            let frame = ui.draw(&mut view, NOW, (24, height));
             assert!(frame.len() <= height);
             assert!(frame.iter().all(|s| columns(&strip_sgr(s)) < 24));
             assert_eq!(ui.detail.top, Some(0));
@@ -4075,7 +4215,7 @@ mod tests {
         assert!(ui.detail.top.is_none());
         store.remove("t1").unwrap();
         view.refresh();
-        assert!(draw(&mut ui, &view)[0].contains("is gone"));
+        assert!(draw(&mut ui, &mut view)[0].contains("is gone"));
         ui.press(Key::Back, &view, NOW);
         assert!(ui.open.is_none());
     }
@@ -4104,7 +4244,7 @@ mod tests {
         // Past half the window, the first stay under the title and the rest open the
         // conversation.
         let live: Vec<String> = ui
-            .draw(&view, NOW, (80, 6))
+            .draw(&mut view, NOW, (80, 6))
             .iter()
             .map(|s| strip_sgr(s))
             .collect();
@@ -4116,7 +4256,7 @@ mod tests {
         ui.press(Key::Home, &view, NOW);
         let mut read = String::new();
         for _ in 0..10 {
-            read.push_str(&ui.draw(&view, NOW, (80, 6)).join("\n"));
+            read.push_str(&ui.draw(&mut view, NOW, (80, 6)).join("\n"));
             ui.press(Key::PageDown, &view, NOW);
         }
         for i in 0..20 {
@@ -4156,14 +4296,14 @@ mod tests {
             keys: true,
             ..Ui::default()
         };
-        let draw = |ui: &mut Ui, view: &View| {
+        let draw = |ui: &mut Ui, view: &mut View| {
             ui.draw(view, NOW, (80, 10))
                 .iter()
                 .map(|s| strip_sgr(s))
                 .collect::<Vec<_>>()
         };
         // Following the latest output, and paged back to the task text.
-        let live = draw(&mut ui, &view);
+        let live = draw(&mut ui, &mut view);
         assert!(live[0].contains("approval"), "{live:#?}");
         assert!(
             live[1].starts_with(" needs  approval r1: git push origin main"),
@@ -4172,7 +4312,7 @@ mod tests {
         assert!(live.iter().any(|s| s.contains("Pushing now.")), "{live:#?}");
         assert!(live[9].contains("live"), "{live:#?}");
         ui.press(Key::Home, &view, NOW);
-        let top = draw(&mut ui, &view);
+        let top = draw(&mut ui, &mut view);
         assert!(top[1].starts_with(" needs  approval r1"), "{top:#?}");
         assert!(top.iter().any(|s| s.contains("prompt-00")), "{top:#?}");
 
@@ -4182,10 +4322,315 @@ mod tests {
             .unwrap();
         view.refresh();
         ui.press(Key::End, &view, NOW);
-        let decided = draw(&mut ui, &view);
+        let decided = draw(&mut ui, &mut view);
         assert!(!decided.iter().any(|s| s.contains("needs")), "{decided:#?}");
         assert!(decided[0].contains("running"), "{decided:#?}");
         assert!(decided[9].contains("live"), "{decided:#?}");
+    }
+
+    #[test]
+    fn metadata_refresh_retries_bad_snapshots_and_detects_same_size_changes() {
+        let h = home();
+        let store = Store::new(&h.0);
+        let mut t = task("t1", "user", "idle", NOW, json!({"name": "old"}));
+        store.save(&t).unwrap();
+        let path = h.0.join("tasks/t1/task.json");
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let stamp = FileStamp::of(&path).unwrap();
+        let allocation = view.tasks["t1"].id.as_ptr();
+        view.refresh();
+        assert_eq!(view.tasks["t1"].id.as_ptr(), allocation);
+        t.name = Some("new".into());
+        let bytes = serde_json::to_vec_pretty(&t).unwrap();
+        assert_eq!(bytes.len() as u64, stamp.len);
+        let changed = stamp.modified + Duration::from_secs(2);
+        let write = |bytes: &[u8]| {
+            fs::write(&path, bytes).unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(fs::FileTimes::new().set_modified(changed))
+                .unwrap();
+        };
+        write(&vec![b'!'; bytes.len()]);
+        view.refresh();
+        assert_eq!(view.tasks["t1"].name.as_deref(), Some("old"));
+        assert_eq!(view.task_stamps["t1"], stamp);
+        write(&bytes);
+        view.refresh();
+        assert_eq!(view.tasks["t1"].name.as_deref(), Some("new"));
+        view.frame(NOW, None, None);
+        view.task_frame("t1", NOW, None, false);
+        store.remove("t1").unwrap();
+        view.refresh();
+        assert!(view.tasks.is_empty() && view.task_stamps.is_empty() && view.tails.is_empty());
+        assert!(view.detail.is_none());
+        store.save(&t).unwrap();
+        view.refresh();
+        assert_eq!(view.find("new").unwrap(), "t1");
+    }
+
+    #[test]
+    fn filtered_logs_and_detail_files_load_when_needed_and_catch_up_on_return() {
+        let h = home();
+        let store = Store::new(&h.0);
+        for (id, parent, status, at) in [
+            ("old", "user", "idle", NOW - 2 * HOUR),
+            ("ancestor", "user", "idle", NOW - 2 * HOUR),
+            ("child", "task:ancestor", "running", NOW),
+        ] {
+            store
+                .save(&task(id, parent, status, at, json!({})))
+                .unwrap();
+            store.save_prompt(id, &format!("prompt {id}")).unwrap();
+            store
+                .append(&event(
+                    1,
+                    0,
+                    id,
+                    "said",
+                    json!({"text": format!("said {id}")}),
+                ))
+                .unwrap();
+        }
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        assert_eq!(view.find("old").unwrap(), "old");
+        assert!(view.tails.is_empty() && view.detail.is_none());
+        let list = view.frame(NOW, None, None).join("\n");
+        assert!(list.contains("said ancestor") && list.contains("said child"));
+        assert!(!view.tails.contains_key("old"));
+        assert!(
+            view.tails
+                .values()
+                .all(|t| t.prompt.is_none() && t.first.is_none() && t.results.is_empty())
+        );
+        let old = view.task_frame("old", NOW, None, false).join("\n");
+        assert!(old.contains("prompt old") && old.contains("said old"));
+        assert_eq!(view.detail.as_ref().unwrap().0, "old");
+        store
+            .append(&event(
+                2,
+                0,
+                "child",
+                "approval_request",
+                json!({"id": "r1", "summary": "push"}),
+            ))
+            .unwrap();
+        view.refresh();
+        view.task_frame("old", NOW, None, false);
+        assert!(view.tail("child").approvals.is_empty());
+        assert!(
+            view.frame(NOW, None, None)
+                .join("\n")
+                .contains("1 approval(s)")
+        );
+        let child = view.task_frame("child", NOW, None, false).join("\n");
+        assert!(child.contains("prompt child") && child.contains("approval r1: push"));
+        assert_eq!(view.detail.as_ref().unwrap().0, "child");
+        view.all = true;
+        view.refresh();
+        assert!(view.frame(NOW, None, None).join("\n").contains("said old"));
+        view.all = false;
+        view.refresh();
+        view.frame(NOW, None, None);
+        assert!(!view.tails.contains_key("old"));
+        let mut child = view.tasks["child"].clone();
+        child.status = Status::Idle;
+        child.updated_ms = NOW - 2 * HOUR;
+        store.save(&child).unwrap();
+        view.refresh();
+        assert!(view.frame(NOW, None, None).join("\n").contains("no tasks"));
+        assert!(view.tails.is_empty());
+    }
+
+    #[test]
+    fn keys_redraw_cached_files_until_refresh_or_a_view_switch() {
+        let h = home();
+        let store = Store::new(&h.0);
+        store
+            .save(&task("t1", "user", "running", NOW, json!({})))
+            .unwrap();
+        store
+            .append(&event(1, 0, "t1", "said", json!({"text": "before"})))
+            .unwrap();
+        let mut view = View::new(&h.0, false);
+        let mut ui = Ui {
+            keys: true,
+            ..Ui::default()
+        };
+        view.refresh();
+        ui.draw(&mut view, NOW, (80, 20));
+        store
+            .append(&event(2, 0, "t1", "said", json!({"text": "after"})))
+            .unwrap();
+        for key in [Key::Down, Key::Up, Key::Home, Key::End] {
+            ui.press(key, &view, NOW);
+            assert!(
+                !ui.draw(&mut view, NOW, (80, 20))
+                    .join("\n")
+                    .contains("after")
+            );
+        }
+        ui.press(Key::Open, &view, NOW);
+        assert!(
+            ui.draw(&mut view, NOW, (80, 20))
+                .join("\n")
+                .contains("after")
+        );
+        store
+            .append(&event(3, 0, "t1", "said", json!({"text": "latest"})))
+            .unwrap();
+        for key in [Key::PageUp, Key::PageDown, Key::Home, Key::End] {
+            ui.press(key, &view, NOW);
+            assert!(
+                !ui.draw(&mut view, NOW, (80, 20))
+                    .join("\n")
+                    .contains("latest")
+            );
+        }
+        view.refresh();
+        assert!(
+            ui.draw(&mut view, NOW, (80, 20))
+                .join("\n")
+                .contains("latest")
+        );
+        store
+            .append(&event(4, 0, "t1", "said", json!({"text": "returned"})))
+            .unwrap();
+        ui.press(Key::Back, &view, NOW);
+        assert!(
+            ui.draw(&mut view, NOW, (80, 20))
+                .join("\n")
+                .contains("returned")
+        );
+    }
+
+    #[test]
+    fn streamed_events_retry_partial_lines_skip_bad_records_and_reset_after_rewrite() {
+        let h = home();
+        let path = h.0.join("events.jsonl");
+        let first =
+            serde_json::to_vec(&event(1, 0, "t1", "said", json!({"text": "first"}))).unwrap();
+        let second =
+            serde_json::to_vec(&event(2, 0, "t1", "said", json!({"text": "other"}))).unwrap();
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(b"\ninvalid\n");
+        bytes.extend_from_slice(&second[..second.len() / 2]);
+        fs::write(&path, &bytes).unwrap();
+        let mut tail = Tail::default();
+        tail.read(&path, |_| None);
+        assert_eq!(tail.words.as_ref().unwrap().0, "first");
+        assert_eq!(tail.offset, first.len() as u64 + 9);
+        tail.read(&path, |_| panic!("unchanged events must not be replayed"));
+        assert_eq!(tail.log.len(), 1);
+        let mut append = File::options().append(true).open(&path).unwrap();
+        append.write_all(&second[second.len() / 2..]).unwrap();
+        append.write_all(b"\n").unwrap();
+        drop(append);
+        tail.read(&path, |_| None);
+        assert_eq!(tail.words.as_ref().unwrap().0, "other");
+        assert_eq!(tail.log.len(), 2);
+        fs::write(&path, [&first[..], b"\n"].concat()).unwrap();
+        tail.read(&path, |_| None);
+        assert_eq!(tail.words.as_ref().unwrap().0, "first");
+        assert_eq!(tail.log.len(), 1);
+        let changed = tail.stamp.as_ref().unwrap().modified + Duration::from_secs(2);
+        fs::write(&path, [&second[..], b"\n"].concat()).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(changed))
+            .unwrap();
+        tail.read(&path, |_| None);
+        assert_eq!(tail.words.as_ref().unwrap().0, "other");
+        assert_eq!(tail.log.len(), 1);
+    }
+
+    // Run each measurement in a separate process with --release --ignored --nocapture.
+    // Fixture creation is excluded from timing; no daemon or agent is started.
+    fn measure_scale(tasks: usize, records: usize, recent: usize, detail: bool) {
+        use std::hint::black_box;
+        use std::io::BufWriter;
+        use std::time::Instant;
+        let h = home();
+        let store = Store::new(&h.0);
+        let record =
+            serde_json::to_string(&event(1, 0, "t0", "said", json!({"text": "x".repeat(256)})))
+                .unwrap();
+        for i in 0..tasks {
+            let id = format!("t{i}");
+            store
+                .save(&task(
+                    &id,
+                    "user",
+                    "idle",
+                    if i < recent { NOW } else { NOW - 2 * HOUR },
+                    json!({}),
+                ))
+                .unwrap();
+            store
+                .save_prompt(&id, &"prompt paragraph\n\n".repeat(50))
+                .unwrap();
+            let mut file = BufWriter::new(File::create(store.events_path(&id)).unwrap());
+            for _ in 0..records {
+                writeln!(file, "{record}").unwrap();
+            }
+            file.flush().unwrap();
+        }
+        let mut view = View::new(&h.0, false);
+        let draw = |view: &mut View| {
+            if detail {
+                black_box(view.task_view(
+                    "t0",
+                    NOW,
+                    Some((100, 30)),
+                    true,
+                    Some(&mut Scroll::default()),
+                ));
+            } else {
+                black_box(view.frame(NOW, Some((100, 30)), None));
+            }
+        };
+        let started = Instant::now();
+        view.refresh();
+        draw(&mut view);
+        let cold = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..20 {
+            view.refresh();
+            draw(&mut view);
+        }
+        let warm = started.elapsed() / 20;
+        let started = Instant::now();
+        for _ in 0..20 {
+            draw(&mut view);
+        }
+        let draw = started.elapsed() / 20;
+        println!(
+            "tasks={tasks} records/task={records} recent={recent} detail={detail} cold={cold:?} warm={warm:?} draw={draw:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "repeatable scale measurement"]
+    fn scale_many_tasks() {
+        measure_scale(1000, 1000, 10, false);
+    }
+
+    #[test]
+    #[ignore = "repeatable scale measurement"]
+    fn scale_large_log() {
+        measure_scale(1, 200_000, 1, false);
+    }
+
+    #[test]
+    #[ignore = "repeatable scale measurement"]
+    fn scale_detail() {
+        measure_scale(1000, 300, 1000, true);
     }
 
     /// A line broken into pieces of up to `room` columns, where `break_at` finds a place.
