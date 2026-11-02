@@ -516,7 +516,7 @@ fn tool_summary(name: &str, update: &Value) -> (String, String) {
             .unwrap_or("")
             .to_string(),
     };
-    (clip(target.unwrap_or(name), 200), clip(&detail, 200))
+    (clip(target.unwrap_or(name), 200), clip(&detail, 400))
 }
 
 /// The message so far, unless it was already reported.

@@ -232,8 +232,8 @@ fn tool_detail(input: &Value) -> String {
     ]
     .iter()
     .find_map(|k| input[*k].as_str())
-    .map(|s| clip(s, 200))
-    .unwrap_or_else(|| clip(&input.to_string(), 200))
+    .map(|s| clip(s, 400))
+    .unwrap_or_else(|| clip(&input.to_string(), 400))
 }
 
 /// What the agent wrote and the tools it called, in order.

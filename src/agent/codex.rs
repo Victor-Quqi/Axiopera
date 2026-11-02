@@ -294,7 +294,7 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
         }
         "item/started" => match item["type"].as_str() {
             Some("commandExecution") => {
-                let detail = clip(item["command"].as_str().unwrap_or(""), 200);
+                let detail = clip(item["command"].as_str().unwrap_or(""), 400);
                 let _ = events.send(AgentEvent::Tool {
                     id: None,
                     name: "shell".into(),
