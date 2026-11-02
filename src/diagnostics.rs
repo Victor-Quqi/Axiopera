@@ -56,6 +56,9 @@ pub fn retain_lines(path: &Path, mut keep: impl FnMut(&[u8]) -> bool) -> io::Res
             }
             if keep(&line) {
                 output.write_all(&line)?;
+                if line.last() != Some(&b'\n') {
+                    output.write_all(b"\n")?;
+                }
             }
         }
         output.flush()?;
@@ -72,6 +75,20 @@ pub fn retain_lines(path: &Path, mut keep: impl FnMut(&[u8]) -> bool) -> io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_finishes_a_last_line_before_future_appends() {
+        let dir = std::env::temp_dir().join(format!("axiopera-log-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("requests.jsonl");
+        fs::write(&path, b"old\nkept").unwrap();
+        retain_lines(&path, |line| line.starts_with(b"kept")).unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"new\n").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"kept\nnew\n");
+        drop(file);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn diagnostic_rotation_keeps_recent_data_and_bounds_large_utf8_records() {
