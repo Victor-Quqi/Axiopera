@@ -1,6 +1,6 @@
 //! Native model pickers, queried without starting an inference turn.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -16,10 +16,15 @@ use crate::ipc::Agent;
 #[derive(Debug, Default, Serialize)]
 pub struct Catalog {
     pub models: Vec<Model>,
+    /// The catalog's own default: Claude's account default, Codex's backend default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// What the agent itself picks when given no model or effort, user settings included.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_model: Option<String>,
+    pub native_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_effort: Option<String>,
+    /// Axiopera's configured model, passed to spawns without --model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configured_model: Option<String>,
 }
@@ -46,21 +51,26 @@ impl Catalog {
             Agent::Claude => "account default",
             _ => "backend default",
         };
-        if let Some(model) = &self.configured_model {
-            lines.push(format!("Configured model: {}", single_line(model)));
+        // A configured model may take a different default effort: name the model alone.
+        let spawns = match (
+            &self.configured_model,
+            &self.native_model,
+            &self.native_effort,
+        ) {
+            (Some(model), _, _) => Some(format!("{} (Axiopera config)", single_line(model))),
+            (None, Some(model), Some(effort)) => Some(format!(
+                "{}, effort {}",
+                single_line(model),
+                single_line(effort)
+            )),
+            (None, Some(model), None) => Some(single_line(model)),
+            (None, None, _) => None,
+        };
+        if let Some(spawns) = spawns {
+            lines.push(format!("Without --model, spawns use {spawns}."));
         }
         if self.models.is_empty() {
             lines.push("No models returned.".into());
-        }
-        for (label, model) in [
-            (default_label, &self.default_model),
-            ("current", &self.current_model),
-        ] {
-            if let Some(model) = model
-                && !self.models.iter().any(|m| &m.id == model)
-            {
-                lines.push(format!("{}  ({label})", single_line(model)));
-            }
         }
         for model in &self.models {
             let mut row = single_line(&model.id);
@@ -78,9 +88,6 @@ impl Catalog {
             }
             if self.default_model.as_deref() == Some(&model.id) {
                 row.push_str(&format!("  ({default_label})"));
-            }
-            if self.current_model.as_deref() == Some(&model.id) {
-                row.push_str("  (current)");
             }
             if model.disabled == Some(true) {
                 row.push_str("  (disabled)");
@@ -212,17 +219,18 @@ pub async fn query(
     .map(str::to_owned)
     .collect();
     let (proc, stdout) = Proc::spawn_with(exe, &args, cwd, env, None)?;
-    query_process(agent, proc, stdout, timeout).await
+    query_process(agent, proc, stdout, cwd, timeout).await
 }
 
 async fn query_process(
     agent: Agent,
     mut proc: Proc,
     stdout: ChildStdout,
+    cwd: &Path,
     timeout: Duration,
 ) -> Result<Catalog> {
     let mut lines = super::lines(stdout);
-    let result = tokio::time::timeout(timeout, discover(agent, &proc, &mut lines)).await;
+    let result = tokio::time::timeout(timeout, discover(agent, &proc, &mut lines, cwd)).await;
     // Kill the whole job on success and error, including any startup helper processes.
     proc.job.kill();
     let _ = proc.child.wait().await;
@@ -233,42 +241,43 @@ async fn discover(
     agent: Agent,
     proc: &Proc,
     lines: &mut Lines<BufReader<ChildStdout>>,
+    cwd: &Path,
 ) -> Result<Catalog> {
     let mut catalog = Catalog::default();
     match agent {
         Agent::Claude => {
             proc.stdin.send(&json!({"type":"control_request","request_id":"models","request":{"subtype":"initialize","hooks":{}}})).await?;
-            while let Some(line) = lines.next_line().await? {
-                let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if msg["type"] == "control_request" {
-                    proc.stdin.send(&json!({"type":"control_response","response":{"subtype":"error","request_id":msg["request_id"],"error":"model query only"}})).await?;
-                }
-                if msg["type"] != "control_response" || msg["response"]["request_id"] != "models" {
-                    continue;
-                }
-                let response = &msg["response"];
-                if response["subtype"] != "success" {
-                    bail!("model query initialize failed")
-                }
-                let payload = &response["response"];
-                catalog.models = parse_models(agent, &payload["models"])?;
-                if catalog.models.iter().any(|m| m.id == "default") {
-                    catalog.default_model = Some("default".into());
-                }
-                if let Some(unavailable) = payload.get("unavailable_models") {
-                    for mut model in parse_models(agent, unavailable)? {
-                        if catalog.models.iter().any(|m| m.id == model.id) {
-                            continue;
-                        }
-                        model.disabled = Some(true);
-                        catalog.models.push(model);
-                    }
-                }
-                return Ok(catalog);
+            let response = claude_response(proc, lines, "models")
+                .await?
+                .context("agent exited before returning models")?;
+            if response["subtype"] != "success" {
+                bail!("model query initialize failed")
             }
-            bail!("agent exited before returning models")
+            let payload = &response["response"];
+            catalog.models = parse_models(agent, &payload["models"])?;
+            if catalog.models.iter().any(|m| m.id == "default") {
+                catalog.default_model = Some("default".into());
+            }
+            if let Some(unavailable) = payload.get("unavailable_models") {
+                for mut model in parse_models(agent, unavailable)? {
+                    if catalog.models.iter().any(|m| m.id == model.id) {
+                        continue;
+                    }
+                    model.disabled = Some(true);
+                    catalog.models.push(model);
+                }
+            }
+            // The model and effort a session gets from the user's settings. The reply holds all
+            // of the settings: only these two are read. Without it the catalog still stands.
+            proc.stdin.send(&json!({"type":"control_request","request_id":"settings","request":{"subtype":"get_settings"}})).await?;
+            let settings = claude_response(proc, lines, "settings");
+            if let Ok(Ok(Some(response))) = tokio::time::timeout(SETTINGS_WAIT, settings).await
+                && response["subtype"] == "success"
+            {
+                let applied = &response["response"]["applied"];
+                catalog.native_model = string(applied, "model");
+                catalog.native_effort = string(applied, "effort");
+            }
         }
         Agent::Codex => {
             rpc(
@@ -284,6 +293,7 @@ async fn discover(
                 .await?;
             let mut cursor = Value::Null;
             let mut seen = HashSet::new();
+            let mut efforts = HashMap::new();
             let mut id = 2;
             loop {
                 let page = rpc(proc, lines, id, "model/list", json!({"cursor":cursor})).await?;
@@ -291,6 +301,9 @@ async fn discover(
                 for (row, model) in page["data"].as_array().unwrap().iter().zip(&models) {
                     if row["isDefault"] == true {
                         catalog.default_model = Some(model.id.clone());
+                    }
+                    if let Some(effort) = string(row, "defaultReasoningEffort") {
+                        efforts.insert(model.id.clone(), effort);
                     }
                 }
                 catalog.models.extend(models);
@@ -303,6 +316,21 @@ async fn discover(
                 }
                 id += 1;
             }
+            // A new thread takes the configured model and effort, project layers included, else
+            // the catalog's defaults. Only these two keys of the configuration are read.
+            let params = json!({"cwd": cwd, "includeLayers": false});
+            if let Ok(read) = rpc(proc, lines, id + 1, "config/read", params).await {
+                catalog.native_model = string(&read["config"], "model");
+                catalog.native_effort = string(&read["config"], "model_reasoning_effort");
+            }
+            let model = catalog
+                .native_model
+                .take()
+                .or(catalog.default_model.clone());
+            if catalog.native_effort.is_none() {
+                catalog.native_effort = model.as_ref().and_then(|m| efforts.remove(m));
+            }
+            catalog.native_model = model;
         }
         Agent::Grok => {
             rpc(proc, lines, 1, "initialize", json!({"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"axiopera","version":env!("CARGO_PKG_VERSION")}})).await?;
@@ -312,10 +340,40 @@ async fn discover(
             }
             let payload = response.get("result").unwrap_or(&response);
             catalog.models = parse_models(agent, &payload["availableModels"])?;
-            catalog.current_model = string(payload, "currentModelId");
+            // New sessions start on the current model, at the effort listed with it.
+            catalog.native_model = string(payload, "currentModelId");
+            catalog.native_effort = payload["availableModels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|row| catalog.native_model.as_deref() == row["modelId"].as_str())
+                .and_then(|row| string(&row["_meta"], "reasoningEffort"));
         }
     }
     Ok(catalog)
+}
+
+/// How long the catalog waits for Claude's settings, which older versions may not answer.
+const SETTINGS_WAIT: Duration = Duration::from_secs(2);
+
+/// The reply to the control request `id`; Claude's own requests are turned down meanwhile.
+async fn claude_response(
+    proc: &Proc,
+    lines: &mut Lines<BufReader<ChildStdout>>,
+    id: &str,
+) -> Result<Option<Value>> {
+    while let Some(line) = lines.next_line().await? {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if msg["type"] == "control_request" {
+            proc.stdin.send(&json!({"type":"control_response","response":{"subtype":"error","request_id":msg["request_id"],"error":"model query only"}})).await?;
+        }
+        if msg["type"] == "control_response" && msg["response"]["request_id"] == id {
+            return Ok(Some(msg["response"].clone()));
+        }
+    }
+    Ok(None)
 }
 
 async fn rpc(
@@ -419,7 +477,7 @@ mod tests {
             &env,
             None,
         )?;
-        query_process(agent, proc, stdout, timeout).await
+        query_process(agent, proc, stdout, &std::env::current_dir()?, timeout).await
     }
 
     #[test]
@@ -437,6 +495,15 @@ mod tests {
             let msg: Value = serde_json::from_str(&line.unwrap()).unwrap();
             if mode == "hang" {
                 std::thread::sleep(Duration::from_secs(30));
+            }
+            if msg["request"]["subtype"] == "get_settings" {
+                if mode == "silent" {
+                    continue;
+                }
+                send(
+                    json!({"type":"control_response","response":{"request_id":msg["request_id"],"subtype":"success","response":{"env":{"SECRET":"x"},"applied":{"model":"claude-opus","effort":"xhigh"}}}}),
+                );
+                continue;
             }
             if msg["type"] == "control_request" {
                 send(
@@ -456,9 +523,21 @@ mod tests {
                         );
                         json!({"data":[{"model":"first","displayName":"First"}],"nextCursor":"page2"})
                     } else {
-                        json!({"data":[{"model":"second","displayName":"Second","isDefault":true}],"nextCursor":if mode == "repeat" { json!("page2") } else { Value::Null }})
+                        json!({"data":[{"model":"second","displayName":"Second","isDefault":true,"defaultReasoningEffort":"medium"}],"nextCursor":if mode == "repeat" { json!("page2") } else { Value::Null }})
                     }
                 }
+                Some("config/read") => match mode.as_str() {
+                    "configured" => {
+                        json!({"config":{"model":"first","model_reasoning_effort":"high","model_providers":{"x":{"token":"secret"}}}})
+                    }
+                    "unsupported" => {
+                        send(
+                            json!({"jsonrpc":"2.0","id":msg["id"],"error":{"code":-32601,"message":"method not found"}}),
+                        );
+                        continue;
+                    }
+                    _ => json!({"config":{"model":null}}),
+                },
                 Some("_x.ai/models/list") => {
                     if mode == "unsupported" {
                         send(
@@ -469,7 +548,7 @@ mod tests {
                     if mode == "error" {
                         json!({"error":"catalog unavailable"})
                     } else {
-                        json!({"result":{"currentModelId":"company-claude","availableModels":[{"modelId":"company-claude","name":"Claude"}]}})
+                        json!({"result":{"currentModelId":"company-claude","availableModels":[{"modelId":"other","name":"Other"},{"modelId":"company-claude","name":"Claude","_meta":{"reasoningEffort":"high"}}]}})
                     }
                 }
                 _ => continue,
@@ -491,28 +570,35 @@ mod tests {
             ["first", "second"]
         );
         assert_eq!(codex.default_model.as_deref(), Some("second"));
-        assert!(
-            codex
-                .render(Agent::Codex)
-                .contains("second  (backend default)")
-        );
-        let grok = fixture(Agent::Grok, "ok", timeout).await.unwrap();
-        assert_eq!(grok.current_model.as_deref(), Some("company-claude"));
-        assert!(grok.default_model.is_none());
         assert_eq!(
-            grok.render(Agent::Grok),
-            "company-claude  Claude  (current)"
+            codex.render(Agent::Codex),
+            "Without --model, spawns use second, effort medium.\nfirst\nsecond  (backend default)"
         );
+        // The user's configuration wins over the catalog's default.
+        let configured = fixture(Agent::Codex, "configured", timeout).await.unwrap();
+        assert_eq!(configured.native_model.as_deref(), Some("first"));
+        assert_eq!(configured.native_effort.as_deref(), Some("high"));
+        // Without config/read the catalog's default still answers.
+        let old = fixture(Agent::Codex, "unsupported", timeout).await.unwrap();
+        assert_eq!(old.native_model.as_deref(), Some("second"));
+        let grok = fixture(Agent::Grok, "ok", timeout).await.unwrap();
+        assert_eq!(grok.native_model.as_deref(), Some("company-claude"));
+        assert_eq!(grok.native_effort.as_deref(), Some("high"));
+        assert!(grok.default_model.is_none());
         let json = serde_json::to_value(&grok).unwrap();
-        assert_eq!(json["current_model"], "company-claude");
+        assert_eq!(json["native_model"], "company-claude");
         assert!(json.get("default_model").is_none());
         let claude = fixture(Agent::Claude, "ok", timeout).await.unwrap();
         assert_eq!(claude.default_model.as_deref(), Some("default"));
         assert_eq!(
             claude.render(Agent::Claude),
-            "default  (account default)\nrestricted  (disabled)"
+            "Without --model, spawns use claude-opus, effort xhigh.\ndefault  (account default)\nrestricted  (disabled)"
         );
         assert_eq!(claude.models[1].disabled, Some(true));
+        // Versions that do not answer get_settings still list their models, after a wait.
+        let silent = fixture(Agent::Claude, "silent", timeout).await.unwrap();
+        assert!(silent.native_model.is_none());
+        assert_eq!(silent.models.len(), 2);
         assert!(
             fixture(Agent::Codex, "repeat", timeout)
                 .await
@@ -597,12 +683,14 @@ mod tests {
                 {"value":"custom","displayName":"Team model","resolvedModel":""}
             ])).unwrap(),
             default_model: Some("default".into()),
+            native_model: Some("claude-opus".into()),
+            native_effort: Some("xhigh".into()),
             configured_model: Some("custom".into()),
-            ..Catalog::default()
         };
+        // A configured model may take another default effort: none is named.
         assert_eq!(
             catalog.render(Agent::Claude),
-            "Configured model: custom\ndefault → claude-opus  (account default)  effort: low, high\nopus → claude-opus\nclaude-sonnet\ncustom  Team model"
+            "Without --model, spawns use custom (Axiopera config).\ndefault → claude-opus  (account default)  effort: low, high\nopus → claude-opus\nclaude-sonnet\ncustom  Team model"
         );
         let json = serde_json::to_value(&catalog).unwrap();
         assert_eq!(json["models"][0]["description"], "Account default");
@@ -611,22 +699,14 @@ mod tests {
     }
 
     #[test]
-    fn selections_outside_the_catalog_are_visible() {
+    fn spawn_defaults_outside_the_catalog_are_visible() {
         let catalog = Catalog {
-            current_model: Some("custom".into()),
-            ..Catalog::default()
-        };
-        assert_eq!(
-            catalog.render(Agent::Grok),
-            "No models returned.\ncustom  (current)"
-        );
-        let catalog = Catalog {
-            default_model: Some("custom".into()),
+            native_model: Some("custom".into()),
             ..Catalog::default()
         };
         assert_eq!(
             catalog.render(Agent::Codex),
-            "No models returned.\ncustom  (backend default)"
+            "Without --model, spawns use custom.\nNo models returned."
         );
     }
 }

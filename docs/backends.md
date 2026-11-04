@@ -73,7 +73,9 @@ Codex decline 不能带拒绝理由，适配器另用 steer 送入理由。Grok 
 
 模型列表通过原生进程查询，保留可直接选用的 ID，包括别名和第三方模型。查询只握手和读取目录：Claude 取 stream-json `initialize` 响应的 `models`；Codex 取 app-server `model/list` 并遍历分页；Grok 取 ACP 扩展 `_x.ai/models/list`。旧版缺少接口时返回错误。
 
-Claude 的 `resolvedModel` 保留为 `resolved_model`，缺失时只显示原 ID。Claude 的 `default` 入口和 Codex 的 `isDefault` 记录为 `default_model`；Grok 的 `currentModelId` 记录为 `current_model`。
+Claude 的 `resolvedModel` 保留为 `resolved_model`，缺失时只显示原 ID。Claude 的 `default` 入口和 Codex 的 `isDefault` 记录为 `default_model`，即目录自身的默认值。
+
+不带模型和推理强度时原生 CLI 实际采用的值记录为 `native_model`、`native_effort`，包括用户自己的设置：Claude 在目录之后发 `get_settings`，取 `applied` 的模型和强度，2 秒内没有回复则省略；Codex 取 `config/read`（带工作目录，含项目层）的 `model` 和 `model_reasoning_effort`，缺失时取目录默认模型及其 `defaultReasoningEffort`；Grok 取 `currentModelId` 及该行 `_meta.reasoningEffort`。两份设置的回复都含全部配置，只读取这两项。Grok 服务端下发的 campaign 在运行时覆盖配置中的默认模型，配置文件不变，用户在 Grok 中选择模型后解除；新会话按建立时已取得的 campaign 决定是否套用，进程取得模型目录后也会重新选择默认模型，因此同一配置下前后两次启动可能不同。
 
 Claude 查询使用 `--no-session-persistence`，通过单次参数关闭 hook 和 MCP 启动。Codex、Grok 查询不创建线程或会话。进程退出、查询结束或超时后回收进程树。目录来源和账号调用权限由各后端管理，Axiopera 不额外推断。
 

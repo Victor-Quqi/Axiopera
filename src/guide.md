@@ -13,7 +13,8 @@ Dispatch
   Tasks share your working directory unless --cwd selects another; axiopera creates no copy.
   Give parallel writers separate git worktrees via --cwd.
   A timeout interrupts the task; send resumes its session with a fresh time limit.
-  axiopera models <agent> lists --model IDs and --effort values; --json includes descriptions.
+  axiopera models <agent> lists --model IDs and --effort values and names what spawns use
+  without --model; --json includes descriptions.
 
 Get results
   axiopera inbox           collects results, questions, approval requests and problems from
