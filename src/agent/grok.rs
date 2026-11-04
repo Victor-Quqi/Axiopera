@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -72,14 +72,7 @@ pub struct Grok {
 
 impl Grok {
     pub async fn start(spec: &StartSpec, exe: &Path, events: Events) -> Result<Grok> {
-        let mut args: Vec<String> = vec!["agent".into(), "--no-leader".into()];
-        if let Some(m) = &spec.model {
-            args.extend(["-m".into(), m.clone()]);
-        }
-        if let Some(e) = &spec.effort {
-            args.extend(["--reasoning-effort".into(), e.clone()]);
-        }
-        args.push("stdio".into());
+        let args = ["agent", "--no-leader", "stdio"].map(String::from);
         let (proc, stdout) = Proc::spawn(exe, &args, spec)?;
         let (rpc, incoming) = Rpc::start(stdout, proc.stdin.clone());
         let state: Arc<Mutex<State>> = Arc::default();
@@ -113,7 +106,7 @@ impl Grok {
         };
         meta["rules"] = json!(protocol_text(spec));
         let mut params = json!({"cwd": spec.cwd, "mcpServers": [], "_meta": meta});
-        let session = match &spec.resume {
+        let (session, reply) = match &spec.resume {
             Some(id) => {
                 params["sessionId"] = json!(id);
                 state.lock().unwrap().loading = true;
@@ -123,18 +116,44 @@ impl Grok {
                     s.loading = false;
                     s.text.clear();
                 }
-                loaded?;
-                id.clone()
+                (id.clone(), loaded?)
             }
-            None => rpc.call("session/new", params).await?["sessionId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
+            None => {
+                let created = rpc.call("session/new", params).await?;
+                let id = created["sessionId"].as_str().unwrap_or_default();
+                (id.to_string(), created)
+            }
         };
         let _ = events.send(AgentEvent::Session {
             file: Some(session_file(spec, &session)),
             id: session.clone(),
         });
+        if spec.tier == Tier::Read
+            && let Some(model) = &spec.model
+        {
+            keeps_read_profile(&reply, model)?;
+        }
+        // ACP sessions ignore `-m` and `--reasoning-effort`; config options do apply.
+        for (option, what, value) in [
+            ("model", "model", &spec.model),
+            ("reasoning_effort", "reasoning effort", &spec.effort),
+        ] {
+            let Some(value) = value else { continue };
+            let params = json!({"sessionId": session, "configId": option, "value": value});
+            match rpc
+                .request("session/set_config_option", params)
+                .await?
+                .await
+            {
+                Ok(Ok(_)) => {}
+                // Grok answers an unknown value with a bare "Invalid params".
+                Ok(Err(e)) if e.code == -32602 => {
+                    bail!("invalid value '{value}' for {what}: Grok rejected it ({e})")
+                }
+                Ok(Err(e)) => bail!("setting the {what} failed: {e}"),
+                Err(_) => bail!("grok exited while setting the {what}"),
+            }
+        }
         Ok(Grok {
             proc,
             rpc,
@@ -211,6 +230,44 @@ fn session_file(spec: &StartSpec, id: &str) -> PathBuf {
         .join(cwd)
         .join(id)
         .join("chat_history.jsonl")
+}
+
+/// The harness (agent type) Grok runs `model` on, as the session reply lists it.
+fn harness<'a>(session: &'a Value, model: &str) -> Option<&'a str> {
+    session["models"]["availableModels"]
+        .as_array()?
+        .iter()
+        .find(|m| m["modelId"] == model)?["_meta"]["agentType"]
+        .as_str()
+}
+
+/// Switching a session without turns to a model on another harness, such as Codex's, makes Grok
+/// rebuild the agent from that harness's definition, dropping the read tier's profile with its
+/// tool limits. Refuse such a model rather than switch to it, naming the models that keep it:
+/// `models grok` does not tell harnesses apart.
+fn keeps_read_profile(session: &Value, model: &str) -> Result<()> {
+    let current = session["models"]["currentModelId"].as_str();
+    let (Some(wanted), Some(now)) = (
+        harness(session, model),
+        current.and_then(|c| harness(session, c)),
+    ) else {
+        return Ok(());
+    };
+    if wanted == now {
+        return Ok(());
+    }
+    let keeping: Vec<&str> = session["models"]["availableModels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|m| m["_meta"]["agentType"] == now)
+        .filter_map(|m| m["modelId"].as_str())
+        .collect();
+    bail!(
+        "model '{model}' would make Grok drop the read tier's tool limits; for --tier read pick \
+         one of {}, or keep this model with --tier work or full",
+        keeping.join(", ")
+    )
 }
 
 async fn pump(
@@ -782,5 +839,26 @@ mod tests {
         let s = state.lock().unwrap();
         assert!(s.text.is_empty());
         assert!(!s.response_complete);
+    }
+
+    #[test]
+    fn read_tier_refuses_a_model_on_another_harness() {
+        let session = json!({"models": {"currentModelId": "grok", "availableModels": [
+            {"modelId": "grok", "_meta": {"agentType": "grok-build-plan"}},
+            {"modelId": "grok-fast", "_meta": {"agentType": "grok-build-plan"}},
+            {"modelId": "grok-codex", "_meta": {"agentType": "codex"}},
+        ]}});
+        assert!(keeps_read_profile(&session, "grok-fast").is_ok());
+        let refused = keeps_read_profile(&session, "grok-codex")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            refused,
+            "model 'grok-codex' would make Grok drop the read tier's tool limits; for --tier read \
+             pick one of grok, grok-fast, or keep this model with --tier work or full"
+        );
+        // Nothing to compare: Grok decides.
+        assert!(keeps_read_profile(&session, "unlisted").is_ok());
+        assert!(keeps_read_profile(&Value::Null, "grok-codex").is_ok());
     }
 }

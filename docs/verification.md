@@ -19,6 +19,7 @@
 | 结论 | 依据 |
 |---|---|
 | [模型查询](backends.md#模型查询)：三家原生目录查询及推理强度字段；Codex 无效强度错误附模型列表 | `models.py`、`models.py codex --errors`，Windows，Claude Code 2.1.309、Codex 0.164.0、Grok 1.0.67；查询不发推理请求，错误探针使用 Codex 在 `turn/start` 拒绝的非法强度。Claude 2.1.312 的 `resolvedModel` 另由 `axiopera models claude --json` 实测。字段映射、渲染、分页、空列表、禁用项、超时回收及错误分类由单元测试覆盖 |
+| [会话与消息](backends.md#会话与消息)：Grok ACP 会话忽略 `-m`、`--reasoning-effort`，`session/set_config_option` 生效，无效值返回 `-32602` | 手动实验，Windows，Grok 1.0.67：带参数和设置配置项各跑一轮，比较 `session/prompt` 回复的 `_meta.modelId`、`model_changed` 通知和会话文件中的模型与强度；无效模型和强度各设置一次。`GROK_DEFAULT_MODEL` 同样不改变新会话的模型。切换到另一 harness 时重建 agent、丢弃 profile 见源码 [model_switch.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs#L60-L175)、[mvp_agent/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs#L935-L948)；1.0.67 目录中的模型都是 `grok-build-plan`，拒绝路径由单元测试覆盖 |
 | [已测版本](#已测版本)中的端到端流程：主 agent 仅凭 `guide --host` 完成派发、收结果、追问和取消 | `host_e2e.py` |
 | [宿主通知](backends.md#宿主通知)：`grok -p` 等 persistent monitor 结束才退出，`--no-wait-for-background` 让它在本轮结束时退出 | `host_e2e.py grok` |
 | [权限](backends.md#权限)：read 档 MCP 工具按注解过滤 | `read_mcp.py` |

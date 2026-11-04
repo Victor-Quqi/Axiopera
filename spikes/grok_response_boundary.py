@@ -15,7 +15,7 @@ def main():
             f"GROK_CLAUDE_{kind}_ENABLED": "0"
             for kind in ("MCPS", "HOOKS", "SKILLS", "RULES", "AGENTS")
         })
-        rpc = Rpc([GROK, "agent", "--no-leader", "--reasoning-effort", "low", "stdio"], cwd, env=env,
+        rpc = Rpc([GROK, "agent", "--no-leader", "stdio"], cwd, env=env,
                   on_request=lambda *_: {"outcome": {"outcome": "cancelled"}})
         rpc.call("initialize", {"protocolVersion": 1, "clientCapabilities": {
             "fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False,
@@ -24,6 +24,8 @@ def main():
             "cwd": str(cwd), "mcpServers": [],
             "_meta": {"yoloMode": False, "autoMode": False},
         })["sessionId"]
+        # ACP sessions ignore --reasoning-effort.
+        rpc.call("session/set_config_option", {"sessionId": sid, "configId": "reasoning_effort", "value": "low"})
         reply = rpc.call_async("session/prompt", {
             "sessionId": sid,
             "prompt": [{"type": "text", "text": (

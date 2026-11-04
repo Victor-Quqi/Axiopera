@@ -84,6 +84,7 @@ Claude 查询使用 `--no-session-persistence`，通过单次参数关闭 hook �
 | 进程协议 | `-p`，stream-json 输入输出，启用 verbose、replay-user-messages 和 permission-prompts host | `app-server` JSON-RPC | `agent --no-leader stdio` ACP |
 | 新建 / 续接 | `--session-id` / `--resume` | `thread/start` / `thread/resume` | `session/new` / `session/load` |
 | 注入任务协议 | `--append-system-prompt` | `developerInstructions` | `_meta.rules` |
+| 模型 / 推理强度 | `--model` / `--effort` | `thread/start` 的 `model` / 每轮 `turn/start` 的 `effort` | `session/set_config_option` 的 `model` / `reasoning_effort` |
 | 开始一轮 | stdin user 消息 | `turn/start` | `session/prompt` |
 | 中途消息 | stdin user 消息 | `turn/steer` | `_x.ai/interject` |
 | 中断 | interrupt control request | `turn/interrupt` | `session/cancel` |
@@ -95,6 +96,8 @@ Claude read 档另加 `--permission-prompt-tool stdio`，只加 `host` 时收不
 Claude 的 user 回显可能合并多条消息，需要按 text block 匹配。轮末仍有未回显输入时继续持有进程。后台命令结束也可能让模型自行开启下一轮，通过 `background_tasks_changed` 和 `task_notification` 跟踪。
 
 Codex 的 `userMessage` 可能在轮末落盘，后续模型响应才构成输入被消费的证据。daemon 将未确认输入带入下一轮。`turn/steer` 返回无活跃轮次时，先处理旧轮末事件再开启新轮。
+
+Grok 的 ACP 会话不采用 `-m` 和 `--reasoning-effort`，它们只改变 `_x.ai/models/list` 报告的当前模型，有 campaign 时新会话也直接采用 campaign 的模型，因此在建立或载入会话后设置配置项。无效值只返回 `-32602 Invalid params`，适配器把它表述为模型或推理强度无效，以便附上模型列表。尚无轮次的会话切换到另一 harness 的模型（如 `codex`）时，Grok 按该 harness 重建 agent，客户端提供的 agent profile 随之丢失；read 档的工具限制来自这个 profile，因此 read 档按会话回复中各模型的 `agentType` 比较，拒绝与当前模型 harness 不同的模型；`models grok` 不区分 harness，因此错误中列出可保留 read 档的模型，或提示该模型改用 work、full 档。
 
 Grok 的 `_x.ai/session/interjection` 只确认入队。轮末输出注明消费确认缺口，Grok 把晚到消息排入后续 prompt。一次 prompt 内可以出现多段答复，`response_completed` 分隔答复；下一段实际输出文字后才替换已有结果。适配器在轮末保留 1 秒等待，并跟踪后台任务和 `runningPromptId`。`session/load` 的历史回放全部忽略。
 
