@@ -4,7 +4,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
 
 use crate::ipc::{self, Envelope, ErrorCode, Reply, Request};
@@ -66,6 +66,7 @@ impl Client {
             return Ok(ipc::exit::ERROR);
         }
         let env = request.needs_env().then(|| std::env::vars().collect());
+        let sub_agent = identity::task_of(&caller).is_some();
         let envelope = Envelope {
             protocol: ipc::PROTOCOL,
             version: env!("CARGO_PKG_VERSION").into(),
@@ -85,6 +86,9 @@ impl Client {
                 None => tokio::time::sleep(Duration::from_millis(500)).await,
             }
         }
+        if sub_agent {
+            bail!("daemon version mismatch persists; only the main session or the user can stop it")
+        }
         bail!(
             "daemon version mismatch persists; `axiopera daemon stop --force` interrupts active tasks from all sessions and stops the daemon"
         )
@@ -92,19 +96,16 @@ impl Client {
 
     /// Ok(None) only without `may_launch`, when nothing is running.
     async fn connect(&self, may_launch: bool) -> Result<Option<platform::ClientStream>> {
-        match platform::connect(&self.home).await {
-            Ok(s) => return Ok(Some(s)),
+        let stream = match platform::connect(&self.home).await {
+            Ok(s) => s,
             // Sandboxes that block sockets fail here rather than with "not found".
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => bail!("{SANDBOX_HINT}"),
-            Err(_) => {}
-        }
-        if !may_launch {
-            return Ok(None);
-        }
-        if platform::self_sandboxed() {
-            bail!("{SANDBOX_HINT}");
-        }
-        launch(&self.home).await.map(Some)
+            Err(_) if !may_launch => return Ok(None),
+            Err(_) if platform::self_sandboxed() => bail!("{SANDBOX_HINT}"),
+            Err(_) => launch(&self.home).await?,
+        };
+        platform::check_server(&stream)?;
+        Ok(Some(stream))
     }
 
     /// Returns the exit code, or None when the daemon asked us to retry after a version change.
@@ -142,9 +143,18 @@ pub fn detect_caller() -> String {
 /// Start the daemon unless another caller is already doing it, then wait for its endpoint.
 async fn launch(home: &Path) -> Result<platform::ClientStream> {
     let dir = home.join("daemon");
-    std::fs::create_dir_all(&dir)?;
-    let lock = File::create(dir.join("launch.lock"))
-        .with_context(|| format!("writing {}", dir.display()))?;
+    // A sandbox that lets the missing socket through as "not found" shows here instead.
+    let unwritable = |e: std::io::Error| match e.kind() {
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem => {
+            anyhow!(
+                "cannot write {}: {e}; in an agent sandbox, {SANDBOX_HINT}",
+                dir.display()
+            )
+        }
+        _ => anyhow!(e).context(format!("writing {}", dir.display())),
+    };
+    std::fs::create_dir_all(&dir).map_err(unwritable)?;
+    let lock = File::create(dir.join("launch.lock")).map_err(unwritable)?;
     tokio::task::block_in_place(|| lock.lock()).context("locking launch.lock")?;
     if let Ok(s) = platform::connect(home).await {
         return Ok(s);

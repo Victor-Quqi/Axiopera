@@ -83,17 +83,17 @@ Windows 为每个 agent 建立 `KILL_ON_JOB_CLOSE` Job，禁止 breakaway。先�
 
 `watch --caller` 直接指定调用方，供不传会话变量的 Grok monitor 使用。多个宿主变量同时存在时，沿祖先进程选择最近的宿主；无法匹配时按 `identity::HOST_VARS` 的顺序选择。
 
-Windows 使用命名管道，DACL 放行当前用户 SID 和登录会话 SID，启用 `PIPE_REJECT_REMOTE_CLIENTS`；首个实例使用 `FILE_FLAG_FIRST_PIPE_INSTANCE`。Unix 使用数据目录下的 `daemon/sock`，目录权限为 0700，接入后核对对端 uid。
+Windows 使用命名管道，启用 `PIPE_REJECT_REMOTE_CLIENTS`；首个实例使用 `FILE_FLAG_FIRST_PIPE_INSTANCE`。DACL 给当前用户 SID 完全权限，给登录会话 SID 读写权限但不含 `FILE_CREATE_PIPE_INSTANCE`，因此同一会话的受限令牌可以连接，但不能为 daemon 的管道另建实例、截走连接。没有 daemon 时，受限进程仍能抢先创建同名管道，所以客户端连接后核对服务端进程：令牌受限或不属于当前用户时拒绝连接；客户端自身受限、无权查看时跳过核对。Unix 使用数据目录下的 `daemon/sock`，目录权限为 0700，接入后核对对端 uid。
 
-一个连接处理一个请求。CLI 发送一行 JSON，带协议版本、调用方和 cwd；`spawn`、`send`、`reply`、`models` 还带环境。daemon 输出若干行，最后一行携带退出码或错误。
+一个连接处理一个请求。CLI 发送一行 JSON，带协议版本、调用方和 cwd；`spawn`、`send`、`reply`、`models` 还带环境。daemon 输出若干行，最后一行携带退出码或错误。读取时单行超过 16 MiB 即断开连接。
 
-daemon 在受限客户端上拒绝 `spawn`、`models`、带 `--tier` 的 `send`、`gc` 和 `daemon stop`。Windows 客户端在启动 daemon 或执行这些命令前也检查自身令牌。
+daemon 在受限客户端上拒绝 `spawn`、`models`、带 `--tier` 的 `send`、`gc` 和 `daemon stop`。Windows 和 macOS 客户端在启动 daemon 或执行这些命令前也检查自身是否受限，在 sandbox 中不启动 daemon：否则 daemon 及其启动的子 agent 都留在 sandbox 里，daemon 也不再把同一 sandbox 中的调用方识别为受限。子 agent 不论是否受限，都不能执行 `gc`、`daemon stop`、`skill install` 和 `plugin cleanup`，前两项由 daemon 拒绝，后两项由客户端拒绝。
 
 - Windows 在收到第一行数据后模拟客户端身份，用 `IsTokenRestricted` 检查令牌；读取失败也按受限处理。
-- Linux 比较对端与 daemon 的 `NoNewPrivs`、`Seccomp_filters`，任一项更高就按受限处理。已带 `NoNewPrivs` 的容器中，只叠加 Landlock 而不增加 seccomp 的限制无法这样识别。
+- Linux 比较对端与 daemon 的 `NoNewPrivs`、`Seccomp_filters`，任一项更高就按受限处理。已带 `NoNewPrivs` 的容器中，只叠加 Landlock 而不增加 seccomp 的限制无法这样识别。客户端不检查自身：daemon 未运行、sandbox 又允许连接 socket 并写入数据目录时，客户端会在 sandbox 中启动 daemon，例如 Grok `--sandbox workspace` 且数据目录位于工作区内；Claude 放开 Unix socket 时也会启动，但 daemon 随该条命令结束。
 - macOS 使用 `sandbox_check(pid, NULL, 0)`。
 
-socket 连接返回 EPERM 时，客户端提示到 sandbox 外重跑。各后端的回连能力见[权限](backends.md#权限)。身份用于同一用户内的任务路由，持有相同用户权限的进程可以修改身份变量。
+socket 连接返回 EPERM，或启动 daemon 时数据目录只读、无权写入，客户端都提示到 sandbox 外重跑。各后端的回连能力见[权限](backends.md#权限)。身份用于同一用户内的任务路由，持有相同用户权限的进程可以修改身份变量。
 
 ## 环境与配置继承
 

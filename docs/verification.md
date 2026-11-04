@@ -60,6 +60,8 @@
 | [宿主通知](backends.md#宿主通知)：不向 Claude inbox socket 推送 | 手动实验；文档 [Claude 跨会话消息](https://code.claude.com/docs/en/cross-session-messaging) |
 | [宿主通知](backends.md#宿主通知)：Windows 上 Codex 的退出码 | 手动实验；源码 [Codex shell.rs](https://github.com/openai/codex/blob/ce0323f2f2d3b25e82806cd555237da3db4e1897/codex-rs/core/src/shell.rs#L34-L40) |
 | [daemon 生命周期](design.md#daemon-生命周期)：Windows 进程存活、Job 取消和命名管道权限 | `daemon_job.py`、`ipc_sandbox.py`、`winproc/` |
+| [身份与 IPC](design.md#身份与-ipc)：Codex Windows sandbox 中的进程不能为 daemon 的管道另建实例，抢先创建的管道被客户端拒绝；sandbox 中的新旧客户端仍能连接 | `pipe_squat.py`，Windows、Codex 0.166.0，2026-11-04；未收紧 DACL 时，8 次连接中有 3 次落到 sandbox 另建的实例，且服务端进程核对没有发现 |
+| [身份与 IPC](design.md#身份与-ipc)：Linux 客户端在 sandbox 中启动 daemon 的条件 | 手动实验，WSL2、Grok 1.0.52、2026-11-04：`--sandbox workspace` 中数据目录在工作区外时启动失败，在工作区内时 daemon 在 sandbox 中启动、Grok 退出后仍在运行，且同一 sandbox 的 `gc` 被接受；Codex 0.162.1 `codex sandbox -P :read-only`、`:workspace` 不论 daemon 是否运行，`connect` 都收到 EPERM。Claude Code 2.1.296（装有 socat）默认 sandbox 中不论 daemon 是否运行都收到 EPERM；`sandbox.network.allowAllUnixSockets` 为 true 且数据目录在工作区内时，daemon 在 sandbox 中启动并接受同一 sandbox 的 `gc`，该条命令结束时随 PID 命名空间终止。macOS 依据用户反馈：Claude Code 命令 sandbox 中的首次调用启动了 daemon |
 
 提示词审查后的协议核对：`question_receipts_match_the_task_answer_route` 验证主会话与原生子会话的回执、实际回答队列和查询；`grok_spawn_receipts_use_the_callers_monitor` 验证 Grok 宿主、任务及混合原生会话的收件指引。拒绝原因按只读限制、审批通道断开和后端缺少批准选项分别表述。探针提示已删冗余和额外行为引导，历史实测对应原提示；新版仅作语法与本地断言核对，尚未重新调用真实模型。
 
@@ -69,7 +71,7 @@
 
 需要 Python 3.12 或更高版本，并安装、登录待测 CLI。探针从 PATH 定位程序；Windows 的 Claude/Codex npm 入口会解析为原生 exe。自定义安装可以通过 `AXIOPERA_PROBE_CLAUDE`、`AXIOPERA_PROBE_CODEX`、`AXIOPERA_PROBE_GROK` 指定可执行文件路径。
 
-调用 Axiopera 的探针使用 `target/debug/axiopera`，Windows 使用对应 `.exe`，先运行 `cargo build --locked`。交互终端探针在 Windows 上需要 `python -m pip install pywinpty`。`daemon_job.py` 和 `ipc_sandbox.py` 仅用于 Windows，先构建辅助程序：
+调用 Axiopera 的探针使用 `target/debug/axiopera`，Windows 使用对应 `.exe`，先运行 `cargo build --locked`。交互终端探针在 Windows 上需要 `python -m pip install pywinpty`。`daemon_job.py`、`ipc_sandbox.py` 和 `pipe_squat.py` 仅用于 Windows，先构建辅助程序：
 
 ```sh
 cargo build --release --locked --manifest-path spikes/winproc/Cargo.toml

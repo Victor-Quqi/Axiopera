@@ -15,8 +15,16 @@ fn socket_path(home: &Path) -> PathBuf {
     home.join("daemon").join("sock")
 }
 
-/// On unix the daemon decides, by comparing the caller with itself (see `more_confined`): a
+/// macOS asks Seatbelt directly: a daemon started from inside a sandbox would keep it and pass it
+/// on to every sub-agent, and take sandboxed callers for its peers.
+#[cfg(target_os = "macos")]
+pub fn self_sandboxed() -> bool {
+    seatbelt(unsafe { libc::getpid() })
+}
+
+/// On Linux the daemon decides, by comparing the caller with itself (see `more_confined`): a
 /// whole container may look confined, and only the daemon knows the baseline.
+#[cfg(not(target_os = "macos"))]
 pub fn self_sandboxed() -> bool {
     false
 }
@@ -43,9 +51,9 @@ fn more_confined(pid: libc::pid_t) -> bool {
     }
 }
 
-/// Seatbelt, as used by `sandbox-exec` and the App Sandbox.
+/// Whether Seatbelt, as used by `sandbox-exec` and the App Sandbox, confines `pid`.
 #[cfg(target_os = "macos")]
-fn more_confined(pid: libc::pid_t) -> bool {
+fn seatbelt(pid: libc::pid_t) -> bool {
     unsafe extern "C" {
         // libsystem_sandbox; without an operation it tells whether the process is sandboxed.
         fn sandbox_check(
@@ -55,8 +63,12 @@ fn more_confined(pid: libc::pid_t) -> bool {
             ...
         ) -> libc::c_int;
     }
-    let sandboxed = |pid| unsafe { sandbox_check(pid, std::ptr::null(), 0) != 0 };
-    sandboxed(pid) && !sandboxed(unsafe { libc::getpid() })
+    unsafe { sandbox_check(pid, std::ptr::null(), 0) != 0 }
+}
+
+#[cfg(target_os = "macos")]
+fn more_confined(pid: libc::pid_t) -> bool {
+    seatbelt(pid) && !seatbelt(unsafe { libc::getpid() })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -132,6 +144,11 @@ impl Peer {
 
 pub async fn connect(home: &Path) -> io::Result<ClientStream> {
     UnixStream::connect(socket_path(home)).await
+}
+
+/// Only processes that can write the data directory can serve its socket.
+pub fn check_server(_: &ClientStream) -> io::Result<()> {
+    Ok(())
 }
 
 pub fn spawn_detached(exe: &Path, args: &[&str]) -> io::Result<&'static str> {

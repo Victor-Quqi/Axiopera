@@ -239,6 +239,15 @@ enum DaemonCommand {
     },
 }
 
+/// These commands change the user's agent configuration, which only the user asks for.
+fn not_in_task(command: &str) -> Result<()> {
+    // Empty counts as unset, as in identity::detect.
+    if std::env::var_os(identity::TASK_VAR).is_some_and(|v| !v.is_empty()) {
+        bail!("{command} is for the main session or the user, not sub-agents");
+    }
+    Ok(())
+}
+
 fn parse_duration(s: &str) -> Result<Duration, String> {
     let (num, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = num.parse().map_err(|_| format!("bad duration {s:?}"))?;
@@ -303,10 +312,16 @@ async fn run(cli: Cli) -> Result<i32> {
         }
         Command::Plugin {
             command: PluginCommand::Cleanup,
-        } => return plugin::cleanup(&home).await,
+        } => {
+            not_in_task("plugin cleanup")?;
+            return plugin::cleanup(&home).await;
+        }
         Command::Skill {
             command: SkillCommand::Install { host, force },
-        } => return Ok(skill::install(host, force, cli.json)),
+        } => {
+            not_in_task("skill install")?;
+            return Ok(skill::install(host, force, cli.json));
+        }
         Command::Top { task, all } => {
             if cli.json {
                 bail!("top has no JSON output; use `axiopera status --all --json`");

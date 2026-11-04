@@ -15,6 +15,9 @@ use tokio::net::windows::named_pipe::{
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Authorization::*;
 use windows_sys::Win32::Security::*;
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_APPEND_DATA, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+};
 use windows_sys::Win32::System::Console::*;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::JobObjects::*;
@@ -147,8 +150,14 @@ fn pipe_name(home: &Path) -> io::Result<String> {
     ))
 }
 
+/// Read and write, without FILE_CREATE_PIPE_INSTANCE, which shares its bit with FILE_APPEND_DATA.
+/// Clients opening the pipe with GENERIC_WRITE still connect.
+const CLIENT_ACCESS: u32 = (FILE_GENERIC_READ | FILE_GENERIC_WRITE) & !FILE_APPEND_DATA;
+
 /// Owned security descriptor for the pipe: the current user, plus the current logon session so
 /// that a restricted-token sandbox of the same user passes the second (restricting-SID) check.
+/// The logon session only gets `CLIENT_ACCESS`: such a sandbox may connect, but not create an
+/// instance of the pipe and take connections meant for the daemon.
 struct Security(PSECURITY_DESCRIPTOR);
 
 unsafe impl Send for Security {}
@@ -158,7 +167,7 @@ impl Security {
     fn new() -> io::Result<Security> {
         let token = Token::process()?;
         let sddl = format!(
-            "D:P(A;;GA;;;{})(A;;GA;;;{})",
+            "D:P(A;;GA;;;{})(A;;{CLIENT_ACCESS:#x};;;{})",
             token.user_sid()?,
             token.logon_sid()?
         );
@@ -262,6 +271,39 @@ pub async fn connect(home: &Path) -> io::Result<ClientStream> {
         }
     }
     Err(io::Error::other("daemon pipe stayed busy"))
+}
+
+/// Refuse a pipe not served by an unrestricted process of this user: a sandboxed process can
+/// create the pipe while no daemon runs, and would then receive the environment `spawn` sends
+/// and answer for the daemon. For an extra instance of a running daemon's pipe Windows reports
+/// the daemon, so that case rests on the DACL.
+pub fn check_server(pipe: &ClientStream) -> io::Result<()> {
+    let mut pid = 0;
+    if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle() as HANDLE, &mut pid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = (|| {
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut h = null_mut();
+        let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut h) } != 0;
+        let err = io::Error::last_os_error();
+        unsafe { CloseHandle(process) };
+        if opened { Ok(Token(h)) } else { Err(err) }
+    })();
+    match token {
+        Ok(t) if !t.restricted() && t.user_sid()? == Token::process()?.user_sid()? => Ok(()),
+        Ok(_) => Err(io::Error::other(format!(
+            "the daemon pipe is served by pid {pid}, a sandboxed process or another user's"
+        ))),
+        // A sandboxed client may not be allowed to look; what it sends is the sandbox's anyway.
+        Err(_) if self_sandboxed() => Ok(()),
+        Err(e) => Err(io::Error::other(format!(
+            "cannot check pid {pid}, which serves the daemon pipe: {e}"
+        ))),
+    }
 }
 
 // ---- launching the daemon ----

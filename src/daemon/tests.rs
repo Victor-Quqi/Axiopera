@@ -460,6 +460,32 @@ async fn native_callers_receive_approvals_under_the_owning_tasks_tier() {
 }
 
 #[tokio::test]
+async fn only_sessions_and_the_user_stop_the_daemon() {
+    let f = fixture();
+    let stop = |caller: &str| Envelope {
+        protocol: ipc::PROTOCOL,
+        version: env!("CARGO_PKG_VERSION").into(),
+        caller: caller.into(),
+        cwd: f.home.clone(),
+        env: None,
+        request: Request::Stop { force: true },
+    };
+    for caller in ["task:test", "task:test/codex:native"] {
+        let error =
+            f.d.dispatch(stop(caller), &mut Out::new(&mut Vec::new()))
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("not sub-agents"), "{error}");
+    }
+    let mut buf = Vec::new();
+    f.d.dispatch(stop("user"), &mut Out::new(&mut buf))
+        .await
+        .unwrap();
+    assert_eq!(replies(&buf), "stopping");
+}
+
+#[tokio::test]
 async fn question_receipts_match_the_task_answer_route() {
     for caller in ["task:test", "task:test/codex:child", "task:test/grok:child"] {
         let f = fixture();

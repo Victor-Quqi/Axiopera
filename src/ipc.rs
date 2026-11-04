@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// Bump on incompatible wire types or caller identity semantics.
 pub const PROTOCOL: u32 = 6;
@@ -203,22 +203,39 @@ pub async fn write<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> s
     w.flush().await
 }
 
-pub struct Reader<R>(Lines<BufReader<R>>);
+pub struct Reader<R> {
+    input: BufReader<R>,
+    /// The line read so far; kept across a cancelled read.
+    line: Vec<u8>,
+}
 
 impl<R: AsyncRead + Unpin> Reader<R> {
     pub fn new(r: R) -> Self {
-        Reader(BufReader::new(r).lines())
+        Reader {
+            input: BufReader::new(r),
+            line: Vec::new(),
+        }
     }
 
     /// Next message, or None at end of stream.
     pub async fn read<T: for<'de> Deserialize<'de>>(&mut self) -> std::io::Result<Option<T>> {
-        let Some(line) = self.0.next_line().await? else {
+        // Stop at the limit plus "\r\n": a peer that never ends its line must not grow the buffer.
+        let room = (MAX_LINE + 2).saturating_sub(self.line.len()) as u64;
+        (&mut self.input)
+            .take(room)
+            .read_until(b'\n', &mut self.line)
+            .await?;
+        let mut line = std::mem::take(&mut self.line);
+        if line.is_empty() {
             return Ok(None);
-        };
+        }
+        if line.pop_if(|b| *b == b'\n').is_some() {
+            line.pop_if(|b| *b == b'\r');
+        }
         if line.len() > MAX_LINE {
             return Err(std::io::Error::other("message too long"));
         }
-        serde_json::from_str(&line)
+        serde_json::from_slice(&line)
             .map(Some)
             .map_err(std::io::Error::other)
     }
@@ -243,6 +260,31 @@ mod tests {
             assert!(request.needs_env());
             assert_eq!(serde_json::to_value(&request).unwrap()["tier"], tier);
         }
+    }
+
+    #[tokio::test]
+    async fn reader_splits_lines_and_stops_at_the_limit() {
+        let input = b"{\"a\":1}\r\n{\"a\":2}\n{\"a\":3}";
+        let mut reader = Reader::new(input.as_slice());
+        for want in 1..=3 {
+            let got = reader.read::<Value>().await.unwrap().unwrap();
+            assert_eq!(got["a"], want);
+        }
+        assert!(reader.read::<Value>().await.unwrap().is_none());
+
+        let mut longest = vec![b' '; MAX_LINE - 1];
+        longest.extend_from_slice(b"7\r\n");
+        longest.extend_from_slice(&vec![b' '; MAX_LINE]);
+        longest.extend_from_slice(b"8\n");
+        let mut reader = Reader::new(longest.as_slice());
+        assert_eq!(reader.read::<Value>().await.unwrap(), Some(Value::from(7)));
+        let err = reader.read::<Value>().await.unwrap_err();
+        assert_eq!(err.to_string(), "message too long");
+
+        // A peer that never ends its line is cut off instead of filling memory.
+        let mut reader = Reader::new(tokio::io::repeat(b' '));
+        let err = reader.read::<Value>().await.unwrap_err();
+        assert_eq!(err.to_string(), "message too long");
     }
 
     #[test]

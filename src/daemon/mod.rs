@@ -609,10 +609,15 @@ impl Daemon {
                     .await?;
                 self.shutdown.notify_one();
             } else {
+                let next = if identity::task_of(&env.caller).is_some() {
+                    "only the main session or the user can stop it"
+                } else {
+                    "wait for them or run `axiopera daemon stop --force`, which interrupts active tasks from all sessions"
+                };
                 out.error(
                     ErrorCode::Invalid,
                     format!(
-                        "the running daemon is version {} and has live tasks; wait for them or run `axiopera daemon stop --force`, which interrupts active tasks from all sessions",
+                        "the running daemon is version {} and has live tasks; {next}",
                         env!("CARGO_PKG_VERSION")
                     ),
                 )
@@ -778,6 +783,12 @@ impl Daemon {
                 Ok(ipc::exit::OK)
             }
             Request::Stop { force } => {
+                if identity::task_of(&caller).is_some() {
+                    return refuse(
+                        ErrorCode::Invalid,
+                        "daemon stop is for the main session or the user, not sub-agents",
+                    );
+                }
                 let running = self.lock().running;
                 if running > 0 && !force {
                     return refuse(
