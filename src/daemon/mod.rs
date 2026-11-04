@@ -1011,6 +1011,8 @@ impl Daemon {
                 .clone()
                 .or_else(|| self.opts.agents.get(s.agent).model.clone()),
             effort: s.effort.clone(),
+            actual_model: None,
+            actual_effort: None,
             timeout_secs: s.timeout_secs,
             status: Status::Queued,
             session: None,

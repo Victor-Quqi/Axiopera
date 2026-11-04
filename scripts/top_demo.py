@@ -117,12 +117,12 @@ def build(h):
     # Under a Claude Code session: a running task with a sub-task that has ended its turn but
     # still runs background work, and one queued from inside it by a native sub-agent.
     h.task("trun", CLAUDE, "codex", "read", "running", 3 * MIN, name="review",
-           prompt="Review the uncommitted changes to src/top.rs for correctness bugs.\n\n"
+           actual_model="gpt-6-astra", actual_effort="xhigh", prompt="Review the uncommitted changes to src/top.rs for correctness bugs.\n\n"
                   "Focus on terminal handling and the event reader.\nReport file:line findings.")
     h.task("tbg", "task:trun", "claude", "read", "running", 2 * MIN, name="sub-tests", turns=0,
            prompt="Run the test suite in the background and report failures.")
     h.task("tnat", "task:trun/claude:native-1", "grok", "work", "queued", 5_000, name="native-child",
-           prompt="Check the Grok adapter for the same issue.")
+           model="grok-4.6", prompt="Check the Grok adapter for the same issue.")
     h.task("twait", CLAUDE, "claude", "work", "waiting", 4 * MIN, name="问题澄清",
            prompt="把开发服务器的端口改成可配置，先确认用哪个端口。", questions=question("q7k2"))
     h.task("tappr", CLAUDE, "codex", "full", "running", 5 * MIN, name="deploy-check", turns=0,

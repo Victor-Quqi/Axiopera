@@ -140,6 +140,10 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
                 format!("failed ({})", s("error"))
             };
             let mut line = format!("{who} turn {} {status}", n("turn"));
+            let running = running_on(get(e, "model").as_str(), get(e, "effort").as_str());
+            if !running.is_empty() {
+                line.push_str(&format!("; {}", running.join(", ")));
+            }
             if n("unread") > 0 {
                 line.push_str(&format!(
                     "; this result predates {} of your messages; queued for a following turn",
@@ -317,6 +321,14 @@ pub fn duration(ms: u64) -> String {
     }
 }
 
+/// "model X" and "effort Y", for those known.
+pub fn running_on(model: Option<&str>, effort: Option<&str>) -> Vec<String> {
+    [("model", model), ("effort", effort)]
+        .into_iter()
+        .filter_map(|(label, v)| Some(format!("{label} {}", clip(v?, 100))))
+        .collect()
+}
+
 pub fn status_line(t: &Task, live: bool) -> String {
     let status = match t.status {
         Status::Queued => "queued",
@@ -335,6 +347,10 @@ pub fn status_line(t: &Task, live: bool) -> String {
         tier_name(t.tier),
         t.turns
     );
+    let (model, effort) = t.running_on();
+    for part in running_on(model, effort) {
+        line.push_str(&format!("  {part}"));
+    }
     if let Some(name) = &t.name {
         line.push_str(&format!("  name {name}"));
     }
@@ -403,5 +419,47 @@ mod tests {
     #[test]
     fn short_results_are_untouched() {
         assert_eq!(result_body("done", Path::new("x.md"), 100), "done");
+    }
+
+    #[test]
+    fn status_and_turn_lines_name_the_model_in_use() {
+        let mut task: Task = serde_json::from_value(serde_json::json!({
+            "id": "t1", "parent": "user", "agent": "claude", "tier": "work", "cwd": ".",
+            "status": "idle", "turns": 1, "delivered": 0, "changed_files": [],
+            "stalled": false, "detached": false, "created_ms": 0, "updated_ms": 0,
+            "model": "opus",
+        }))
+        .unwrap();
+        assert_eq!(
+            status_line(&task, false),
+            "t1  claude/work  idle  turns 1  model opus"
+        );
+        task.actual_model = Some("claude-opus\n5".into());
+        task.actual_effort = Some("xhigh".into());
+        assert_eq!(
+            status_line(&task, false),
+            "t1  claude/work  idle  turns 1  model claude-opus ↵ 5  effort xhigh"
+        );
+        let ended = |data: serde_json::Value| Event {
+            seq: 1,
+            ts: 0,
+            task: "t1".into(),
+            kind: "turn_ended".into(),
+            data: data.as_object().unwrap().clone(),
+        };
+        let line = event_line(
+            &ended(
+                serde_json::json!({"turn": 1, "ok": true, "model": "claude-opus", "effort": "xhigh", "blocked": 1}),
+            ),
+            Agent::Claude,
+        );
+        assert!(line.starts_with(
+            "[t1 claude] turn 1 finished; model claude-opus, effort xhigh; 1 operation(s) refused"
+        ));
+        let line = event_line(
+            &ended(serde_json::json!({"turn": 2, "ok": true, "model": null, "effort": null})),
+            Agent::Claude,
+        );
+        assert_eq!(line, "[t1 claude] turn 2 finished");
     }
 }

@@ -89,6 +89,10 @@ impl Claude {
             file: Some(session_file(spec, &session)),
             id: session,
         });
+        // The model and effort in effect, before any turn; init messages give only the model.
+        let settings = json!({"type": "control_request", "request_id": SETTINGS,
+                              "request": {"subtype": "get_settings"}});
+        proc.stdin.send(&settings).await?;
         let state: Arc<Mutex<State>> = Arc::default();
         tokio::spawn(pump(
             stdout,
@@ -282,6 +286,8 @@ fn replay_input(content: &Value, state: &Mutex<State>, events: &Events) {
 
 type StatusRequests = Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>;
 
+const SETTINGS: &str = "axiopera-settings";
+
 fn read_only_mcp(status: &Value, tool: &str) -> bool {
     status["mcpServers"]
         .as_array()
@@ -349,8 +355,18 @@ async fn pump(
     let pending: StatusRequests = Arc::default();
     let mut lines = super::lines(stdout);
     while let Ok(Some(line)) = lines.next_line().await {
-        stdin.trace.line("recv", &line);
-        let Ok(m) = serde_json::from_str::<Value>(&line) else {
+        let parsed = serde_json::from_str::<Value>(&line);
+        // The settings reply carries the user's whole effective settings.
+        let settings = matches!(&parsed, Ok(m) if m["response"]["request_id"] == SETTINGS);
+        stdin.trace.line(
+            "recv",
+            if settings {
+                "(get_settings reply omitted)"
+            } else {
+                &line
+            },
+        );
+        let Ok(m) = parsed else {
             continue;
         };
         match m["type"].as_str().unwrap_or("") {
@@ -406,6 +422,9 @@ async fn pump(
                 });
             }
             "system" => match m["subtype"].as_str().unwrap_or("") {
+                // At the start of every turn.
+                "init" => super::report_model(&events, m["model"].as_str()),
+                "model_fallback" => super::report_model(&events, m["fallbackModel"].as_str()),
                 "background_tasks_changed" => {
                     let n = m["tasks"].as_array().map_or(0, Vec::len);
                     state.lock().unwrap().background = n;
@@ -472,7 +491,17 @@ async fn pump(
             }
             "control_response" => {
                 let response = &m["response"];
-                if let Some(id) = response["request_id"].as_str()
+                if settings {
+                    // Versions without get_settings answer with an error: nothing to report.
+                    if response["subtype"] == "success" {
+                        let applied = &response["response"]["applied"];
+                        super::report_settings(
+                            &events,
+                            applied["model"].as_str(),
+                            applied["effort"].as_str(),
+                        );
+                    }
+                } else if let Some(id) = response["request_id"].as_str()
                     && let Some(tx) = pending.lock().unwrap().remove(id)
                 {
                     let _ = tx.send(response.clone());

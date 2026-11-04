@@ -72,8 +72,14 @@ pub struct Task {
     pub agent: Agent,
     pub tier: Tier,
     pub cwd: PathBuf,
+    /// As requested, by `--model` or the configuration.
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// As the agent last reported running on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_effort: Option<String>,
     pub timeout_secs: Option<u64>,
     pub status: Status,
     /// Native session ID once the agent has reported it.
@@ -98,6 +104,15 @@ pub struct Task {
 impl Task {
     pub fn open_questions(&self) -> impl Iterator<Item = &Question> {
         self.questions.iter().filter(|q| q.answer.is_none())
+    }
+
+    /// The model and effort it runs on, or as requested until the agent reports its model.
+    /// Once reported, a missing effort means the model runs without one.
+    pub fn running_on(&self) -> (Option<&str>, Option<&str>) {
+        match &self.actual_model {
+            Some(model) => (Some(model), self.actual_effort.as_deref()),
+            None => (self.model.as_deref(), self.effort.as_deref()),
+        }
     }
 }
 

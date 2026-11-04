@@ -85,6 +85,7 @@ Claude 查询使用 `--no-session-persistence`，通过单次参数关闭 hook �
 | 新建 / 续接 | `--session-id` / `--resume` | `thread/start` / `thread/resume` | `session/new` / `session/load` |
 | 注入任务协议 | `--append-system-prompt` | `developerInstructions` | `_meta.rules` |
 | 模型 / 推理强度 | `--model` / `--effort` | `thread/start` 的 `model` / 每轮 `turn/start` 的 `effort` | `session/set_config_option` 的 `model` / `reasoning_effort` |
+| 实际模型 / 推理强度 | 启动后 `get_settings` 的 `applied`，每轮 `system/init` 的 `model`，`model_fallback` 的 `fallbackModel` | `thread/start`、`thread/resume` 回复的 `model`、`reasoningEffort`，`model/rerouted` 的 `toModel` | `model_changed` 更新的 `model_id`、`reasoning_effort`，`session/prompt` 回复的 `_meta.modelId` |
 | 开始一轮 | stdin user 消息 | `turn/start` | `session/prompt` |
 | 中途消息 | stdin user 消息 | `turn/steer` | `_x.ai/interject` |
 | 中断 | interrupt control request | `turn/interrupt` | `session/cancel` |
@@ -96,6 +97,10 @@ Claude read 档另加 `--permission-prompt-tool stdio`，只加 `host` 时收不
 Claude 的 user 回显可能合并多条消息，需要按 text block 匹配。轮末仍有未回显输入时继续持有进程。后台命令结束也可能让模型自行开启下一轮，通过 `background_tasks_changed` 和 `task_notification` 跟踪。
 
 Codex 的 `userMessage` 可能在轮末落盘，后续模型响应才构成输入被消费的证据。daemon 将未确认输入带入下一轮。`turn/steer` 返回无活跃轮次时，先处理旧轮末事件再开启新轮。
+
+`get_settings` 是 Claude 未写入文档的控制请求，回复含全部生效设置，适配器只取模型和推理强度，协议跟踪中略去这条回复；不支持时只靠 `system/init` 得到模型。`model_fallback` 只从二进制中确认，尚未实测触发。`get_settings` 和 Grok 的 `model_changed` 给出完整设置，其中没有推理强度表示该模型不使用强度，记录随之清空。
+
+Codex 请求了强度时，每轮 `turn/start` 都带上它，记录取请求值；否则取线程回复的值，回复为空时 Codex 采用目录中该模型的 `defaultReasoningEffort`，适配器从 `model/list` 取同一个值。`model/rerouted` 只说明当轮被改用的模型，后续请求仍用线程模型，因此每轮 `turn/started` 时恢复记录。
 
 Grok 的 ACP 会话不采用 `-m` 和 `--reasoning-effort`，它们只改变 `_x.ai/models/list` 报告的当前模型，有 campaign 时新会话也直接采用 campaign 的模型，因此在建立或载入会话后设置配置项。无效值只返回 `-32602 Invalid params`，适配器把它表述为模型或推理强度无效，以便附上模型列表。尚无轮次的会话切换到另一 harness 的模型（如 `codex`）时，Grok 按该 harness 重建 agent，客户端提供的 agent profile 随之丢失；read 档的工具限制来自这个 profile，因此 read 档按会话回复中各模型的 `agentType` 比较，拒绝与当前模型 harness 不同的模型；`models grok` 不区分 harness，因此错误中列出可保留 read 档的模型，或提示该模型改用 work、full 档。
 

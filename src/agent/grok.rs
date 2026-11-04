@@ -352,6 +352,8 @@ async fn pump(
             Incoming::Reply(reply) => {
                 let (ok, error) = match reply {
                     Ok(r) => {
+                        // The model that served this prompt.
+                        super::report_model(&events, r["_meta"]["modelId"].as_str());
                         let stop = r["stopReason"].as_str().unwrap_or("").to_string();
                         (stop == "end_turn", (stop != "end_turn").then_some(stop))
                     }
@@ -404,12 +406,21 @@ fn on_update(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
         }
         return;
     }
-    // Standard ACP updates come as session/update; xAI's own kinds (turn_completed,
-    // task_backgrounded, ...) use other methods with the same shape.
-    if !p["update"]["sessionUpdate"].is_string() || state.lock().unwrap().loading {
+    let u = &p["update"];
+    // Taken while loading too: replayed or not, the last one names the model in effect.
+    if u["sessionUpdate"] == "model_changed" {
+        super::report_settings(
+            events,
+            u["model_id"].as_str(),
+            u["reasoning_effort"].as_str(),
+        );
         return;
     }
-    let u = &p["update"];
+    // Standard ACP updates come as session/update; xAI's own kinds (turn_completed,
+    // task_backgrounded, ...) use other methods with the same shape.
+    if !u["sessionUpdate"].is_string() || state.lock().unwrap().loading {
+        return;
+    }
     match u["sessionUpdate"].as_str().unwrap_or("") {
         "agent_message_chunk" => {
             let mut s = state.lock().unwrap();
@@ -824,6 +835,31 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         assert_eq!(state.lock().unwrap().text, "Final answer.");
+    }
+
+    #[test]
+    fn model_changes_count_even_while_loading() {
+        let state = Mutex::new(State {
+            loading: true,
+            ..State::default()
+        });
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let update = json!({"update": {"sessionUpdate": "model_changed", "model_id": "grok-4.6",
+                                       "reasoning_effort": "low"}});
+        on_notification("_x.ai/session_notification", &update, &state, &events);
+        assert!(matches!(rx.try_recv(),
+            Ok(AgentEvent::Model { model: Some(m), effort: Some(Some(e)) }) if m == "grok-4.6" && e == "low"));
+        // A model without effort support clears the previous one.
+        let update = json!({"update": {"sessionUpdate": "model_changed", "model_id": "plain"}});
+        on_notification("_x.ai/session_notification", &update, &state, &events);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(AgentEvent::Model {
+                effort: Some(None),
+                ..
+            })
+        ));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

@@ -26,6 +26,8 @@ struct State {
     patches: HashMap<String, Value>,
     /// The auto_review reviewer could not review; said once.
     review_failed: bool,
+    /// The thread's model. A reroute moves only the turn it happens in.
+    model: Option<String>,
 }
 
 pub struct Codex {
@@ -101,6 +103,18 @@ impl Codex {
             id: thread.clone(),
             file,
         });
+        // Every turn/start passes the requested effort, which overrides the thread's. Without
+        // either, Codex applies the model's default from its catalog.
+        let model = reply["model"].as_str();
+        let effort = match spec.effort.as_deref().or(reply["reasoningEffort"].as_str()) {
+            Some(effort) => Some(effort.to_owned()),
+            None => match model {
+                Some(model) => catalog_effort(&rpc, model).await,
+                None => None,
+            },
+        };
+        super::report_settings(&events, model, effort.as_deref());
+        state.lock().unwrap().model = model.map(str::to_owned);
         if let Some(notice) = sandbox_notice(spec.tier, &reply) {
             let _ = events.send(AgentEvent::Notice(notice));
         }
@@ -272,6 +286,30 @@ async fn pump(
     let _ = events.send(AgentEvent::Exited("codex exited".into()));
 }
 
+/// The default effort of `model` in Codex's catalog.
+async fn catalog_effort(rpc: &Rpc, model: &str) -> Option<String> {
+    let mut cursor = Value::Null;
+    let mut seen = HashSet::new();
+    loop {
+        let page = rpc
+            .call("model/list", json!({"cursor": cursor}))
+            .await
+            .ok()?;
+        let rows = page["data"].as_array()?;
+        if let Some(row) = rows
+            .iter()
+            .find(|r| r["model"] == model || r["id"] == model)
+        {
+            return row["defaultReasoningEffort"].as_str().map(str::to_owned);
+        }
+        cursor = page["nextCursor"].clone();
+        let next = cursor.as_str().filter(|c| !c.is_empty())?;
+        if !seen.insert(next.to_owned()) {
+            return None;
+        }
+    }
+}
+
 fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
     let item = &p["item"];
     // Finishing a turn can persist pending input without another model request. Only a
@@ -285,6 +323,8 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
     }
     match method {
         "turn/started" => {
+            let model = state.lock().unwrap().model.clone();
+            super::report_model(events, model.as_deref());
             if let Some(id) = p["turn"]["id"].as_str() {
                 let mut s = state.lock().unwrap();
                 if !s.done.contains(id) {
@@ -354,6 +394,7 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
             _ => {}
         },
         "thread/tokenUsage/updated" => state.lock().unwrap().usage = p.get("tokenUsage").cloned(),
+        "model/rerouted" => super::report_model(events, p["toModel"].as_str()),
         // The auto_review reviewer turned an escalation down; the agent only sees a failure.
         // The payload is marked unstable, so only the plain fields are read.
         "item/autoApprovalReview/completed" => {
@@ -563,6 +604,26 @@ mod tests {
         );
         assert!(sandbox_notice(Tier::Work, &reply("workspaceWrite")).is_none());
         assert!(sandbox_notice(Tier::Read, &reply("readOnly")).is_none());
+    }
+
+    #[test]
+    fn a_rerouted_turn_reports_the_model_it_moved_to() {
+        let state = Mutex::new(State::default());
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let rerouted = json!({"fromModel": "gpt-a", "toModel": "gpt-b", "reason": "x"});
+        state.lock().unwrap().model = Some("gpt-a".into());
+        on_notification("model/rerouted", &rerouted, &state, &events);
+        assert!(matches!(rx.try_recv(),
+            Ok(AgentEvent::Model { model: Some(m), effort: None }) if m == "gpt-b"));
+        // The next turn runs on the thread's model again.
+        on_notification(
+            "turn/started",
+            &json!({"turn": {"id": "t2"}}),
+            &state,
+            &events,
+        );
+        assert!(matches!(rx.try_recv(),
+            Ok(AgentEvent::Model { model: Some(m), effort: None }) if m == "gpt-a"));
     }
 
     #[test]

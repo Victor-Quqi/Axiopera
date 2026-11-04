@@ -1022,8 +1022,9 @@ impl View {
         self.load_detail(id);
         // The way back is told however narrow the window: the title gives way to it.
         let width = size.map(|(w, _)| w);
+        let hint = "  Esc back";
         let back = |title: Vec<Seg>| match keys {
-            true => hinted(title, "  Esc back", width),
+            true => hinted(title, hint, width),
             false => title,
         };
         let Some(t) = self.tasks.get(id) else {
@@ -1037,13 +1038,28 @@ impl View {
             render::agent_name(t.agent),
             render::tier_name(t.tier)
         );
-        let about = match &t.name {
-            Some(_) => format!("  {id} {agent}  "),
-            None => format!("  {agent}  "),
+        let (model, effort) = t.running_on();
+        let runs_on: String = [model, effort]
+            .into_iter()
+            .flatten()
+            .map(|part| format!(" {}", clean(part)))
+            .collect();
+        let about = |runs_on: &str| match &t.name {
+            Some(_) => format!("  {id} {agent}{runs_on}  "),
+            None => format!("  {agent}{runs_on}  "),
         };
+        let name = clean(t.name.as_deref().unwrap_or(id));
+        // The model gives way before the state does.
+        let room = width.map_or(usize::MAX, |w| {
+            w.saturating_sub(1 + if keys { columns(hint) } else { 0 })
+        });
+        let mut shown = about(&runs_on);
+        if columns(&name) + columns(&shown) + columns(state) > room {
+            shown = about("");
+        }
         let title = back(vec![
-            (clean(t.name.as_deref().unwrap_or(id)), BOLD),
-            (about, DIM),
+            (name, BOLD),
+            (shown, DIM),
             (state.into(), color),
             (format!("  {}", meta(t, tail, now)), ""),
         ]);
@@ -2713,6 +2729,23 @@ mod tests {
             view.task_frame("t1", NOW, None, true),
             ["t1 is gone: it was removed, by gc or by hand  Esc back"]
         );
+    }
+
+    #[test]
+    fn a_task_title_drops_the_model_before_the_state() {
+        let h = home();
+        let more = json!({"name": "review", "actual_model": "gpt-6", "actual_effort": "high"});
+        Store::new(&h.0)
+            .save(&task("t1", "user", "idle", NOW, more))
+            .unwrap();
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let mut title = |width| strip_sgr(&view.task_frame("t1", NOW, Some((width, 5)), true)[0]);
+        assert!(title(80).starts_with("review  t1 codex/work gpt-6 high  idle  1 turn(s)"));
+        // "review  t1 codex/work gpt-6 high  idle" fills 38 columns; with the hint and the
+        // empty last column, 49 hold it.
+        assert!(title(49).starts_with("review  t1 codex/work gpt-6 high  idle  Esc back"));
+        assert!(title(48).starts_with("review  t1 codex/work  idle"));
     }
 
     #[test]

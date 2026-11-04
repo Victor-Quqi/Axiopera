@@ -368,6 +368,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                     }
                     AgentEvent::Blocked(detail) => d.try_emit(id, "blocked", json!({"detail": detail}))?,
                     AgentEvent::Notice(text) => d.try_emit(id, "notice", json!({"text": text}))?,
+                    AgentEvent::Model { model, effort } => record_model(d, id, model, effort)?,
                     AgentEvent::TurnStarted => {
                         // Unless it is the turn we have just started.
                         let turn = d
@@ -625,6 +626,31 @@ fn delivered(d: &Daemon, id: &str, inputs: &[String], mail: &[String]) -> Result
     })
 }
 
+/// Record what the agent runs on. Agents repeat it every turn: save changes only.
+fn record_model(
+    d: &Daemon,
+    id: &str,
+    model: Option<String>,
+    effort: Option<Option<String>>,
+) -> Result<()> {
+    let changed = d.lock().tasks.get(id).is_some_and(|e| {
+        let t = &e.task;
+        (model.is_some() && model != t.actual_model)
+            || effort.as_ref().is_some_and(|e| *e != t.actual_effort)
+    });
+    if !changed {
+        return Ok(());
+    }
+    d.try_update(id, |t| {
+        if model.is_some() {
+            t.actual_model = model;
+        }
+        if let Some(effort) = effort {
+            t.actual_effort = effort;
+        }
+    })
+}
+
 fn end_turn(
     d: &Daemon,
     id: &str,
@@ -645,10 +671,20 @@ fn end_turn(
         + 1;
     d.store().save_turn(id, turn, result)?;
     d.try_update(id, |t| t.turns = turn)?;
-    let (files, open) = d.lock().tasks.get(id).map_or((0, Vec::new()), |e| {
-        let open: Vec<String> = e.task.open_questions().map(|q| q.id.clone()).collect();
-        (e.task.changed_files.len(), open)
-    });
+    let (files, open, model, effort) =
+        d.lock()
+            .tasks
+            .get(id)
+            .map_or((0, Vec::new(), None, None), |e| {
+                let open: Vec<String> = e.task.open_questions().map(|q| q.id.clone()).collect();
+                let (model, effort) = e.task.running_on();
+                (
+                    e.task.changed_files.len(),
+                    open,
+                    model.map(str::to_owned),
+                    effort.map(str::to_owned),
+                )
+            });
     let (blocked, notices) = {
         let mut st = d.lock();
         st.tasks.get_mut(id).map_or((0, Vec::new()), |e| {
@@ -658,7 +694,7 @@ fn end_turn(
             )
         })
     };
-    d.try_emit(id, "turn_ended", json!({"unread": unread, "unconfirmed": unconfirmed, "blocked": blocked, "notices": notices, "turn": turn, "ok": ok, "error": error, "usage": usage, "chars": result.len(), "files": files, "open_questions": open}))?;
+    d.try_emit(id, "turn_ended", json!({"unread": unread, "unconfirmed": unconfirmed, "blocked": blocked, "notices": notices, "turn": turn, "ok": ok, "error": error, "usage": usage, "chars": result.len(), "files": files, "open_questions": open, "model": model, "effort": effort}))?;
     Ok(())
 }
 
@@ -739,6 +775,37 @@ async fn cancel(backend: &mut Backend, cause: Cancellation) -> Exit {
 mod tests {
     use super::super::tests::fixture;
     use super::*;
+
+    #[test]
+    fn reported_models_replace_only_what_they_name() {
+        let f = fixture();
+        f.d.lock().tasks.get_mut("test").unwrap().task.model = Some("opus".into());
+        f.d.lock().tasks.get_mut("test").unwrap().task.effort = Some("low".into());
+        let saved = || {
+            f.d.store()
+                .load_all()
+                .into_iter()
+                .find(|t| t.id == "test")
+                .unwrap()
+        };
+        // Until the agent reports, the request stands for it.
+        assert_eq!(
+            f.d.lock().tasks["test"].task.running_on(),
+            (Some("opus"), Some("low"))
+        );
+        record_model(&f.d, "test", Some("claude-opus".into()), Some(None)).unwrap();
+        assert_eq!(saved().running_on(), (Some("claude-opus"), None));
+        record_model(&f.d, "test", None, Some(Some("high".into()))).unwrap();
+        record_model(&f.d, "test", Some("claude-sonnet".into()), None).unwrap();
+        let saved = saved();
+        assert_eq!(saved.model.as_deref(), Some("opus"));
+        assert_eq!(saved.running_on(), (Some("claude-sonnet"), Some("high")));
+        end_turn(&f.d, "test", true, "done", None, None, (0, 0)).unwrap();
+        let ended =
+            super::super::delivery::tail_events(&f.d.store().events_path("test"), 1).unwrap();
+        assert_eq!(ended[0].data["model"], "claude-sonnet");
+        assert_eq!(ended[0].data["effort"], "high");
+    }
 
     #[tokio::test]
     async fn missing_query_context_keeps_the_error_and_adds_the_command() {

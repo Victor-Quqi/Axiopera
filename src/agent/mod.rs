@@ -52,6 +52,12 @@ pub enum AgentEvent {
     TurnStarted,
     /// A problem in the agent's own setup that its parent should hear of.
     Notice(String),
+    /// The model or reasoning effort now in effect. `None` leaves that one as it was; an effort
+    /// of `Some(None)` means the model runs without one.
+    Model {
+        model: Option<String>,
+        effort: Option<Option<String>>,
+    },
     TurnEnded {
         ok: bool,
         result: String,
@@ -144,6 +150,28 @@ impl Inputs {
             let _ = events.send(AgentEvent::InputRead(id));
         }
     }
+}
+
+fn nonempty(v: Option<&str>) -> Option<String> {
+    v.filter(|s| !s.is_empty()).map(str::to_owned)
+}
+
+/// Report the model a backend names, if it names one; the effort stays as it was.
+fn report_model(events: &Events, model: Option<&str>) {
+    if let Some(model) = nonempty(model) {
+        let _ = events.send(AgentEvent::Model {
+            model: Some(model),
+            effort: None,
+        });
+    }
+}
+
+/// Report both, from a backend that states its whole setting: no effort means none applies.
+fn report_settings(events: &Events, model: Option<&str>, effort: Option<&str>) {
+    let _ = events.send(AgentEvent::Model {
+        model: nonempty(model),
+        effort: Some(nonempty(effort)),
+    });
 }
 
 fn content_text(content: &Value) -> String {
