@@ -557,6 +557,10 @@ struct FileStamp {
     len: u64,
     modified: SystemTime,
     created: Option<SystemTime>,
+    /// Some Linux kernels give files written within the same few milliseconds the same
+    /// timestamps; each save replaces the file, so its inode still tells the two apart.
+    #[cfg(unix)]
+    inode: u64,
 }
 
 impl FileStamp {
@@ -566,6 +570,8 @@ impl FileStamp {
             len: m.len(),
             modified: m.modified().ok()?,
             created: m.created().ok(),
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(&m),
         })
     }
 }
