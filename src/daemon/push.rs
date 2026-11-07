@@ -818,6 +818,7 @@ mod tests {
 command: {summary}"
                     ),
                     reply,
+                    withdrawn: tokio::sync::oneshot::channel().1,
                 },
             );
             decision

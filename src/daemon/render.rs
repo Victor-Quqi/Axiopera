@@ -133,6 +133,7 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
         "message" => format!("{who} told {}: {}", s("to"), clip(&s("text"), LINE)),
         "approved" => format!("{who} {} approved by {}", s("id"), s("by")),
         "denied" => format!("{who} {} denied by {}", s("id"), s("by")),
+        "withdrawn" => format!("{who} {} withdrawn by the backend", s("id")),
         "turn_ended" => {
             let status = if get(e, "ok") == &Value::Bool(true) {
                 "finished".to_string()

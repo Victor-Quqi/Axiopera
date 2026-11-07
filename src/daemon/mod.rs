@@ -1712,6 +1712,7 @@ impl Daemon {
             summary,
             detail,
             reply,
+            withdrawn,
         } = a;
         let read_only = self
             .lock()
@@ -1756,13 +1757,25 @@ impl Daemon {
         }
         let d = self.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(d.opts.approval_timeout).await;
-            let _ = d.resolve(
-                &rid,
-                None,
-                agent::Decision::Deny("Approval timed out; the action was denied.".into()),
-            );
+            tokio::select! {
+                () = tokio::time::sleep(d.opts.approval_timeout) => {
+                    let _ = d.resolve(
+                        &rid,
+                        None,
+                        agent::Decision::Deny("Approval timed out; the action was denied.".into()),
+                    );
+                }
+                Ok(()) = withdrawn => d.withdraw(&rid),
+            }
         });
+    }
+
+    /// The backend stopped waiting for a decision: drop the request undecided.
+    fn withdraw(&self, rid: &str) {
+        let Some(pending) = self.lock().approvals.remove(rid) else {
+            return;
+        };
+        self.emit(&pending.task, "withdrawn", json!({"id": rid}));
     }
 
     /// Keep a text too long to show whole in a file, and note the file in the event's `data`.
@@ -1791,7 +1804,9 @@ impl Daemon {
             let Some(p) = st.approvals.get(rid) else {
                 return refuse(
                     ErrorCode::NotFound,
-                    format!("no pending request {rid}; it may have timed out or been decided"),
+                    format!(
+                        "no pending request {rid}; it may have timed out, been decided or been withdrawn"
+                    ),
                 );
             };
             // Like questions: tasks decide only what is routed to them; sessions and people

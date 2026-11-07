@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use serde_json::{Map, Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::rpc::{Incoming, Rpc};
 use super::{AgentEvent, Decision, Events, Proc, StartSpec, Steer, clip, protocol_text};
@@ -28,6 +28,9 @@ struct State {
     review_failed: bool,
     /// The thread's model. A reroute moves only the turn it happens in.
     model: Option<String>,
+    /// Forwarded requests still awaiting a decision, by JSON-RPC ID, to withdraw once Codex
+    /// stops waiting.
+    asked: HashMap<String, oneshot::Sender<()>>,
 }
 
 pub struct Codex {
@@ -255,10 +258,19 @@ async fn pump(
                     };
                     continue;
                 }
-                let decision = super::ask_approval(&events, summary, detail);
+                let key = id.to_string();
+                let (gone_tx, gone) = oneshot::channel();
+                state.lock().unwrap().asked.insert(key.clone(), gone_tx);
+                let decision = super::ask_withdrawable_approval(&events, summary, detail, gone);
                 let rpc = rpc.clone();
+                let state = state.clone();
                 tokio::spawn(async move {
-                    match decision.await {
+                    let decision = decision.await;
+                    state.lock().unwrap().asked.remove(&key);
+                    // Withdrawn: Codex no longer reads an answer, and a refusal's reason
+                    // would reach the turn as a stale message.
+                    let Some(decision) = decision else { return };
+                    match decision {
                         Decision::Approve => {
                             if let Some(r) = approval(&method, &params) {
                                 let _ = rpc.respond(id, r).await;
@@ -393,6 +405,14 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
             }
             _ => {}
         },
+        // Codex no longer waits for the answer: it came, or, from 0.167, a network approval's
+        // request ended before anyone decided.
+        "serverRequest/resolved" => {
+            let key = p["requestId"].to_string();
+            if let Some(gone) = state.lock().unwrap().asked.remove(&key) {
+                let _ = gone.send(());
+            }
+        }
         "thread/tokenUsage/updated" => state.lock().unwrap().usage = p.get("tokenUsage").cloned(),
         "model/rerouted" => super::report_model(events, p["toModel"].as_str()),
         // The auto_review reviewer turned an escalation down; the agent only sees a failure.
@@ -593,6 +613,59 @@ mod tests {
         ));
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::Blocked(_))));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_request_codex_resolves_is_withdrawn_unanswered() {
+        let state = Mutex::new(State::default());
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let (gone_tx, gone) = oneshot::channel();
+        state
+            .lock()
+            .unwrap()
+            .asked
+            .insert(json!(7).to_string(), gone_tx);
+        let decision = tokio::spawn(super::super::ask_withdrawable_approval(
+            &events,
+            "shell: curl example.com".into(),
+            String::new(),
+            gone,
+        ));
+        let Ok(AgentEvent::Approval(approval)) = rx.try_recv() else {
+            panic!("no approval request");
+        };
+        let resolved = |id: Value| {
+            on_notification(
+                "serverRequest/resolved",
+                &json!({"threadId": "t", "requestId": id}),
+                &state,
+                &events,
+            );
+        };
+        resolved(json!("7"));
+        assert_eq!(state.lock().unwrap().asked.len(), 1);
+        resolved(json!(7));
+        assert!(state.lock().unwrap().asked.is_empty());
+        assert!(decision.await.unwrap().is_none());
+        assert!(approval.withdrawn.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_decided_request_is_not_withdrawn() {
+        let (events, mut rx) = mpsc::unbounded_channel();
+        let (_gone_tx, gone) = oneshot::channel();
+        let decision = tokio::spawn(super::super::ask_withdrawable_approval(
+            &events,
+            "shell: ls".into(),
+            String::new(),
+            gone,
+        ));
+        let Ok(AgentEvent::Approval(approval)) = rx.try_recv() else {
+            panic!("no approval request");
+        };
+        approval.reply.send(Decision::Approve).unwrap();
+        assert!(matches!(decision.await.unwrap(), Some(Decision::Approve)));
+        assert!(approval.withdrawn.await.is_err());
     }
 
     #[test]

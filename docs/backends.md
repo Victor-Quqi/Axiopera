@@ -57,6 +57,8 @@ Claude 其他 control request 返回 unsupported。Codex 的 MCP elicitation 返
 
 Codex decline 不能带拒绝理由，适配器另用 steer 送入理由。Grok 通过 `_meta.followup_message` 传理由。各家要求持久化规则的批准选项均不使用。
 
+Codex 不再等待某个请求的应答时发出 `serverRequest/resolved`，应答之后也会发出；0.167 起，网络审批对应的请求在裁决前结束时同样发出。转发的请求尚无裁决时，适配器撤回它：不应答，也不送入拒绝理由。
+
 后端自己拒绝且没有请求批准的操作，按原生错误返回给子 agent。适配器通过 Claude 的 `permission_denials`、Codex 的 auto-review 结果、Grok 工具错误中的 `Auto mode blocked this action` 识别并记录。
 
 ## 可执行文件与配置继承

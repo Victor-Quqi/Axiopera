@@ -2117,7 +2117,9 @@ impl Tail {
             "approval_request" => self
                 .approvals
                 .push((text("id").into(), text("summary").into())),
-            "approved" | "denied" => self.approvals.retain(|(id, _)| id != text("id")),
+            "approved" | "denied" | "withdrawn" => {
+                self.approvals.retain(|(id, _)| id != text("id"))
+            }
             "failed" => self.stop = Some(("error", text("error").into())),
             "cancelled" | "interrupted" | "detached" => {
                 self.stop = Some(("why", text("reason").into()));

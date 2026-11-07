@@ -76,6 +76,8 @@ pub struct Approval {
     /// Everything the request says, for whoever decides: a summary can hide what matters.
     pub detail: String,
     pub reply: oneshot::Sender<Decision>,
+    /// Fires when the backend stops waiting, so the request must not be decided any more.
+    pub withdrawn: oneshot::Receiver<()>,
 }
 
 #[derive(Debug)]
@@ -93,16 +95,48 @@ fn ask_approval(
     detail: String,
 ) -> impl Future<Output = Decision> + use<> {
     let (reply, rx) = oneshot::channel();
+    // A sender dropped at once: this request is never withdrawn.
+    let (_, withdrawn) = oneshot::channel();
     let _ = events.send(AgentEvent::Approval(Approval {
         summary,
         detail,
         reply,
+        withdrawn,
+    }));
+    decided(rx)
+}
+
+/// `ask_approval` for a backend that can stop waiting. Once `gone` fires, the daemon drops
+/// the request undecided and this yields None.
+fn ask_withdrawable_approval(
+    events: &Events,
+    summary: String,
+    detail: String,
+    gone: oneshot::Receiver<()>,
+) -> impl Future<Output = Option<Decision>> + use<> {
+    let (reply, rx) = oneshot::channel();
+    let (withdraw, withdrawn) = oneshot::channel();
+    let _ = events.send(AgentEvent::Approval(Approval {
+        summary,
+        detail,
+        reply,
+        withdrawn,
     }));
     async move {
-        rx.await.unwrap_or_else(|_| {
-            Decision::Deny("Refused by axiopera: the approval channel closed.".into())
-        })
+        tokio::select! {
+            decision = decided(rx) => Some(decision),
+            Ok(()) = gone => {
+                let _ = withdraw.send(());
+                None
+            }
+        }
     }
+}
+
+async fn decided(rx: oneshot::Receiver<Decision>) -> Decision {
+    rx.await.unwrap_or_else(|_| {
+        Decision::Deny("Refused by axiopera: the approval channel closed.".into())
+    })
 }
 
 /// Environment an agent needs on top of its caller's.

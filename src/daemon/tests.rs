@@ -437,6 +437,7 @@ async fn native_callers_receive_approvals_under_the_owning_tasks_tier() {
             summary: "review".into(),
             detail: "NATIVE_APPROVAL".into(),
             reply,
+            withdrawn: oneshot::channel().1,
         },
     );
     let rid = f.d.lock().approvals.keys().next().unwrap().clone();
@@ -704,6 +705,7 @@ async fn approvals_go_ahead_of_earlier_news_and_reach_the_approver_once() {
                 summary: summary.into(),
                 detail: format!("Bash\ncommand: {summary}"),
                 reply,
+                withdrawn: oneshot::channel().1,
             },
         );
         decision
@@ -859,6 +861,7 @@ async fn agents_approve_only_requests_they_have_read_in_full() {
                 summary: summary.into(),
                 detail: "Bash\ncommand:\nrm -rf build\nrm -rf ~".into(),
                 reply,
+                withdrawn: oneshot::channel().1,
             },
         );
         let rid = f.d.lock().approvals.keys().next().unwrap().clone();
@@ -889,6 +892,39 @@ async fn agents_approve_only_requests_they_have_read_in_full() {
     let (rid, _decision) = request("Bash: ls");
     f.d.resolve(&rid, Some("codex:host"), agent::Decision::Deny("no".into()))
         .unwrap();
+}
+
+#[tokio::test]
+async fn a_withdrawn_request_is_dropped_undecided() {
+    let f = fixture();
+    f.d.update("test", |t| t.tier = ipc::Tier::Work);
+    let (reply, decision) = oneshot::channel();
+    let (withdraw, withdrawn) = oneshot::channel();
+    f.d.request_approval(
+        "test",
+        agent::Approval {
+            summary: "Bash: curl example.com".into(),
+            detail: "WITHDRAWN_REQUEST".into(),
+            reply,
+            withdrawn,
+        },
+    );
+    let rid = f.d.lock().approvals.keys().next().unwrap().clone();
+    withdraw.send(()).unwrap();
+    // Dropping the request closes the channel without a decision.
+    assert!(decision.await.is_err());
+    assert!(f.d.lock().approvals.is_empty());
+    let last = f.d.store.events("test").pop().unwrap();
+    assert_eq!(last.kind, "withdrawn");
+    assert_eq!(last.data["id"], json!(rid));
+
+    let mut buf = Vec::new();
+    f.d.inbox("codex:host", &[], &mut Out::new(&mut buf))
+        .await
+        .unwrap();
+    assert!(!replies(&buf).contains("WITHDRAWN_REQUEST"));
+    let late = f.d.resolve(&rid, Some("user"), agent::Decision::Approve);
+    assert!(late.unwrap_err().to_string().contains("withdrawn"));
 }
 
 #[test]
