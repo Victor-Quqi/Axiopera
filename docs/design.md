@@ -2,7 +2,7 @@
 
 用户可见的操作和配置见[使用文档](usage.md)，各家协议及权限映射见[后端文档](backends.md)。
 
-实现范围是本机 CLI 编排，采用单二进制分发，不注册系统服务。远程主机、云端执行、桌面界面、多租户和 PR/CI 工作流由其他工具负责。接入新的 backend 前，需验证其在一轮运行中接收消息的能力。
+实现范围是本机 CLI 编排，采用单二进制分发，不注册系统服务。连接远程主机、文件同步、云端执行、桌面界面、多租户和 PR/CI 工作流由其他工具负责；经 ssh 等工具调用另一台机器上的 Axiopera 时，由那台机器的 daemon 编排，调用方用 `--caller` 指明会话。接入新的 backend 前，需验证其在一轮运行中接收消息的能力。
 
 ## 进程与任务
 
@@ -61,7 +61,7 @@
 
 提问和答案随任务保存。`ask` 按所属任务存储问题，`reply` 将回答送入该任务的主会话；没有记录单独的原生提问会话作为回答目标。可识别的原生子会话会在回执中得知这一路由，并可用 `answers` 查询。审批应答通道和消息消费跟踪 ID 只保存在内存中。取消和超时中断均保留会话及未交付队列，任务及子任务可以分别用 `send` 或 `reply` 续接；继续父任务不会自动启动已取消的子任务。旧队列等待明确续接，释放进程期间收到的新输入在旧进程退出后启动；每次启动重新计时。旧版本明确由 timeout 取消的记录在加载时转为 interrupted，手动取消保留 cancelled 状态并允许续接。启动前清除上一轮会话指纹，进程退出并回收后记录本轮指纹；握手中断或路径未知时指纹为空，待后续运行取得路径后恢复接管检测。
 
-`requests.jsonl` 每个请求记一行：时间、调用方类别（宿主、子 agent 或 `user`）、命令、给出的参数名、退出码、错误类别和输出的字节数，不记参数值和输出内容。客户端先断开时退出码为空。hook 的 `pending` 请求、`daemon status` 和 `daemon stop` 不记录。
+`requests.jsonl` 每个请求记一行：时间、调用方类别（宿主或 `--caller` 给出的名称、子 agent 或 `user`）、命令、给出的参数名、退出码、错误类别和输出的字节数，不记参数值和输出内容。客户端先断开时退出码为空。hook 的 `pending` 请求、`daemon status` 和 `daemon stop` 不记录。
 
 daemon 启动时和连续运行期间每 24 小时自动清理一次。清理任务时，在同一把状态锁内检查和删除，防止与续接并发。先处理子任务，再处理父任务；目录删除成功后才移除内存记录和游标，删除失败保留记录供下次重试。启动时清除格式无效、任务不存在或超出已知事件序号的 ledger 游标。`daemon.log` 在启动时和每 24 小时裁剪；运行期间先关闭、裁剪后重新打开。日志大小与备份策略、清理条件见[使用文档](usage.md#daemon-与清理)。
 
@@ -77,11 +77,11 @@ Windows 为每个 agent 建立 `KILL_ON_JOB_CLOSE` Job，禁止 breakaway。先�
 
 ## 身份与 IPC
 
-调用方没有 `AXIOPERA_TASK_ID` 时，使用宿主会话身份 `<host>:<session>`，没有宿主身份则回落到终端用户 `user`；`identity::HOST_VARS` 之外的 agent 没有可识别的会话变量，也归入 `user`，彼此之间和与终端共用收件箱。带有任务 ID 时，同时传递原生身份 `task:<id>/<host>:<session>`；daemon 核对任务记录中的后端和原生会话，将任务自身会话归一为 `task:<id>`，其他原生会话保留完整身份，各自收件。只有任务 ID 的调用（如注入的 MCP server）仍使用 `task:<id>`。原生子 agent 共享宿主会话 ID 时仍共用收件箱，使用约定见[后端文档](backends.md#会话与消息)。
+调用方没有 `AXIOPERA_TASK_ID` 时，使用宿主会话身份 `<host>:<session>`，没有宿主身份则视为终端前的用户 `user`。`identity::HOST_VARS` 之外的 agent 没有可识别的会话变量，Axiopera 无法把它与用户区分，因此它要用 `--caller` 指明会话；不指明时按用户处理，与终端共用收件箱，审批时也不受先读后批的限制。带有任务 ID 时，同时传递原生身份 `task:<id>/<host>:<session>`；daemon 核对任务记录中的后端和原生会话，将任务自身会话归一为 `task:<id>`，其他原生会话保留完整身份，各自收件。只有任务 ID 的调用（如注入的 MCP server）仍使用 `task:<id>`。原生子 agent 共享宿主会话 ID 时仍共用收件箱，使用约定见[后端文档](backends.md#会话与消息)。
 
 完整调用方身份决定任务别名、收件游标和消息归属；其中的任务 ID 决定深度、权限上限、审批向上路由、整树取消和清理依赖。原生子 agent 属于所在的 Axiopera 任务，其派发的 Axiopera 任务继续计入原任务树。
 
-`watch --caller` 直接指定调用方，供不传会话变量的 Grok monitor 使用。多个宿主变量同时存在时，沿祖先进程选择最近的宿主；无法匹配时按 `identity::HOST_VARS` 的顺序选择。
+全局选项 `--caller` 直接给出调用方，供会话变量到不了 Axiopera 的调用使用，如经 ssh、容器调用和 Grok monitor 启动的命令，`identity::HOST_VARS` 之外的 agent 也用它与用户区分。取值为 `<名称>:<会话>` 或 `task:<id>[/<名称>:<会话>]`：名称由小写字母、数字和连字符组成，`task` 保留，会话为空时报错。环境中有任务 ID 时，任务部分始终取自环境，`<名称>:<会话>` 组合为 `task:<id>/<名称>:<会话>`，指向其他任务的值被拒绝。子 agent 免审批运行纯 `axiopera` 命令，`--caller` 若能换掉任务部分，read 档子 agent 就能以顶层身份派发更高档位的任务；去掉任务变量则需要不在放行范围内的命令。多个宿主变量同时存在时，沿祖先进程选择最近的宿主；无法匹配时按 `identity::HOST_VARS` 的顺序选择。
 
 Windows 使用命名管道，启用 `PIPE_REJECT_REMOTE_CLIENTS`；首个实例使用 `FILE_FLAG_FIRST_PIPE_INSTANCE`。DACL 给当前用户 SID 完全权限，给登录会话 SID 读写权限但不含 `FILE_CREATE_PIPE_INSTANCE`，因此同一会话的受限令牌可以连接，但不能为 daemon 的管道另建实例、截走连接。没有 daemon 时，受限进程仍能抢先创建同名管道，所以客户端连接后核对服务端进程：令牌受限或不属于当前用户时拒绝连接；客户端自身受限、无权查看时跳过核对。Unix 使用数据目录下的 `daemon/sock`，目录权限为 0700，接入后核对对端 uid。
 
@@ -93,7 +93,7 @@ daemon 在受限客户端上拒绝 `spawn`、`models`、带 `--tier` 的 `send`�
 - Linux 比较对端与 daemon 的 `NoNewPrivs`、`Seccomp_filters`，任一项更高就按受限处理。已带 `NoNewPrivs` 的容器中，只叠加 Landlock 而不增加 seccomp 的限制无法这样识别。客户端不检查自身：daemon 未运行、sandbox 又允许连接 socket 并写入数据目录时，客户端会在 sandbox 中启动 daemon，例如 Grok `--sandbox workspace` 且数据目录位于工作区内；Claude 放开 Unix socket 时也会启动，但 daemon 随该条命令结束。
 - macOS 使用 `sandbox_check(pid, NULL, 0)`。
 
-socket 连接返回 EPERM，或启动 daemon 时数据目录只读、无权写入，客户端都提示到 sandbox 外重跑。各后端的回连能力见[权限](backends.md#权限)。身份用于同一用户内的任务路由，持有相同用户权限的进程可以修改身份变量。
+socket 连接返回 EPERM，或启动 daemon 时数据目录只读、无权写入，客户端都提示到 sandbox 外重跑。各后端的回连能力见[权限](backends.md#权限)。身份用于同一用户内的任务路由，持有相同用户权限的进程可以修改身份变量或传入 `--caller`。
 
 ## 环境与配置继承
 

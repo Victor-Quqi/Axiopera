@@ -1762,12 +1762,12 @@ fn project(cwd: &Path) -> Option<String> {
     name(cwd)
 }
 
-/// Who spawned a group of tasks: a host session, `user`, or a task already removed. Agents
-/// other than the known hosts call as `user` too, like a person at a terminal. A session's ID
-/// is cut to `session_chars` characters.
+/// Who spawned a group of tasks: a host session, `user` (the person at a terminal, and any
+/// agent that does not name its session), or a task already removed. A session's ID is cut to
+/// `session_chars` characters.
 fn caller_label(caller: &str, session_chars: usize) -> String {
     match caller.split_once(':') {
-        _ if caller == "user" => "user: terminals and unrecognized agents".into(),
+        _ if caller == "user" => "user: you at a terminal".into(),
         Some((host, session)) if host != "task" => {
             let session: String = session.chars().take(session_chars).collect();
             format!("{host} session {session}")
@@ -2476,13 +2476,10 @@ mod tests {
             ),
             "{text}"
         );
-        assert_eq!(frame[1..3], ["", "user: terminals and unrecognized agents"]);
+        assert_eq!(frame[1..3], ["", "user: you at a terminal"]);
         // With tasks of two sessions, a line for each, its ID cut to tell them apart.
         assert!(text.contains("\nclaude session s1234567\n"), "{text}");
-        assert!(
-            text.contains("\nuser: terminals and unrecognized agents\n"),
-            "{text}"
-        );
+        assert!(text.contains("\nuser: you at a terminal\n"), "{text}");
         assert!(!text.contains("t4 "), "{text}");
 
         // Its ID beside its name, then what it last said, on one line, past the tool calls
@@ -4064,7 +4061,7 @@ mod tests {
             "{shown:#?}"
         );
         assert_eq!(columns(&shown[3]), 79, "{shown:#?}");
-        assert_eq!(shown[2], "user: terminals and unrecognized agents");
+        assert_eq!(shown[2], "user: you at a terminal");
         assert!(shown[4].starts_with("  t1 "));
         assert!(shown[5].starts_with("  rows 1–3/8"));
 

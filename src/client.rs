@@ -46,11 +46,17 @@ impl Client {
         .await
     }
 
-    /// Send one request, handing each line of the answer to `sink`. Returns the exit code.
-    pub async fn request(&self, request: Request, sink: impl FnMut(Line)) -> Result<i32> {
+    /// Send one request as `caller` (default: the one detected), handing each line of the
+    /// answer to `sink`. Returns the exit code.
+    pub async fn request(
+        &self,
+        caller: Option<String>,
+        request: Request,
+        sink: impl FnMut(Line),
+    ) -> Result<i32> {
+        let caller = caller.unwrap_or_else(detect_caller);
         let launch = !matches!(request, Request::Stop { .. });
-        self.request_as(detect_caller(), launch, request, sink)
-            .await
+        self.request_as(caller, launch, request, sink).await
     }
 
     /// Without `launch`, a daemon that is not running answers nothing.

@@ -1,5 +1,7 @@
 //! Who is calling: a sub-agent task, a host agent session, or a person at a terminal.
 
+use anyhow::{Result, bail};
+
 /// Set by the daemon in every sub-agent's environment.
 pub const TASK_VAR: &str = "AXIOPERA_TASK_ID";
 
@@ -60,6 +62,55 @@ pub fn detect(
         Some(id) => format!("task:{id}/{host}"),
         None => host,
     }
+}
+
+/// Caller key from `--caller`, for calls the host's session variable does not reach (ssh,
+/// containers, monitors) and for agents not in `HOST_VARS`: `<name>:<session>`, or
+/// `task:<id>` with an optional `/<name>:<session>`. Inside a task, `task` (from the
+/// environment) keeps the task part: a session joins it, and another task is refused.
+/// Sub-agents run plain `axiopera` commands without approval, so the option must not let them
+/// call from outside their task tree; dropping the task variable takes a command that is not.
+pub fn explicit(given: &str, task: Option<&str>) -> Result<String> {
+    if let Some(rest) = given.strip_prefix("task:") {
+        let (id, native) = match rest.split_once('/') {
+            Some((id, native)) => (id, Some(native)),
+            None => (rest, None),
+        };
+        if id.is_empty() {
+            bail!("--caller {given:?} names no task");
+        }
+        if let Some(native) = native {
+            check_session(given, native)?;
+        }
+        if let Some(own) = task
+            && own != id
+        {
+            bail!("--caller {given:?}: this is task {own}, which can only name its own sessions");
+        }
+        return Ok(given.to_string());
+    }
+    check_session(given, given)?;
+    Ok(match task {
+        Some(id) => format!("task:{id}/{given}"),
+        None => given.to_string(),
+    })
+}
+
+fn check_session(given: &str, session: &str) -> Result<()> {
+    let Some((name, id)) = session.split_once(':') else {
+        bail!("--caller {given:?} is not <agent>:<session ID>");
+    };
+    let valid_name = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
+    if name.is_empty() || name == "task" || !name.chars().all(valid_name) {
+        bail!(
+            "--caller {given:?}: the agent name before the colon takes lowercase letters, digits \
+             and hyphens, and cannot be `task`"
+        );
+    }
+    if id.is_empty() {
+        bail!("--caller {given:?} has no session ID; was its variable expanded where it is set?");
+    }
+    Ok(())
 }
 
 /// Owning Axiopera task, including callers in its native child sessions.
@@ -136,6 +187,57 @@ mod tests {
     fn first_host_variable_wins_without_ancestry() {
         let e = env(&[("CODEX_THREAD_ID", "c1"), ("CLAUDE_CODE_SESSION_ID", "s1")]);
         assert_eq!(detect(e, no_ancestors), "claude:s1");
+    }
+
+    #[test]
+    fn explicit_callers_outside_tasks_are_taken_as_given() {
+        for given in [
+            "claude:s1",
+            "my-agent2:a/b",
+            "task:t1",
+            "task:t1/grok:child",
+        ] {
+            assert_eq!(explicit(given, None).unwrap(), given);
+        }
+    }
+
+    #[test]
+    fn explicit_callers_inside_a_task_stay_in_it() {
+        // A read-tier sub-agent may run `axiopera --caller ... spawn` without approval.
+        assert_eq!(
+            explicit("claude:s1", Some("t1")).unwrap(),
+            "task:t1/claude:s1"
+        );
+        assert_eq!(explicit("task:t1", Some("t1")).unwrap(), "task:t1");
+        assert_eq!(
+            explicit("task:t1/grok:c", Some("t1")).unwrap(),
+            "task:t1/grok:c"
+        );
+        for other in ["task:t2", "task:t2/claude:s1"] {
+            let error = explicit(other, Some("t1")).unwrap_err().to_string();
+            assert!(error.contains("this is task t1"), "{error}");
+        }
+    }
+
+    #[test]
+    fn malformed_explicit_callers_are_refused() {
+        for (given, says) in [
+            ("user", "is not <agent>:<session ID>"),
+            ("", "is not <agent>:<session ID>"),
+            ("claude:", "has no session ID"),
+            ("task:t1/claude:", "has no session ID"),
+            (":s1", "agent name"),
+            ("Claude:s1", "agent name"),
+            ("my_agent:s1", "agent name"),
+            ("task:t1/task:t2", "agent name"),
+            ("task:", "names no task"),
+            ("task:/claude:s1", "names no task"),
+        ] {
+            for task in [None, Some("t1")] {
+                let error = explicit(given, task).unwrap_err().to_string();
+                assert!(error.contains(says), "{given:?}: {error}");
+            }
+        }
     }
 
     #[test]

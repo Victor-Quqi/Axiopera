@@ -2,6 +2,13 @@ axiopera: run other coding agents (claude, codex, grok) as your sub-agents.
 
 Use axiopera for a different agent or model, or for work that must continue after your
 session ends.
+@user
+@user axiopera takes you for `user`, the person at a terminal. An agent must not act as `user`:
+@user when your session variable does not reach axiopera (over ssh, in a container) or axiopera
+@user does not recognize your agent, add `--caller <agent>:<session ID>` to every command, e.g.
+@user `ssh host axiopera --caller "claude:$CLAUDE_CODE_SESSION_ID" inbox`. Claude Code, Codex and
+@user Grok keep the ID in CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID and GROK_SESSION_ID; an agent
+@user without one generates a random ID once and keeps using it.
 
 Dispatch
   axiopera spawn codex "Fix the failing test in tests/parser.rs."

@@ -32,6 +32,10 @@ struct Cli {
     /// Print structured JSON.
     #[arg(long, global = true)]
     json: bool,
+    /// Call as this session when its variable does not reach axiopera, e.g. over ssh:
+    /// `<agent>:<session ID>`, the same on every command.
+    #[arg(long, global = true, value_name = "AGENT:SESSION")]
+    caller: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -101,10 +105,6 @@ enum Command {
         /// Show progress until no sub-tasks are running or queued.
         #[arg(long)]
         status: bool,
-        /// Whose sub-tasks, e.g. `grok:<session>`: Grok's monitor tool starts commands without
-        /// the session's GROK_SESSION_ID.
-        #[arg(long)]
-        caller: Option<String>,
     },
     /// List your sub-tasks, or show one.
     Status {
@@ -297,7 +297,16 @@ fn main() {
 
 async fn run(cli: Cli) -> Result<i32> {
     let home = paths::default_home();
-    let mut caller = None;
+    let caller = match &cli.caller {
+        Some(given) => {
+            // Empty counts as unset, as in identity::detect.
+            let task = std::env::var(identity::TASK_VAR)
+                .ok()
+                .filter(|v| !v.is_empty());
+            Some(identity::explicit(given, task.as_deref())?)
+        }
+        None => None,
+    };
     let request = match cli.command {
         Command::Models { agent, cwd } => Request::Models {
             agent,
@@ -307,7 +316,10 @@ async fn run(cli: Cli) -> Result<i32> {
             },
         },
         Command::Guide { host } => {
-            print!("{}", guide(host, &client::detect_caller()));
+            print!(
+                "{}",
+                guide(host, &caller.unwrap_or_else(client::detect_caller))
+            );
             return Ok(0);
         }
         Command::Plugin {
@@ -329,7 +341,7 @@ async fn run(cli: Cli) -> Result<i32> {
             return top::run(&home, task.as_deref(), all).await;
         }
         Command::Mcp { codex_hooks } => {
-            return mcp::serve(client::Client { home, json: false }, codex_hooks).await;
+            return mcp::serve(client::Client { home, json: false }, codex_hooks, caller).await;
         }
         Command::Daemon {
             command: DaemonCommand::Run { home, idle_secs },
@@ -388,10 +400,7 @@ async fn run(cli: Cli) -> Result<i32> {
             timeout_ms: timeout.map(|d| d.as_millis() as u64),
         },
         Command::Inbox { tasks } => Request::Inbox { tasks },
-        Command::Watch { caller: c, status } => {
-            caller = c;
-            Request::Watch { status }
-        }
+        Command::Watch { status } => Request::Watch { status },
         Command::Status { task, all } => Request::Status { task, all },
         Command::Log { task, tail } => Request::Log { task, tail },
         Command::Result { task, turn, force } => Request::Result { task, turn, force },
@@ -422,18 +431,31 @@ async fn run(cli: Cli) -> Result<i32> {
 }
 
 /// The guide for one host, or for all with each one's part labelled; lines in `guide.md`
-/// that start with `@<host> ` apply to that host only. The watch command is filled in for a
-/// Grok session or a sub-agent, as their monitors cannot tell who started them.
+/// that start with `@<host> ` apply to that host only, and `@user` lines only to a caller
+/// taken for `user`, such as a host whose session variable did not reach axiopera. The watch
+/// command is filled in for a Grok session or a sub-agent, as their monitors cannot tell who
+/// started them.
 fn guide(host: Option<Agent>, caller: &str) -> String {
     let mut text = String::new();
     let mut labelled = None;
     for line in include_str!("guide.md").lines() {
-        let Some((tag, rest)) = line.strip_prefix('@').and_then(|l| l.split_once(' ')) else {
+        let Some((tag, rest)) = line
+            .strip_prefix('@')
+            .map(|l| l.split_once(' ').unwrap_or((l, "")))
+        else {
             text.push_str(line);
             text.push('\n');
             labelled = None;
             continue;
         };
+        if tag == "user" {
+            if caller == "user" {
+                text.push_str(rest);
+                text.push('\n');
+                labelled = None;
+            }
+            continue;
+        }
         let (name, label) = match tag {
             "claude" => (Agent::Claude, "Claude Code"),
             "codex" => (Agent::Codex, "Codex"),
@@ -618,20 +640,60 @@ mod tests {
     }
 
     #[test]
-    fn watch_status_keeps_the_caller_option() {
-        let cli =
-            Cli::try_parse_from(["axiopera", "watch", "--status", "--caller", "codex:s0"]).unwrap();
-        assert!(
-            matches!(cli.command, Command::Watch { status: true, caller: Some(c) } if c == "codex:s0")
-        );
-        let cli = Cli::try_parse_from(["axiopera", "watch"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Command::Watch {
-                status: false,
-                caller: None
-            }
-        ));
+    fn only_a_caller_taken_for_user_is_told_to_name_itself() {
+        let hint = "\n\naxiopera takes you for `user`";
+        // A host over ssh asks for its own part but arrives without its session variable.
+        for host in [
+            None,
+            Some(Agent::Claude),
+            Some(Agent::Codex),
+            Some(Agent::Grok),
+        ] {
+            let text = guide(host, "user");
+            assert_eq!(text.matches(hint).count(), 1);
+            assert!(text.contains("keeps using it.\n\nDispatch\n"));
+            assert!(!text.contains('@'));
+        }
+        for caller in ["claude:s0", "pi:s0", "task:t1"] {
+            let text = guide(Some(Agent::Claude), caller);
+            assert!(!text.contains("--caller") && !text.contains("takes you for"));
+            assert!(text.contains("session ends.\n\nDispatch\n"));
+        }
+    }
+
+    #[test]
+    fn the_caller_option_goes_anywhere() {
+        for args in [
+            vec!["axiopera", "--caller", "claude:s0", "inbox"],
+            vec!["axiopera", "inbox", "--caller", "claude:s0"],
+            vec![
+                "axiopera",
+                "spawn",
+                "codex",
+                "fix",
+                "it",
+                "--caller",
+                "claude:s0",
+            ],
+            vec!["axiopera", "watch", "--status", "--caller", "claude:s0"],
+        ] {
+            let cli = Cli::try_parse_from(&args).unwrap();
+            assert_eq!(cli.caller.as_deref(), Some("claude:s0"), "{args:?}");
+        }
+        let cli = Cli::try_parse_from(["axiopera", "watch", "--status"]).unwrap();
+        assert!(cli.caller.is_none());
+        assert!(matches!(cli.command, Command::Watch { status: true }));
+        let cli = Cli::try_parse_from(["axiopera", "spawn", "codex", "a", "b"]).unwrap();
+        assert!(matches!(cli.command, Command::Spawn { task, .. } if task == ["a", "b"]));
+    }
+
+    #[tokio::test]
+    async fn malformed_callers_fail_before_daemon_connection() {
+        for given in ["claude:", "user"] {
+            let cli = Cli::try_parse_from(["axiopera", "--caller", given, "inbox"]).unwrap();
+            let error = run(cli).await.unwrap_err().to_string();
+            assert!(error.starts_with(&format!("--caller {given:?}")), "{error}");
+        }
     }
 
     #[test]

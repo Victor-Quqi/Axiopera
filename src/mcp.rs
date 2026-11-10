@@ -19,7 +19,9 @@ use crate::ipc::Request;
 /// not use yet.
 const VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 
-pub async fn serve(client: Client, codex_hooks: bool) -> Result<i32> {
+/// `caller` overrides detection for the ask, tell and answers tools; the hooks take each
+/// session from the hook call.
+pub async fn serve(client: Client, codex_hooks: bool, caller: Option<String>) -> Result<i32> {
     let mut reminded = HashMap::new();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
@@ -45,7 +47,7 @@ pub async fn serve(client: Client, codex_hooks: bool) -> Result<i32> {
             "tools/list" if codex_hooks => json!({"tools": hook_tools()}),
             "tools/list" => json!({"tools": tools()}),
             "tools/call" if codex_hooks => hook(&client, params, &mut reminded).await,
-            "tools/call" => call(&client, params).await,
+            "tools/call" => call(&client, caller.clone(), params).await,
             other => {
                 let error = json!({"code": -32601, "message": format!("unknown method {other}")});
                 reply(
@@ -107,7 +109,7 @@ fn tools() -> Value {
     ])
 }
 
-async fn call(client: &Client, params: &Value) -> Value {
+async fn call(client: &Client, caller: Option<String>, params: &Value) -> Value {
     let arg = |k: &str| {
         params["arguments"][k]
             .as_str()
@@ -128,7 +130,7 @@ async fn call(client: &Client, params: &Value) -> Value {
     let mut lines = Vec::new();
     let mut failed = false;
     let outcome = client
-        .request(request, |line| match line {
+        .request(caller, request, |line| match line {
             Line::Out { text, .. } => lines.push(text),
             Line::Error(message) => {
                 failed = true;
