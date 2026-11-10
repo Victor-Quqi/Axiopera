@@ -118,8 +118,9 @@ impl Remote {
         }
     }
 
-    /// Into the running turn, or as a new turn if the session is idle. Returns which.
-    pub async fn message(&mut self, thread: &str, text: &str) -> Result<&'static str> {
+    /// Into the running turn, or as a new turn if the session is idle. Returns which. `id` goes
+    /// with the message as its `clientUserMessageId`, outside the text the agent reads.
+    pub async fn message(&mut self, thread: &str, text: &str, id: &str) -> Result<&'static str> {
         let input = json!([{"type": "text", "text": text}]);
         let mut last_err = None;
         // The session may start or end a turn between our look and our message.
@@ -136,14 +137,20 @@ impl Remote {
             let sent = if last["status"] == "inProgress" {
                 self.call(
                     "turn/steer",
-                    json!({"threadId": thread, "expectedTurnId": last["id"], "input": input}),
+                    json!({
+                        "threadId": thread, "expectedTurnId": last["id"], "input": input,
+                        "clientUserMessageId": id,
+                    }),
                 )
                 .await
                 .map(|_| "steered into its running turn")
             } else {
-                self.call("turn/start", json!({"threadId": thread, "input": input}))
-                    .await
-                    .map(|_| "started a turn")
+                self.call(
+                    "turn/start",
+                    json!({"threadId": thread, "input": input, "clientUserMessageId": id}),
+                )
+                .await
+                .map(|_| "started a turn")
             };
             match sent {
                 Ok(how) => return Ok(how),
@@ -159,7 +166,10 @@ impl Remote {
         self.sent
     }
 
-    pub async fn contains_message(&mut self, thread: &str, marker: &str) -> Result<bool> {
+    /// Whether the session has the user message sent with `id`. Codex keeps the ID with the
+    /// message, also in a session loaded again from disk. A message steered into a running turn
+    /// is not listed yet when the steer is accepted.
+    pub async fn contains_message(&mut self, thread: &str, id: &str) -> Result<bool> {
         let mut cursor = Value::Null;
         loop {
             let page = self
@@ -177,7 +187,7 @@ impl Remote {
             if turns.iter().any(|t| !t["items"].is_array()) {
                 bail!("thread/turns/list omitted full items");
             }
-            if turns.iter().any(|t| has_marker(t, marker)) {
+            if turns.iter().any(|t| has_message(t, id)) {
                 return Ok(true);
             }
             cursor = page["nextCursor"].clone();
@@ -382,23 +392,12 @@ impl Remote {
     }
 }
 
-fn has_marker(turn: &Value, marker: &str) -> bool {
+fn has_message(turn: &Value, id: &str) -> bool {
     turn["items"]
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|item| item["type"] == "userMessage")
-        .any(|item| {
-            item["content"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|block| {
-                    block["text"]
-                        .as_str()
-                        .is_some_and(|text| text.contains(marker))
-                })
-        })
+        .any(|item| item["type"] == "userMessage" && item["clientId"] == id)
 }
 
 fn base64(bytes: &[u8]) -> String {
@@ -425,16 +424,19 @@ fn base64(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn receipt_matches_only_user_content() {
+    fn receipt_matches_only_the_user_message_sent_with_the_id() {
         use serde_json::json;
-        let marker = "[axiopera:batch]";
+        let id = "axiopera:batch";
         let turn = json!({"items": [
-            {"type": "agentMessage", "content": [{"text": marker}]},
-            {"type": "userMessage", "content": [{"text": "something else"}]}
+            {"type": "agentMessage", "id": id, "text": id},
+            {"type": "userMessage", "clientId": null, "content": [{"text": id}]},
+            {"type": "userMessage", "clientId": "axiopera:other", "content": [{"text": "result"}]}
         ]});
-        assert!(!super::has_marker(&turn, marker));
-        let turn = json!({"items": [{"type": "userMessage", "content": [{"text": format!("{marker} result")}]}]});
-        assert!(super::has_marker(&turn, marker));
+        assert!(!super::has_message(&turn, id));
+        let turn = json!({"items": [
+            {"type": "userMessage", "clientId": id, "content": [{"text": "result"}]}
+        ]});
+        assert!(super::has_message(&turn, id));
     }
 
     #[test]

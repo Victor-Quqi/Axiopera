@@ -453,16 +453,17 @@ impl Daemon {
                 return Ok(("nothing left to send".to_string(), false));
             }
             let texts: Vec<&str> = taken.items.iter().map(|(_, t)| t.as_str()).collect();
+            // Sent beside the text, where the agent does not read it.
             let marker = format!(
-                "[axiopera:{}]",
+                "axiopera:{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..12]
             );
             let message = format!(
-                "{marker} From your sub-tasks (sent by axiopera, not typed by the user):\n{}",
+                "From your sub-tasks (sent by axiopera, not typed by the user):\n{}",
                 texts.join("\n")
             );
             let pending = PendingPush {
-                marker,
+                marker: marker.clone(),
                 events: taken.seen.iter().map(|e| (e.task.clone(), e.seq)).collect(),
                 turns: taken.turns.clone(),
                 approvals: taken.approvals.clone(),
@@ -477,7 +478,7 @@ impl Daemon {
             }
             let more = taken.left > 0;
             batch = Some(taken);
-            let how = r.message(&host.thread, &message).await?;
+            let how = r.message(&host.thread, &message, &marker).await?;
             anyhow::Ok((how.to_string(), more))
         })
         .await;
@@ -703,7 +704,7 @@ mod tests {
         for found in [false, true] {
             let f = fixture();
             let pending = PendingPush {
-                marker: "[axiopera:receipt]".into(),
+                marker: "axiopera:receipt".into(),
                 events: vec![("test".into(), 7)],
                 turns: vec![("test".into(), 1)],
                 approvals: vec!["r1".into()],
@@ -728,7 +729,7 @@ mod tests {
             }
             let loaded = crate::store::Ledger::load(&f.d.opts.home).unwrap();
             let pending = loaded.pending_pushes["codex:host"].clone();
-            assert_eq!(pending.marker, "[axiopera:receipt]");
+            assert_eq!(pending.marker, "axiopera:receipt");
             f.d.settle_push("codex:host", pending, found).unwrap();
             let st = f.d.lock();
             assert!(st.ledger.pending_pushes.is_empty());

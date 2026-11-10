@@ -171,7 +171,7 @@ def main():
         log("spawn alpha:", axiopera("spawn", "claude", "--tier", "read", "--model", "haiku", "--name", "alpha",
                                      "Reply with exactly ALPHA").splitlines()[-1])
         turns = daemon.wait_idle(tid, 2, 240)
-        pushed = [t for t in user_texts(turns[-1]) if t.startswith("[axiopera:") and "ALPHA" in t]
+        pushed = [t for t in user_texts(turns[-1]) if t.startswith("From your sub-tasks") and "ALPHA" in t]
         log("idle:", "new turn" if len(turns) == 2 and pushed else "NOT pushed", "|", " / ".join(pushed)[:200])
 
         # Busy host: the result should be steered into the running turn.

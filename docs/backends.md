@@ -132,7 +132,7 @@ Claude 和 Grok 由宿主进程在后台命令退出时唤醒，与界面无关�
 
 经 ssh 等调用另一台机器上的 Axiopera 时（见[指定调用方](usage.md#指定调用方)），Claude 的后台 `wait` 和 Grok monitor 中的 `watch` 仍由本机宿主运行，送达方式与本机相同。Codex 的推送、门铃和插件 hook 都要求 daemon 与 Codex 会话在同一台机器上，跨机器时只能轮询 `wait` 和 `inbox`。远端 daemon 收到 `codex:` 调用方的 `spawn` 时仍在远端查找该会话：远端没有 Codex 时回执称找不到 Codex，有 Codex 时先后查询共享 daemon 和私有 app-server，各最多等 5 秒，再回落到轮询。
 
-Codex 交互式会话挂在用户级 app-server daemon 上时，Axiopera 经 `codex app-server proxy` 连接其 WebSocket JSON-RPC。用 `thread/loaded/list` 确认会话已加载，再按轮次状态调用 `turn/steer` 或 `turn/start`。`codex exec`、`--no-daemon`、带 `-c` 配置覆盖（Codex 0.164 起只开关 feature 的除外，未实测）、Windows 管理员终端中的会话不在该 daemon 上；桌面端和 VS Code 扩展的会话也不在，它们各自以 stdio 启动私有 app-server。
+Codex 交互式会话挂在用户级 app-server daemon 上时，Axiopera 经 `codex app-server proxy` 连接其 WebSocket JSON-RPC。用 `thread/loaded/list` 确认会话已加载，再按轮次状态调用 `turn/steer` 或 `turn/start`。两者都可带 `clientUserMessageId`，Codex 把它记为该用户消息的 `clientId`，`thread/turns/list` 读回时原样给出，会话从磁盘重新加载后仍在。`turn/steer` 送入的消息在被接受时还不在列表中，本轮结束后可以读到，中间何时出现未测。`codex exec`、`--no-daemon`、带 `-c` 配置覆盖（Codex 0.164 起只开关 feature 的除外，未实测）、Windows 管理员终端中的会话不在该 daemon 上；桌面端和 VS Code 扩展的会话也不在，它们各自以 stdio 启动私有 app-server。
 
 不在共享 daemon 上的会话，由 Axiopera 另起的私有 `codex app-server` 用 `thread/read` 读取来源。来源为 `vscode` 表示 app-server 客户端的会话，桌面端和 VS Code 扩展都属于此类，Axiopera 对其使用门铃：
 

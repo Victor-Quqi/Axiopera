@@ -434,6 +434,7 @@ pub struct Ledger {
 /// A batch written without an acknowledged reply, recoverable after a daemon restart.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct PendingPush {
+    /// The `clientUserMessageId` its message was sent with, which a read-back finds it by.
     pub marker: String,
     pub events: Vec<(String, u64)>,
     pub turns: Vec<(String, u32)>,
