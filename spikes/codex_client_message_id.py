@@ -1,11 +1,12 @@
 """Does Codex hand back the `clientUserMessageId` of a user message, so that a push is found again
 without a marker in its text?
 
-Sends messages into one thread of a private `codex app-server`, by `turn/start` and by `turn/steer`,
-each with a `clientUserMessageId` of the shape axiopera gives its pushes, and reads them back as
-axiopera does, with `thread/turns/list`:
+Sends messages into one thread of a private `codex app-server`, by `turn/start`, by `turn/steer` and
+by `thread/queue/add`, each with a `clientUserMessageId` of the shape axiopera gives its pushes and
+reminders, and reads them back as axiopera does, with `thread/turns/list`:
   start    a message that starts a turn
   steer    a message steered into a running turn, read back while it runs and after it ends
+  queue    a message queued for the idle thread, as a reminder is, read back once its turn ended
   reload   the same thread read by a new app-server, before and after `thread/resume`
 Prints for each message whether its `clientId` and its text came back as sent. Deletes the thread.
 
@@ -115,6 +116,12 @@ def main(model):
         report("while the steered turn runs", user_messages(rpc, tid), sent)
         log("steered turn:", (until(rpc, "turn/completed", 300) or {}).get("turn", {}).get("status"))
         report("after the steered turn", user_messages(rpc, tid), sent)
+
+        # A message queued for the idle thread, which the app-server starts a turn with.
+        queued = send("queue", "Reply with just: queued. Run no commands.")
+        rpc.call("thread/queue/add", {"threadId": tid, **queued})
+        log("queued turn:", (until(rpc, "turn/completed", 120) or {}).get("turn", {}).get("status"))
+        report("after the queued turn", user_messages(rpc, tid), sent)
 
         # The thread as another process reads it from its rollout.
         rpc.close()
