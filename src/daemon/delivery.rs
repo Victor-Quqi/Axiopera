@@ -11,6 +11,16 @@ use serde_json::Value;
 use super::{Daemon, State, cursor_key, render, within};
 use crate::{agent, store::Event};
 
+/// An ID for one handover: what `inbox`, `result` or a push gave a caller at once. A message
+/// axiopera sends into a host session carries one as its `clientUserMessageId`, where the agent
+/// does not read it.
+pub(super) fn mark() -> String {
+    format!(
+        "axiopera:{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    )
+}
+
 pub(super) fn index_approval(index: &mut HashMap<String, Vec<usize>>, event: &Event, at: usize) {
     if event.kind == "approval_request"
         && let Some(caller) = event.data.get("approver").and_then(Value::as_str)
@@ -28,6 +38,47 @@ pub(super) fn approval_index(events: &[Event]) -> HashMap<String, Vec<usize>> {
 }
 
 impl Daemon {
+    /// Record what reached `to` at once, in the log of each task it tells of: the events
+    /// `shown`, and the `turns` whose result text went along. Nothing reads it back here; it
+    /// tells whoever watches the store what an agent was given, which the text given does not.
+    pub(super) fn record_delivery(
+        &self,
+        to: &str,
+        via: &str,
+        mark: &str,
+        shown: &[(String, u64)],
+        turns: &[(String, u32)],
+    ) {
+        let mut tasks: Vec<&String> = shown
+            .iter()
+            .map(|(task, _)| task)
+            .chain(turns.iter().map(|(task, _)| task))
+            .collect();
+        tasks.sort_unstable();
+        tasks.dedup();
+        // A task gc removed meanwhile took its log along.
+        tasks.retain(|task| self.lock().tasks.contains_key(*task));
+        for task in tasks {
+            let events: Vec<u64> = shown
+                .iter()
+                .filter(|(t, _)| t == task)
+                .map(|(_, seq)| *seq)
+                .collect();
+            let results: Vec<u32> = turns
+                .iter()
+                .filter(|(t, _)| t == task)
+                .map(|(_, turn)| *turn)
+                .collect();
+            self.emit(
+                task,
+                "delivered",
+                serde_json::json!({
+                    "to": to, "via": via, "batch": mark, "events": events, "results": results,
+                }),
+            );
+        }
+    }
+
     /// Keep historical approval routes, including requests whose process has gone away.
     pub(super) fn unseen(&self, st: &State, caller: &str, only: &[String]) -> Vec<Event> {
         let mut ready = Vec::new();

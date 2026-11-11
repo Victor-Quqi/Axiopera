@@ -437,6 +437,9 @@ pub struct PendingPush {
     /// The `clientUserMessageId` its message was sent with, which a read-back finds it by.
     pub marker: String,
     pub events: Vec<(String, u64)>,
+    /// Those of them its message shows, for the record of the delivery.
+    #[serde(default)]
+    pub shown: Vec<(String, u64)>,
     pub turns: Vec<(String, u32)>,
     #[serde(default)]
     pub approvals: Vec<String>,

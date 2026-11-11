@@ -272,10 +272,10 @@ impl Daemon {
     ) -> anyhow::Result<()> {
         let mut st = self.lock();
         if delivered {
-            for (task, turn) in pending.turns {
-                if let Some(entry) = st.tasks.get_mut(&task) {
+            for (task, turn) in &pending.turns {
+                if let Some(entry) = st.tasks.get_mut(task) {
                     let mut task = entry.task.clone();
-                    task.delivered = task.delivered.max(turn);
+                    task.delivered = task.delivered.max(*turn);
                     task.updated_ms = crate::store::now_ms();
                     self.store.save(&task)?;
                     entry.task = task;
@@ -284,15 +284,15 @@ impl Daemon {
         }
         let mut ledger = st.ledger.clone();
         if delivered {
-            for (task, seq) in pending.events {
-                if !st.tasks.contains_key(&task) {
+            for (task, seq) in &pending.events {
+                if !st.tasks.contains_key(task) {
                     continue;
                 }
                 let cursor = ledger
                     .cursors
-                    .entry(super::cursor_key(caller, &task))
+                    .entry(super::cursor_key(caller, task))
                     .or_default();
-                *cursor = (*cursor).max(seq);
+                *cursor = (*cursor).max(*seq);
             }
         }
         ledger.pending_pushes.remove(caller);
@@ -304,6 +304,16 @@ impl Daemon {
                     p.delivered = true;
                 }
             }
+        }
+        drop(st);
+        if delivered {
+            self.record_delivery(
+                caller,
+                "push",
+                &pending.marker,
+                &pending.shown,
+                &pending.turns,
+            );
         }
         self.log(&format!(
             "{caller} push read-back: {}",
@@ -453,11 +463,7 @@ impl Daemon {
                 return Ok(("nothing left to send".to_string(), false));
             }
             let texts: Vec<&str> = taken.items.iter().map(|(_, t)| t.as_str()).collect();
-            // Sent beside the text, where the agent does not read it.
-            let marker = format!(
-                "axiopera:{}",
-                &uuid::Uuid::new_v4().simple().to_string()[..12]
-            );
+            let marker = super::delivery::mark();
             let message = format!(
                 "From your sub-tasks (sent by axiopera, not typed by the user):\n{}",
                 texts.join("\n")
@@ -465,6 +471,7 @@ impl Daemon {
             let pending = PendingPush {
                 marker: marker.clone(),
                 events: taken.seen.iter().map(|e| (e.task.clone(), e.seq)).collect(),
+                shown: taken.shown(),
                 turns: taken.turns.clone(),
                 approvals: taken.approvals.clone(),
             };
@@ -477,7 +484,7 @@ impl Daemon {
                 st.ledger = ledger;
             }
             let more = taken.left > 0;
-            batch = Some(taken);
+            batch = Some((taken, marker.clone()));
             let how = r.message(&host.thread, &message, &marker).await?;
             anyhow::Ok((how.to_string(), more))
         })
@@ -487,12 +494,14 @@ impl Daemon {
             Err(_) => Err("timed out".to_string()),
         };
         if outcome.is_ok() {
-            if let Some(b) = &batch {
+            if let Some((b, marker)) = &batch {
                 if let Err(e) = self.mark_seen(caller, &b.seen, &b.turns, &b.approvals) {
                     return Err(format!("saving cursors: {e:#}"));
                 }
                 self.clear_pending_push(caller)
                     .map_err(|e| format!("saving push state: {e:#}"))?;
+                // Once it is pending no more, so that no read-back puts it on record again.
+                self.record_delivery(caller, "push", marker, &b.shown(), &b.turns);
             }
         } else if batch.is_some() && !remote.as_ref().is_some_and(Remote::sent) {
             self.clear_pending_push(caller)
@@ -688,6 +697,7 @@ mod tests {
         let pending = PendingPush {
             marker: "receipt".into(),
             events: vec![("gone".into(), 8), ("test".into(), 9)],
+            shown: vec![("gone".into(), 8), ("test".into(), 9)],
             turns: vec![("gone".into(), 1), ("test".into(), 1)],
             approvals: Vec::new(),
         };
@@ -697,6 +707,8 @@ mod tests {
         assert!(!st.ledger.cursors.contains_key("codex:host|gone"));
         assert_eq!(st.ledger.cursors["codex:host|test"], 9);
         assert_eq!(st.tasks["test"].task.delivered, 1);
+        drop(st);
+        assert!(!f.d.store.exists("gone"));
     }
 
     #[test]
@@ -705,7 +717,8 @@ mod tests {
             let f = fixture();
             let pending = PendingPush {
                 marker: "axiopera:receipt".into(),
-                events: vec![("test".into(), 7)],
+                events: vec![("test".into(), 5), ("test".into(), 7)],
+                shown: vec![("test".into(), 7)],
                 turns: vec![("test".into(), 1)],
                 approvals: vec!["r1".into()],
             };
@@ -740,6 +753,20 @@ mod tests {
             );
             // Approved by whoever got it, though it was taken from no cursor.
             assert_eq!(st.approvals["r1"].delivered, found);
+            drop(st);
+            // What the message showed is on record once it is known to have arrived.
+            let records: Vec<_> =
+                f.d.store
+                    .events("test")
+                    .into_iter()
+                    .filter(|e| e.kind == "delivered")
+                    .map(|e| serde_json::Value::Object(e.data))
+                    .collect();
+            let expected = serde_json::json!({
+                "to": "codex:host", "via": "push", "batch": "axiopera:receipt",
+                "events": [7], "results": [1],
+            });
+            assert_eq!(records, if found { vec![expected] } else { vec![] });
         }
     }
 
@@ -896,6 +923,7 @@ mod capability_cache_tests {
                 PendingPush {
                     marker: "saved-before-send".into(),
                     events: vec![("test".into(), seq)],
+                    shown: vec![],
                     turns: vec![("test".into(), 1)],
                     approvals: vec![],
                 },
@@ -1020,6 +1048,7 @@ mod capability_cache_tests {
                 PendingPush {
                     marker: "already-written".into(),
                     events: vec![("test".into(), 1)],
+                    shown: vec![],
                     turns: vec![("test".into(), 1)],
                     approvals: vec![],
                 },
@@ -1053,6 +1082,7 @@ mod capability_cache_tests {
                 PendingPush {
                     marker: "keep-for-read-back".into(),
                     events: vec![("test".into(), 1)],
+                    shown: vec![],
                     turns: vec![],
                     approvals: vec![],
                 },

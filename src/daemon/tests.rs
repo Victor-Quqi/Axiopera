@@ -633,6 +633,93 @@ async fn wait_lists_news_without_taking_it_and_inbox_takes_all() {
     assert_eq!(exit, ipc::exit::NOTHING_RUNNING);
 }
 
+#[tokio::test]
+async fn what_inbox_and_result_hand_over_is_on_record_in_each_tasks_log() {
+    let f = fixture_with(&[json!({"id": "other"})]);
+    let records = |task: &str| -> Vec<Value> {
+        f.d.store
+            .events(task)
+            .into_iter()
+            .filter(|e| e.kind == "delivered")
+            .map(|e| Value::Object(e.data))
+            .collect()
+    };
+    f.d.update("test", |t| t.turns = 1);
+    f.d.store.save_turn("test", 1, "the report").unwrap();
+    f.d.emit("test", "turn_ended", json!({"turn": 1, "ok": true}));
+    f.d.emit("other", "question", json!({"id": "q1", "text": "Which?"}));
+    let seq = |task: &str| f.d.lock().tasks[task].deliverable[0].seq;
+    let (ended, asked) = (seq("test"), seq("other"));
+    // Listing news hands nothing over.
+    f.d.wait("codex:host", &[], None, &mut Out::new(&mut Vec::new()))
+        .await
+        .unwrap();
+    assert!(records("test").is_empty() && records("other").is_empty());
+
+    f.d.inbox("codex:host", &[], &mut Out::new(&mut Vec::new()))
+        .await
+        .unwrap();
+    let (of_test, of_other) = (records("test"), records("other"));
+    let batch = of_test[0]["batch"].as_str().unwrap();
+    assert!(batch.starts_with("axiopera:"), "{batch}");
+    assert_eq!(
+        of_test,
+        [
+            json!({"to": "codex:host", "via": "inbox", "batch": batch, "events": [ended], "results": [1]})
+        ]
+    );
+    assert_eq!(
+        of_other,
+        [
+            json!({"to": "codex:host", "via": "inbox", "batch": batch, "events": [asked], "results": []})
+        ]
+    );
+    // An inbox with nothing to hand over leaves no record, nor does a record count as news.
+    let exit =
+        f.d.inbox("codex:host", &[], &mut Out::new(&mut Vec::new()))
+            .await
+            .unwrap();
+    assert_eq!(exit, ipc::exit::NOTHING_RUNNING);
+    assert_eq!(records("test").len() + records("other").len(), 2);
+
+    // A result already handed over is not handed over again, unless forced.
+    let mut buf = Vec::new();
+    f.d.result("user", "test", None, false, &mut Out::new(&mut buf))
+        .await
+        .unwrap();
+    assert!(replies(&buf).contains("already delivered"));
+    assert_eq!(records("test").len(), 1);
+    f.d.result("user", "test", None, true, &mut Out::new(&mut Vec::new()))
+        .await
+        .unwrap();
+    let taken = &records("test")[1];
+    assert_eq!(
+        (
+            &taken["to"],
+            &taken["via"],
+            &taken["events"],
+            &taken["results"]
+        ),
+        (&json!("user"), &json!("result"), &json!([]), &json!([1]))
+    );
+    assert_ne!(taken["batch"], json!(batch));
+    let agent = f.d.lock().tasks["test"].task.agent;
+    let lines: Vec<String> =
+        f.d.store
+            .events("test")
+            .iter()
+            .filter(|e| e.kind == "delivered")
+            .map(|e| render::event_line(e, agent))
+            .collect();
+    assert_eq!(
+        lines,
+        [
+            "[test codex] handed to codex:host by inbox: 1 message(s), the result of turn 1",
+            "[test codex] handed to user by result: the result of turn 1",
+        ]
+    );
+}
+
 #[test]
 fn a_reply_takes_whole_events_and_leaves_the_rest() {
     let f = fixture();

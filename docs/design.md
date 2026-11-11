@@ -117,7 +117,19 @@ daemon 用调用方经 IPC 传来的环境启动子 agent。环境只留在内�
 
 其中兄弟留言抄送、交接通知和调用方自己发起的取消不算新消息：不让 `wait` 返回，不触发推送和提醒，随下一次 `inbox` 一起交出。超时或其他调用方的取消仍算新消息。
 
-spawned、turn_started、steered、input_read、tool、tool_updated、said、file_changed、answered、approved、denied、withdrawn、blocked、notice 只写事件日志。`tool_updated` 按调用 ID 更新已有工具记录的名称与摘要，不增加调用计数或改变调用时间。`said` 是子 agent 写完的一段话，截到 500 个字符，换行记为 `↵`；每轮最后一段同时是结果，全文在 `turns/<n>.md`。`blocked` 在轮末汇总次数，避免每次拒绝都提醒主 agent。`notice` 是适配器发现的后端设置问题，原文附在下一条轮末结果上。改动文件从工具事件提取，共享目录下的 Git diff 无法归属到某个任务。
+spawned、turn_started、steered、input_read、tool、tool_updated、said、file_changed、answered、approved、denied、withdrawn、blocked、notice、delivered 只写事件日志。`tool_updated` 按调用 ID 更新已有工具记录的名称与摘要，不增加调用计数或改变调用时间。`said` 是子 agent 写完的一段话，截到 500 个字符，换行记为 `↵`；每轮最后一段同时是结果，全文在 `turns/<n>.md`。`blocked` 在轮末汇总次数，避免每次拒绝都提醒主 agent。`notice` 是适配器发现的后端设置问题，原文附在下一条轮末结果上。改动文件从工具事件提取，共享目录下的 Git diff 无法归属到某个任务。
+
+`delivered` 记一次交付。`inbox`、`result` 或推送把内容交给调用方后，在涉及的每个任务的日志里各记一条：
+
+| 字段 | 内容 |
+|---|---|
+| `to` | 收件的调用方 |
+| `via` | `inbox`、`result` 或 `push` |
+| `batch` | 批次标记，`axiopera:` 加 12 位十六进制。同一次交付的各条记录相同；推送的标记就是那条消息的 `clientUserMessageId` |
+| `events` | 这次交出的该任务事件的序号 |
+| `results` | 这次附带结果正文的轮次 |
+
+记录供读取存储的观测工具对上宿主会话里的命令和消息，Axiopera 不读回；写入失败只记入 daemon 日志，不影响交付。`inbox` 和 `result` 在正文写给调用方后、保存游标和交付标记前记录，保存失败后重取的内容另记一条。推送在待确认批次清除后记录，同一批次不会记两次；daemon 在两步之间退出则漏记。`wait`、`watch`、门铃和 hook 的提醒只列出新消息，不算交付，不记。
 
 `wait` 只等不取，`inbox` 只取不等。游标按调用方和任务保存，只有 `inbox` 和推送推进游标；指定任务时不会消费其他任务的事件。结果正文的交付标记独立于游标，正文实际写给客户端后才标记。再次取正文的规则见[使用文档](usage.md#结果与接管)。
 

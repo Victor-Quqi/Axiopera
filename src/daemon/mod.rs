@@ -2076,6 +2076,14 @@ impl Daemon {
             out.text(format!("{more}: run `axiopera inbox` again."), Value::Null)
                 .await?;
         }
+        // The text has reached the caller, whether or not its cursors get saved.
+        self.record_delivery(
+            caller,
+            "inbox",
+            &delivery::mark(),
+            &batch.shown(),
+            &batch.turns,
+        );
         self.mark_seen(caller, &batch.seen, &batch.turns, &batch.approvals)?;
         drop(delivering);
         self.retract_doorbell(caller);
@@ -2712,6 +2720,13 @@ impl Daemon {
             json!({"task": id, "turn": turn, "path": path}),
         )
         .await?;
+        self.record_delivery(
+            caller,
+            "result",
+            &delivery::mark(),
+            &[],
+            &[(id.clone(), turn)],
+        );
         self.try_update(&id, |t| t.delivered = t.delivered.max(turn))?;
         Ok(ipc::exit::OK)
     }
@@ -2769,6 +2784,16 @@ struct Batch {
     /// How many items are left for the next reply, and how many of them approval requests.
     left: usize,
     left_approvals: usize,
+}
+
+impl Batch {
+    /// The events shown, each by its task and sequence number.
+    fn shown(&self) -> Vec<(String, u64)> {
+        self.items
+            .iter()
+            .map(|(e, _)| (e.task.clone(), e.seq))
+            .collect()
+    }
 }
 
 fn urgency(e: &Event) -> u8 {

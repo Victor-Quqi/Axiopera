@@ -190,6 +190,22 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
             e.task
         ),
         "detached" => format!("{who} detached: {}", s("reason")),
+        "delivered" => {
+            let count = |k: &str| get(e, k).as_array().map_or(0, Vec::len);
+            let mut what = Vec::new();
+            if count("events") > 0 {
+                what.push(format!("{} message(s)", count("events")));
+            }
+            for turn in get(e, "results").as_array().into_iter().flatten() {
+                what.push(format!("the result of turn {turn}"));
+            }
+            format!(
+                "{who} handed to {} by {}: {}",
+                s("to"),
+                s("via"),
+                what.join(", ")
+            )
+        }
         other => format!("{who} {other}"),
     }
 }
