@@ -136,7 +136,7 @@ Codex 交互式会话挂在用户级 app-server daemon 上时，Axiopera 经 `co
 
 不在共享 daemon 上的会话，由 Axiopera 另起的私有 `codex app-server` 用 `thread/read` 读取来源。来源为 `vscode` 表示 app-server 客户端的会话，桌面端和 VS Code 扩展都属于此类，Axiopera 对其使用门铃：
 
-- 用持久化队列的 `thread/queue/add` 排入一条提醒，让宿主运行 `inbox`。队列属于实验性 API，需在 `initialize` 中声明 `experimentalApi`。
+- 用持久化队列的 `thread/queue/add` 排入一条提醒，让宿主运行 `inbox`。队列属于实验性 API，需在 `initialize` 中声明 `experimentalApi`。提醒所带的 `clientUserMessageId` 与 `turn/start` 的一样，成为它开启的那一轮里用户消息的 `clientId`。
 - 加载了该会话的 app-server 约每 10 秒检查一次队列。会话空闲时用提醒开启一轮，运行中则等本轮结束。用户中断上一轮后，要等下一轮开始才继续处理。会话未打开时提醒一直保留。
 - 提醒在界面上显示为一条用户消息。
 - 宿主运行 `inbox` 后，Axiopera 用 `thread/queue/delete` 撤回尚未处理的提醒。

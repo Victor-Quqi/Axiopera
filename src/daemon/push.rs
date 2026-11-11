@@ -532,7 +532,9 @@ impl Daemon {
             };
             let text =
                 format!("From your sub-tasks (sent by axiopera, not typed by the user):\n{news}");
-            let id = r.enqueue(&host.thread, &text).await?;
+            let id = r
+                .enqueue(&host.thread, &text, &super::delivery::mark())
+                .await?;
             let mut st = self.lock();
             st.ledger.doorbells.insert(caller.to_string(), id);
             st.ledger.save(&self.opts.home)?;

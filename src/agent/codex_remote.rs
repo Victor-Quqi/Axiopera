@@ -215,15 +215,16 @@ impl Remote {
         Ok(true)
     }
 
-    /// Queue a message for the session's next turn; returns its ID.
-    pub async fn enqueue(&mut self, thread: &str, text: &str) -> Result<String> {
+    /// Queue a message for the session's next turn; returns the ID it has in the queue. `id` goes
+    /// with it as its `clientUserMessageId`, as with `message`.
+    pub async fn enqueue(&mut self, thread: &str, text: &str, id: &str) -> Result<String> {
         let added = self
             .call(
                 "thread/queue/add",
                 json!({
                     "threadId": thread,
                     "input": [{"type": "text", "text": text}],
-                    "clientUserMessageId": format!("axiopera-{}", uuid::Uuid::new_v4()),
+                    "clientUserMessageId": id,
                 }),
             )
             .await?;
