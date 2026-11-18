@@ -377,25 +377,6 @@ async fn discover(
             let inherits_effort = preference.is_some_and(|label| {
                 super::agy::preferred_variant(&session, label, configured_model).is_some()
             });
-            let mut configured_picker = None;
-            if let Some(model) = configured_model
-                && !inherits_effort
-                && super::agy::option(&session, "model")
-                    .and_then(|o| o["options"].as_array())
-                    .is_some_and(|rows| rows.iter().any(|row| row["value"] == model))
-            {
-                let configured = rpc(
-                    proc,
-                    lines,
-                    3,
-                    "session/set_config_option",
-                    json!({"sessionId":id,"configId":"model","value":model}),
-                )
-                .await?;
-                catalog.configured_effort = super::agy::option(&configured, "thought_level")
-                    .and_then(|o| string(o, "currentValue"));
-                configured_picker = Some(configured);
-            }
             if let Some(variant) = preferred {
                 rpc(
                     proc,
@@ -418,22 +399,17 @@ async fn discover(
                 super::agy::option(&session, "model").context("missing AGY model picker")?;
             catalog.models = parse_models(agent, &choices["options"])?;
             catalog.native_model = string(choices, "currentValue");
-            if let Some(effort) = super::agy::option(&session, "thought_level") {
-                catalog.native_effort = string(effort, "currentValue");
-                if configured_model.is_some() && inherits_effort {
-                    catalog.configured_effort.clone_from(&catalog.native_effort);
-                }
-            }
+            catalog.native_effort = super::agy::option(&session, "thought_level")
+                .and_then(|o| string(o, "currentValue"));
             // ACP returns the effort picker for the selected family only.
             // Switch models on the disposable catalog session, without starting a turn.
             for (index, model) in catalog.models.iter_mut().enumerate() {
                 let switched;
-                let picker = if Some(&model.id) == catalog.native_model.as_ref() {
-                    &session
-                } else if Some(model.id.as_str()) == configured_model
-                    && let Some(picker) = &configured_picker
+                let configured = Some(model.id.as_str()) == configured_model;
+                let picker = if Some(&model.id) == catalog.native_model.as_ref()
+                    && (!configured || inherits_effort)
                 {
-                    picker
+                    &session
                 } else {
                     let Ok(reply) = rpc(
                         proc,
@@ -452,8 +428,12 @@ async fn discover(
                 if super::agy::option(picker, "model").and_then(|o| o["currentValue"].as_str())
                     == Some(model.id.as_str())
                 {
+                    let effort = super::agy::option(picker, "thought_level");
+                    if configured {
+                        catalog.configured_effort = effort.and_then(|o| string(o, "currentValue"));
+                    }
                     model.efforts = Some(
-                        super::agy::option(picker, "thought_level")
+                        effort
                             .and_then(|o| o["options"].as_array())
                             .into_iter()
                             .flatten()
@@ -467,7 +447,7 @@ async fn discover(
                 lines,
                 6 + catalog.models.len() as u64,
                 "session/close",
-                json!({"sessionId":session["sessionId"]}),
+                json!({"sessionId":id}),
             )
             .await?;
         }
@@ -623,7 +603,7 @@ mod tests {
             stdout,
             &std::env::current_dir()?,
             timeout,
-            (None, None),
+            (None, mode.strip_prefix("configured-agy-")),
         )
         .await
     }
@@ -723,6 +703,24 @@ mod tests {
             };
             send(json!({"jsonrpc":"2.0","id":msg["id"],"result":result}));
         }
+    }
+
+    #[tokio::test]
+    async fn unavailable_configured_agy_model_keeps_other_choices_visible() {
+        let catalog = fixture(
+            Agent::Agy,
+            "configured-agy-unavailable",
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(catalog.native_model.as_deref(), Some("first"));
+        assert_eq!(catalog.configured_effort, None);
+        assert_eq!(
+            catalog.models[1].efforts.as_ref().unwrap(),
+            &["deep", "extra"]
+        );
+        assert!(catalog.models[3].efforts.is_none());
     }
 
     #[tokio::test]

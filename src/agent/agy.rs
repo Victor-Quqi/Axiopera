@@ -329,11 +329,55 @@ struct Journal {
     offset: u64,
     user_inputs: Vec<String>,
     spawn_slots: HashSet<u64>,
+    unmatched_children: usize,
     delivered_after_pending: HashSet<u64>,
     version: Option<(std::time::SystemTime, u64)>,
 }
 
 impl Journal {
+    // The transcript identifies the child and parent, but has no ACP tool call ID.
+    // A discovered child accounts for one successful spawn, never an in-flight one.
+    fn match_spawns(&mut self, parent: &str, spawns: &mut HashMap<String, Option<Instant>>) {
+        while self.unmatched_children > 0 {
+            let completed = spawns
+                .iter()
+                .filter_map(|(key, time)| {
+                    let (owner, _) = key.split_once(':')?;
+                    time.filter(|_| owner == parent).map(|time| (key, time))
+                })
+                .min_by_key(|(_, time)| *time);
+            let Some((key, _)) = completed else { break };
+            let key = key.clone();
+            spawns.remove(&key);
+            self.unmatched_children -= 1;
+        }
+    }
+
+    fn find_children(
+        &mut self,
+        parent: &str,
+        rows: &[Value],
+        candidates: &mut HashMap<String, String>,
+    ) {
+        for row in rows {
+            let index = row["step_index"].as_u64().unwrap();
+            if row["type"] == "PLANNER_RESPONSE"
+                && let Some(calls) = row["tool_calls"].as_array()
+            {
+                for (offset, call) in calls.iter().enumerate() {
+                    if call["name"] == "invoke_subagent" {
+                        self.spawn_slots.insert(index + offset as u64 + 1);
+                    }
+                }
+            } else if row["type"] == "GENERIC"
+                && self.spawn_slots.remove(&index)
+                && let Some(id) = row["content"].as_str().and_then(child_id)
+            {
+                candidates.insert(id, parent.to_owned());
+            }
+        }
+    }
+
     // AGY rewrites running steps in place. Seek past the settled prefix only; later
     // steps (including concurrent spawns) can already be complete.
     fn drain(&mut self, path: &Path) -> std::io::Result<Vec<Value>> {
@@ -630,21 +674,31 @@ impl Driver {
     }
 
     async fn inspect(&mut self) {
-        let mut discovered = Vec::new();
+        let mut updates = Vec::new();
+        for (sid, journal) in &mut self.journals {
+            let Ok(rows) = journal.drain(&transcript(&self.brain, sid)) else {
+                continue;
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            journal.find_children(sid, &rows, &mut self.candidates);
+            updates.push((sid.clone(), rows));
+        }
+        self.attach_children();
         let known_children: HashSet<_> = self
             .journals
             .keys()
             .filter(|id| *id != &self.root)
             .cloned()
             .collect();
-        for (sid, journal) in &mut self.journals {
-            let Ok(rows) = journal.drain(&transcript(&self.brain, sid)) else {
-                continue;
-            };
+        // A fast child's first message and spawn result can arrive in the same disk read.
+        for (sid, rows) in updates {
+            let journal = self.journals.get_mut(&sid).unwrap();
             for r in rows {
                 let body = r["content"].as_str().unwrap_or("");
                 match r["type"].as_str() {
-                    Some("USER_INPUT") if sid == &self.root && r["source"] == "USER_EXPLICIT" => {
+                    Some("USER_INPUT") if sid == self.root && r["source"] == "USER_EXPLICIT" => {
                         if let Some(text) = body.strip_prefix("<USER_REQUEST>\n").and_then(|text| {
                             text.rsplit_once("\n</USER_REQUEST>")
                                 .map(|(input, _)| input)
@@ -671,17 +725,10 @@ impl Driver {
                             .as_array()
                             .map(Vec::as_slice)
                             .unwrap_or_default();
-                        for (offset, call) in calls.iter().enumerate() {
-                            if call["name"] == "invoke_subagent" {
-                                journal
-                                    .spawn_slots
-                                    .insert(r["step_index"].as_u64().unwrap() + offset as u64 + 1);
-                            }
-                        }
                         if calls.is_empty() && !body.is_empty() {
                             let mut s = self.state.lock().unwrap();
-                            if sid != &self.root {
-                                s.children.remove(sid);
+                            if sid != self.root {
+                                s.children.remove(&sid);
                             } else if self.parent_woke {
                                 self.parent_woke = false;
                                 s.waking = false;
@@ -697,17 +744,7 @@ impl Driver {
                             }
                         }
                     }
-                    Some("GENERIC")
-                        if r["status"] == "DONE"
-                            && journal
-                                .spawn_slots
-                                .remove(&r["step_index"].as_u64().unwrap()) =>
-                    {
-                        if let Some(id) = child_id(body) {
-                            discovered.push((id, sid.clone()));
-                        }
-                    }
-                    Some("SYSTEM_MESSAGE") if sid == &self.root && r["source"] == "SYSTEM" => {
+                    Some("SYSTEM_MESSAGE") if sid == self.root && r["source"] == "SYSTEM" => {
                         let mut s = self.state.lock().unwrap();
                         let from_child =
                             system_sender(&r).is_some_and(|id| known_children.contains(id));
@@ -727,7 +764,24 @@ impl Driver {
                 }
             }
         }
-        self.candidates.extend(discovered);
+        // A changed native journal format must surface as a task error instead of silently
+        // stranding the child on a permission request the parent cannot receive.
+        let mut state = self.state.lock().unwrap();
+        for (parent, journal) in &mut self.journals {
+            journal.match_spawns(parent, &mut state.spawns);
+        }
+        if state
+            .spawns
+            .values()
+            .flatten()
+            .any(|t| t.elapsed() > Duration::from_secs(30))
+        {
+            let _ = self.events.send(AgentEvent::Exited(
+                "could not locate the AGY subagent in its parent's transcript".into(),
+            ));
+        }
+    }
+    fn attach_children(&mut self) {
         // Authenticate the relationship against the child's own system record. A tool's
         // output alone must never attach an unrelated conversation to this task.
         for (id, parent) in self.candidates.clone() {
@@ -748,18 +802,8 @@ impl Driver {
                 continue;
             }
             self.journals.insert(id.clone(), Journal::default());
-            {
-                let mut s = self.state.lock().unwrap();
-                s.children.insert(id.clone());
-                if let Some(key) = s
-                    .spawns
-                    .keys()
-                    .find(|k| k.starts_with(&format!("{parent}:")))
-                    .cloned()
-                {
-                    s.spawns.remove(&key);
-                }
-            }
+            self.journals.get_mut(&parent).unwrap().unmatched_children += 1;
+            self.state.lock().unwrap().children.insert(id.clone());
             // Loading can replay approval requests before the load reply arrives.
             let rpc = self.rpc.clone();
             let events = self.events.clone();
@@ -775,21 +819,6 @@ impl Driver {
                     "loading AGY subagent {id}: {error}"
                 )));
             });
-        }
-        // A changed native journal format must surface as a task error instead of silently
-        // stranding the child on a permission request the parent cannot receive.
-        if self
-            .state
-            .lock()
-            .unwrap()
-            .spawns
-            .values()
-            .flatten()
-            .any(|t| t.elapsed() > Duration::from_secs(30))
-        {
-            let _ = self.events.send(AgentEvent::Exited(
-                "could not locate the AGY subagent in its parent's transcript".into(),
-            ));
         }
     }
 }
@@ -867,6 +896,28 @@ mod tests {
             .unwrap()
             .push(json!({"name":label,"modelId":"another-variant"}));
         assert_eq!(preferred_variant(&session, label, None), None);
+    }
+
+    #[test]
+    fn discovered_child_only_counts_against_a_completed_spawn_of_its_parent() {
+        let time = Instant::now();
+        let mut spawns = HashMap::from([
+            ("parent:one".into(), None),
+            ("parent:two".into(), None),
+            ("other:one".into(), Some(time)),
+        ]);
+        let mut journal = Journal {
+            unmatched_children: 1,
+            ..Default::default()
+        };
+        journal.match_spawns("parent", &mut spawns);
+        assert_eq!(spawns.len(), 3);
+        // The other spawn fails after discovery, before the successful call replies.
+        spawns.remove("parent:one");
+        *spawns.get_mut("parent:two").unwrap() = Some(time);
+        journal.match_spawns("parent", &mut spawns);
+        assert_eq!(journal.unmatched_children, 0);
+        assert_eq!(spawns, HashMap::from([("other:one".into(), Some(time))]));
     }
 
     #[test]

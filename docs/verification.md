@@ -100,6 +100,8 @@ python spikes/read_mcp.py grok
 
 work 档派发原生子 agent 写文件，父任务在首轮结束后收到子任务结果并交付了第二轮答复。另一次测试中，子 agent 运行需要审批的命令，Axiopera 的审批详情显示子会话 ID 和完整命令，经 `axiopera approve` 批准后脚本写出了标记。原生 ACP 双子会话探针另核对了分别允许、拒绝和取消时的审批归属。
 
+另用隔离 daemon 与模拟 ACP 回放两个并发创建请求，一次成功、一次失败。让成功子会话的创建记录、完成消息和父会话的第二轮答复在同一次读取中出现。修复前仅交付第一轮，修复后两轮均可取回。单元测试另覆盖子会话记录早于创建回复，以及不同父会话同时创建子会话。
+
 AGY 作为宿主的收件实测使用两个独立的 ACP 会话和隔离的 Axiopera daemon。子任务返回一个只有它知道的随机值。以宿主实际运行 `axiopera inbox` 并把该值写入文件作为送达证据。
 
 - 空闲唤醒：宿主后台启动 `axiopera wait`，收到首轮 `end_turn` 后才放行子任务。子任务结束后，宿主自行调用 `inbox`，正确写回随机值；期间没有再发送 prompt。
@@ -109,7 +111,7 @@ AGY 作为宿主的收件实测使用两个独立的 ACP 会话和隔离的 Axio
 
 AGY 终端模型偏好（Windows，1.5.11）：同一工作目录中，直接启动交互终端显示 Hydrogen / High，原生 ACP 新会话报告 Argon / Medium。适配后用独立 daemon 和会话目录实测：终端偏好为 Hydrogen / High 时，模型查询、无参数派发、显式选 Hydrogen 都得到 Hydrogen / High；只指定 low 得到 Hydrogen / Low；只选 Argon 得到 Argon / Medium。将偏好改为 Argon / Low 后，重新查询得到新值，跨进程续接之前的 Hydrogen 任务仍运行在 High。匹配新型号的单元测试使用虚构模型名和不含型号信息的 ID。
 
-Windows 上用安装版 `axiopera models agy` 对照 AGY 1.5.11 的 ACP 菜单。文本与 JSON 均列出 Argon、Flash、Opus 和 Sonnet 的 low、medium、high 三档，Hydrogen 另有 xhigh。Orchestrator 和 GPT-OSS 均无强度菜单，GPT-OSS 的原生名称标明 Medium。逐个切换后，查询结果仍报告用户的派发默认值 Hydrogen / High。
+Windows 上用安装版 `axiopera models agy` 对照 AGY 1.5.11 的 ACP 菜单。文本与 JSON 均列出 Argon、Flash、Opus 和 Sonnet 的 low、medium、high 三档，Hydrogen 另有 xhigh。Orchestrator 和 GPT-OSS 均无强度菜单，GPT-OSS 的原生名称标明 Medium。逐个切换后，查询结果仍报告用户的派发默认值 Hydrogen / High。协议回归测试另覆盖 Axiopera 配置的默认模型仍在目录中、选择时被 ACP 拒绝的情况，其余模型和强度菜单仍可查询。
 
 AGY 1.5.11 只读目录实测（Windows）：在任务目录和中文子目录分别放入一份未告知文件名的 CSV。AGY 调用两次 `list_directory`、两次 `read_file`，得到正确总额 14.74。升级前缺少目录工具的只读会话用 `send` 续接后也能发现并读取 CSV。指向工作区外的 Windows 目录联接被目录工具拒绝。先回答币种再收取第一轮结果，回执没有重复催答，下一轮给出 14.74 EUR；任务空闲后，`inbox` 和 `wait` 均返回退出码 4。
 
