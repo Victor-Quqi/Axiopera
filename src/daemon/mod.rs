@@ -125,6 +125,16 @@ struct Entry {
     turn_ended_ms: u64,
 }
 
+impl Entry {
+    fn has_work(&self) -> bool {
+        // An idle or waiting task may already have published its result while its process exits.
+        // Other exits can still publish a failure or cancellation before the actor is gone.
+        !self.pending.is_empty()
+            || (self.actor.is_some()
+                && !(self.releasing && matches!(self.task.status, Status::Idle | Status::Waiting)))
+    }
+}
+
 /// One request's reply stream.
 pub struct Out<'a, W> {
     w: &'a mut W,
@@ -1167,6 +1177,8 @@ impl Daemon {
             st.tasks.get_mut(id).is_some_and(|e| {
                 e.actor = None;
                 e.releasing = false;
+                e.in_turn = false;
+                e.turn_ended_ms = 0;
                 !e.pending.is_empty() && !e.task.status.is_stopped()
             })
         };
@@ -2114,10 +2126,9 @@ impl Daemon {
 
     /// Whether any of the caller's children (or those in `only`) is running or about to.
     fn live(&self, st: &State, caller: &str, only: &[String]) -> bool {
-        self.children(st, caller, only).iter().any(|id| {
-            let e = &st.tasks[id];
-            e.actor.is_some() || !e.pending.is_empty()
-        })
+        self.children(st, caller, only)
+            .iter()
+            .any(|id| st.tasks[id].has_work())
     }
 
     /// Nothing new yet: where each running sub-task stands.
@@ -2133,7 +2144,7 @@ impl Daemon {
                 .children(&st, caller, only)
                 .iter()
                 .map(|id| &st.tasks[id])
-                .filter(|e| e.actor.is_some() || !e.pending.is_empty())
+                .filter(|e| e.has_work())
                 .collect();
             live.sort_by_key(|e| e.task.created_ms);
             live.iter()
@@ -2147,6 +2158,9 @@ impl Daemon {
                 })
                 .collect::<Vec<_>>()
         };
+        if lines.is_empty() {
+            return self.nothing_running(caller, only, out).await;
+        }
         out.text(
             format!(
                 "nothing new; still running:
@@ -2167,7 +2181,9 @@ impl Daemon {
         let now = store::now_ms();
         let t = &e.task;
         let mut parts = Vec::new();
-        if t.status == Status::Queued {
+        if t.status == Status::Queued
+            || ((e.releasing || e.actor.is_none()) && !e.pending.is_empty())
+        {
             parts.push("queued".to_string());
         } else if e.actor.is_some() && e.in_turn {
             let mut turn = format!(
@@ -2587,10 +2603,7 @@ impl Daemon {
                     .tasks
                     .values()
                     .filter(|e| {
-                        e.task.parent == caller
-                            && (e.actor.is_some()
-                                || !e.pending.is_empty()
-                                || seen.contains_key(&e.task.id))
+                        e.task.parent == caller && (e.has_work() || seen.contains_key(&e.task.id))
                     })
                     .collect();
                 entries.sort_by_key(|e| (e.task.created_ms, &e.task.id));

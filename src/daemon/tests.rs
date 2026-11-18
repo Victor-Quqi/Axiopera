@@ -906,12 +906,20 @@ fn progress_tells_the_turn_its_tool_calls_and_what_it_waits_for() {
     );
     drop(st);
 
-    // Nothing runs once the process is on its way out.
+    // Idle process cleanup is invisible to wait/inbox, unless new work is queued.
     f.d.emit("test", "turn_ended", json!({"turn": 2, "ok": true}));
     let mut st = f.d.lock();
     st.tasks.get_mut("test").unwrap().releasing = true;
     let done = f.d.progress(&st, &st.tasks["test"], "codex:host");
     assert!(!done.contains("turn"), "{done}");
+    st.tasks.get_mut("test").unwrap().task.status = Status::Idle;
+    assert!(!f.d.live(&st, "codex:host", &[]));
+    st.tasks
+        .get_mut("test")
+        .unwrap()
+        .pending
+        .push("resume".into());
+    assert!(f.d.live(&st, "codex:host", &[]));
 }
 
 #[test]
@@ -1919,6 +1927,8 @@ async fn input_during_interrupted_release_schedules_a_fresh_actor() {
         entry.releasing = true;
         entry.task.status = Status::Running;
         entry.task.pending_inputs.push("earlier".into());
+        entry.turn_ended_ms = 1;
+        entry.in_turn = true;
     }
     f.d.stop_tree("test", "parent timed out", "timeout", true)
         .unwrap();
@@ -1936,9 +1946,43 @@ async fn input_during_interrupted_release_schedules_a_fresh_actor() {
     let mut st = f.d.lock();
     assert!(st.tasks["test"].actor.is_some());
     assert_eq!(st.tasks["test"].pending, ["earlier", "continue"]);
+    assert_eq!(st.tasks["test"].turn_ended_ms, 0);
+    assert!(!st.tasks["test"].in_turn);
     assert_eq!(st.running, 1);
     // The current-thread runtime has not polled the actor; prevent any CLI startup.
     st.tasks.get_mut("test").unwrap().env = None;
+}
+
+#[test]
+fn inbox_only_reports_questions_that_still_need_an_answer() {
+    let f = fixture();
+    f.d.update("test", |t| {
+        for (id, answer) in [("q1", Some("yes".into())), ("q2", None), ("q3", None)] {
+            t.questions.push(store::Question {
+                id: id.into(),
+                text: id.into(),
+                answer,
+                asked_ms: 0,
+            });
+        }
+    });
+    f.d.emit(
+        "test",
+        "turn_ended",
+        json!({"turn":1, "ok":true, "open_questions":["q1","q2"]}),
+    );
+    f.d.emit(
+        "test",
+        "question",
+        json!({"id":"q1","text":"answered already"}),
+    );
+    let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data["open_questions"], json!(["q2"]));
+    assert_eq!(
+        f.d.store.events("test")[0].data["open_questions"],
+        json!(["q1", "q2"])
+    );
 }
 
 #[tokio::test]

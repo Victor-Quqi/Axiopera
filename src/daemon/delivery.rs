@@ -102,11 +102,28 @@ impl Daemon {
                 ready.extend(
                     entry.deliverable[start..]
                         .iter()
-                        .filter(|e| {
-                            e.kind != "approval_request"
-                                || e.data.get("approver").and_then(Value::as_str) == Some(caller)
+                        .filter(|e| match e.kind.as_str() {
+                            "approval_request" => {
+                                e.data.get("approver").and_then(Value::as_str) == Some(caller)
+                            }
+                            "question" => !entry.task.questions.iter().any(|q| {
+                                q.answer.is_some()
+                                    && e.data.get("id").and_then(Value::as_str) == Some(&q.id)
+                            }),
+                            _ => true,
                         })
-                        .cloned(),
+                        .cloned()
+                        .map(|mut event| {
+                            if event.kind == "turn_ended"
+                                && let Some(ids) = event
+                                    .data
+                                    .get_mut("open_questions")
+                                    .and_then(Value::as_array_mut)
+                            {
+                                ids.retain(|id| entry.task.open_questions().any(|q| id == &q.id));
+                            }
+                            event
+                        }),
                 );
             } else if let Some(indices) = approvals {
                 let start = indices.partition_point(|&at| entry.deliverable[at].seq <= cursor);
