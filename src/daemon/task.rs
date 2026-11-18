@@ -1705,7 +1705,7 @@ mod request_tests {
                 &f,
                 &exe,
                 if hang == "mail" { "turn/steer" } else { hang },
-                if action == "timeout" { 2 } else { 60 },
+                60,
             );
             let (tx, mut rx) = mpsc::unbounded_channel();
             let d = f.d.clone();
@@ -1733,7 +1733,13 @@ mod request_tests {
                     }))
                     .unwrap(),
                 "abort" => tx.send(Cmd::Abort).unwrap(),
-                _ => {}
+                // The clock jumps to the deadline: on a busy machine the peer alone can take
+                // longer to start than a deadline short enough to wait for.
+                _ => {
+                    tokio::time::pause();
+                    tokio::time::advance(Duration::from_secs(60)).await;
+                    tokio::time::resume();
+                }
             }
             let exit = tokio::time::timeout(Duration::from_secs(12), runner)
                 .await
