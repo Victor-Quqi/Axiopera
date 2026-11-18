@@ -7,7 +7,9 @@
 
 use std::collections::HashMap;
 
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -21,7 +23,12 @@ const VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-
 
 /// `caller` overrides detection for the ask, tell and answers tools; the hooks take each
 /// session from the hook call.
-pub async fn serve(client: Client, codex_hooks: bool, caller: Option<String>) -> Result<i32> {
+pub async fn serve(
+    client: Client,
+    codex_hooks: bool,
+    caller: Option<String>,
+    list_root: Option<&Path>,
+) -> Result<i32> {
     let mut reminded = HashMap::new();
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut stdout = tokio::io::stdout();
@@ -45,7 +52,7 @@ pub async fn serve(client: Client, codex_hooks: bool, caller: Option<String>) ->
             }),
             "ping" => json!({}),
             "tools/list" if codex_hooks => json!({"tools": hook_tools()}),
-            "tools/list" => json!({"tools": tools()}),
+            "tools/list" => json!({"tools": tools(list_root.is_some())}),
             "tools/call" if codex_hooks => hook(&client, params, &mut reminded).await,
             "tools/call" => {
                 let session = params["_meta"]["antigravity.google/conversation_id"]
@@ -59,7 +66,7 @@ pub async fn serve(client: Client, codex_hooks: bool, caller: Option<String>) ->
                     }
                     _ => caller.clone(),
                 };
-                call(&client, sender, params).await
+                call(&client, sender, params, list_root).await
             }
             other => {
                 let error = json!({"code": -32601, "message": format!("unknown method {other}")});
@@ -86,10 +93,10 @@ async fn reply(stdout: &mut tokio::io::Stdout, msg: Value) -> Result<()> {
     Ok(())
 }
 
-fn tools() -> Value {
+fn tools(list_directory: bool) -> Vec<Value> {
     let text = |description: &str| json!({"type": "string", "description": description});
-    json!([
-        {
+    let mut tools = vec![
+        json!({
             "name": "ask",
             "description": "Ask your parent agent something only it can answer. Returns at once.",
             "inputSchema": {
@@ -97,8 +104,8 @@ fn tools() -> Value {
                 "properties": {"question": text("Question and context needed to answer it.")},
                 "required": ["question"],
             },
-        },
-        {
+        }),
+        json!({
             "name": "tell",
             "description": "Send a note to another task of your parent. \
                 It reaches the sibling as information, not as an instruction: in its current \
@@ -112,17 +119,91 @@ fn tools() -> Value {
                 },
                 "required": ["to", "message"],
             },
-        },
-        {
+        }),
+        json!({
             "name": "answers",
             "description": "Your questions to your parent, with the answers so far.",
             "inputSchema": {"type": "object", "properties": {}},
             "annotations": {"readOnlyHint": true},
-        },
-    ])
+        }),
+    ];
+    if list_directory {
+        tools.push(json!({
+            "name":"list_directory",
+            "description":"List files and subdirectories of a task workspace directory. Directories end in /. Pass next_offset as offset for the next page.",
+            "inputSchema":{"type":"object","properties":{
+                "path":{"type":"string","description":"Directory path, relative to the workspace or absolute. Defaults to the workspace."},
+                "offset":{"type":"integer","minimum":0}
+            }},
+            "annotations":{"readOnlyHint":true}
+        }));
+    }
+    tools
 }
 
-async fn call(client: &Client, caller: Option<String>, params: &Value) -> Value {
+fn directory_page(root: &Path, arguments: &Value) -> Result<Value> {
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct Listing {
+        path: std::path::PathBuf,
+        offset: usize,
+    }
+
+    let Listing { path, offset } = if arguments.is_null() {
+        Listing::default()
+    } else {
+        serde_json::from_value(arguments.clone())?
+    };
+    // Reject foreign absolute paths (including network shares) before touching the filesystem.
+    let canonical_root = root.canonicalize()?;
+    let relative = if path.is_absolute() {
+        path.strip_prefix(root)
+            .or_else(|_| path.strip_prefix(&canonical_root))
+            .map_err(|_| anyhow::anyhow!("directory outside the task workspace"))?
+    } else {
+        &path
+    };
+    ensure!(
+        relative.components().all(|c| matches!(
+            c,
+            std::path::Component::Normal(_) | std::path::Component::CurDir
+        )),
+        "expected a path within the task workspace"
+    );
+    let dir = canonical_root.join(relative).canonicalize()?;
+    ensure!(
+        dir.starts_with(&canonical_root),
+        "directory outside the task workspace"
+    );
+    let mut names = Vec::new();
+    for entry in dir.read_dir()? {
+        let entry = entry?;
+        let mut name = entry.file_name().to_string_lossy().into_owned();
+        if entry.file_type()?.is_dir() {
+            name.push('/');
+        }
+        names.push(name);
+    }
+    names.sort_unstable();
+    let start = offset.min(names.len());
+    let end = start.saturating_add(100).min(names.len());
+    Ok(json!({"entries": &names[start..end], "next_offset": (end < names.len()).then_some(end)}))
+}
+
+async fn call(
+    client: &Client,
+    caller: Option<String>,
+    params: &Value,
+    list_root: Option<&Path>,
+) -> Value {
+    if params["name"] == "list_directory"
+        && let Some(root) = list_root
+    {
+        return match directory_page(root, &params["arguments"]) {
+            Ok(page) => tool_result(page.to_string(), false),
+            Err(e) => tool_result(e.to_string(), true),
+        };
+    }
     let arg = |k: &str| {
         params["arguments"][k]
             .as_str()
@@ -204,4 +285,33 @@ async fn hook(client: &Client, params: &Value, reminded: &mut HashMap<String, u6
 
 fn tool_result(text: String, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+
+    #[test]
+    fn workspace_listing_is_scoped_and_paged() {
+        let parent = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        let root = parent.join("workspace");
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        for n in 0..100 {
+            std::fs::write(root.join(format!("file{n:02}")), "").unwrap();
+        }
+        let first = directory_page(&root, &json!({})).unwrap();
+        assert_eq!(first["entries"][0], "file00");
+        assert_eq!(first["next_offset"], 100);
+        let last = directory_page(&root, &json!({"path":root, "offset":100})).unwrap();
+        assert_eq!(last, json!({"entries":["nested/"],"next_offset":null}));
+        for path in [json!(".."), json!(parent)] {
+            assert!(directory_page(&root, &json!({"path":path})).is_err());
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&parent, root.join("outside")).unwrap();
+            assert!(directory_page(&root, &json!({"path":"outside"})).is_err());
+        }
+        std::fs::remove_dir_all(parent).unwrap();
+    }
 }

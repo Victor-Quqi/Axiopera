@@ -151,10 +151,18 @@ impl Agy {
         let (proc, stdout) = Proc::spawn(exe, &args, spec)?;
         let (rpc, incoming) = Rpc::start(stdout, proc.stdin.clone());
         rpc.call("initialize", initialize()).await?;
+        let mut mcp_args = vec![
+            "mcp".to_string(),
+            "--caller".into(),
+            format!("task:{}", spec.task_id),
+        ];
+        if spec.tier == Tier::Read {
+            mcp_args.extend(["--list-root".into(), spec.cwd.display().to_string()]);
+        }
         let server = json!({
             "name": "axiopera",
             "command": std::env::current_exe()?,
-            "args": ["mcp", "--caller", format!("task:{}", spec.task_id)],
+            "args": mcp_args,
             "env": [
                 {"name": identity::TASK_VAR, "value": spec.task_id},
                 {"name": paths::HOME_VAR, "value": home},
@@ -572,7 +580,7 @@ impl Driver {
         let bridge = matches!(
             name,
             "mcp_axiopera_ask" | "mcp_axiopera_tell" | "mcp_axiopera_answers"
-        );
+        ) || (self.tier == Tier::Read && name == "mcp_axiopera_list_directory");
         let reply = |option: Option<Value>| match option {
             Some(o) => json!({"outcome":{"outcome":"selected","optionId":o}}),
             None => json!({"outcome":{"outcome":"cancelled"}}),

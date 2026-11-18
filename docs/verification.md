@@ -110,3 +110,5 @@ AGY 作为宿主的收件实测使用两个独立的 ACP 会话和隔离的 Axio
 AGY 终端模型偏好（Windows，1.5.11）：同一工作目录中，直接启动交互终端显示 Hydrogen / High，原生 ACP 新会话报告 Argon / Medium。适配后用独立 daemon 和会话目录实测：终端偏好为 Hydrogen / High 时，模型查询、无参数派发、显式选 Hydrogen 都得到 Hydrogen / High；只指定 low 得到 Hydrogen / Low；只选 Argon 得到 Argon / Medium。将偏好改为 Argon / Low 后，重新查询得到新值，跨进程续接之前的 Hydrogen 任务仍运行在 High。匹配新型号的单元测试使用虚构模型名和不含型号信息的 ID。
 
 Windows 上用安装版 `axiopera models agy` 对照 AGY 1.5.11 的 ACP 菜单。文本与 JSON 均列出 Argon、Flash、Opus 和 Sonnet 的 low、medium、high 三档，Hydrogen 另有 xhigh。Orchestrator 和 GPT-OSS 均无强度菜单，GPT-OSS 的原生名称标明 Medium。逐个切换后，查询结果仍报告用户的派发默认值 Hydrogen / High。
+
+AGY 1.5.11 只读目录实测（Windows）：在任务目录和中文子目录分别放入一份未告知文件名的 CSV。AGY 调用两次 `list_directory`、两次 `read_file`，得到正确总额 14.74。升级前缺少目录工具的只读会话用 `send` 续接后也能发现并读取 CSV。指向工作区外的 Windows 目录联接被目录工具拒绝。先回答币种再收取第一轮结果，回执没有重复催答，下一轮给出 14.74 EUR；任务空闲后，`inbox` 和 `wait` 均返回退出码 4。

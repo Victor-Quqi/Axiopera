@@ -93,7 +93,9 @@ pub fn capability_notes(agent: Agent, tier: Tier) -> Vec<String> {
                 "MCP: only tools marked read-only without a destructive hint are allowed".into()
             }
             Agent::Grok => "MCP: unavailable".into(),
-            Agent::Agy => "MCP: Axiopera communication tools only; no shell".into(),
+            Agent::Agy => {
+                "MCP: Axiopera workspace directory listing and communication only; no shell".into()
+            }
         });
         notes.push(match agent {
             Agent::Grok => "shell commands other than plain axiopera commands are refused".into(),

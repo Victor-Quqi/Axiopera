@@ -14,7 +14,7 @@ Dispatch
   axiopera spawn codex "Fix the failing test in tests/parser.rs."
   axiopera spawn claude --tier read --name review -f task.md
   Tiers: read (read-only; requests needing approval are refused;
-              MCP: read-only tools only, none on Grok, Axiopera communication tools only on AGY; Grok shell: plain axiopera commands only),
+              MCP: read-only tools only, none on Grok, Axiopera directory listing and communication tools on AGY; Grok shell: plain axiopera commands only),
          work (default: the agent's own auto mode), full (the agent's full-access mode).
   Options: --model, --effort, --name (use it instead of the ID), --cwd, --timeout 30m.
   Tasks share your working directory unless --cwd selects another; axiopera creates no copy.

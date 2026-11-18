@@ -10,7 +10,7 @@
 
 | 档位 | Claude Code | Codex | Grok Build | Antigravity CLI |
 |---|---|---|---| --- |
-| read | `default`，移除 Edit、Write、NotebookEdit、Agent；通过 stdio 接审批 | `read-only`，`never`，reviewer 为 `user` | ask 模式，移除写入、子 agent、工作流、定时任务、媒体生成和 MCP 入口 | 任务专用 agent，仅开放 `read_file` 和 Axiopera 的 ask、tell、answers |
+| read | `default`，移除 Edit、Write、NotebookEdit、Agent；通过 stdio 接审批 | `read-only`，`never`，reviewer 为 `user` | ask 模式，移除写入、子 agent、工作流、定时任务、媒体生成和 MCP 入口 | 任务专用 agent，使用原生 `read_file` 读文件，通过 Axiopera 的 `list_directory` 浏览工作区目录，另可调用 ask、tell、answers |
 | work | `auto` | `workspace-write`，`on-request`，reviewer 为 `auto_review` | `autoMode:true`、`yoloMode:false` | 原生 `--sandbox` 和 `auto` 模式 |
 | full | `bypassPermissions` | `danger-full-access`，`on-request`，reviewer 为 `user` | `yoloMode:true` | 原生 `--dangerously-skip-permissions` |
 

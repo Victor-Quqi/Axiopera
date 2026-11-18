@@ -184,6 +184,9 @@ enum Command {
         /// Serve the Codex plugin's hooks instead.
         #[arg(long)]
         codex_hooks: bool,
+        /// Expose read-only directory listings within this AGY task workspace.
+        #[arg(long, conflicts_with = "codex_hooks")]
+        list_root: Option<PathBuf>,
     },
     /// Manage the background daemon.
     Daemon {
@@ -340,8 +343,17 @@ async fn run(cli: Cli) -> Result<i32> {
             }
             return top::run(&home, task.as_deref(), all).await;
         }
-        Command::Mcp { codex_hooks } => {
-            return mcp::serve(client::Client { home, json: false }, codex_hooks, caller).await;
+        Command::Mcp {
+            codex_hooks,
+            list_root,
+        } => {
+            return mcp::serve(
+                client::Client { home, json: false },
+                codex_hooks,
+                caller,
+                list_root.as_deref(),
+            )
+            .await;
         }
         Command::Daemon {
             command: DaemonCommand::Run { home, idle_secs },
