@@ -1723,9 +1723,9 @@ impl Daemon {
         }
         let mut st = self.lock();
         let State { tasks, ledger, .. } = &mut *st;
-        ledger
-            .codex_hosts
-            .retain(|host, _| tasks.values().any(|e| e.task.parent == *host));
+        ledger.codex_hosts.retain(|host, _| {
+            ledger.doorbells.contains_key(host) || tasks.values().any(|e| e.task.parent == *host)
+        });
         ledger
             .pending_pushes
             .retain(|host, _| ledger.codex_hosts.contains_key(host));
@@ -2071,7 +2071,7 @@ impl Daemon {
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
         let only = self.find_all(caller, only)?;
-        let delivering = self.delivery(caller).lock_owned().await;
+        let _delivering = self.delivery(caller).lock_owned().await;
         self.reconcile_before_take(caller).await?;
         let (approvals, events, live) = {
             let st = self.lock();
@@ -2087,8 +2087,7 @@ impl Daemon {
             if !batch.seen.is_empty() {
                 self.mark_seen(caller, &batch.seen, &[], &[])?;
             }
-            drop(delivering);
-            self.retract_doorbell(caller);
+            self.retract_doorbell(caller).await;
             return if live {
                 self.nothing_new(caller, &only, out).await
             } else {
@@ -2115,8 +2114,7 @@ impl Daemon {
             &batch.turns,
         );
         self.mark_seen(caller, &batch.seen, &batch.turns, &batch.approvals)?;
-        drop(delivering);
-        self.retract_doorbell(caller);
+        self.retract_doorbell(caller).await;
         Ok(ipc::exit::OK)
     }
 

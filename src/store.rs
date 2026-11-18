@@ -422,7 +422,7 @@ pub struct Ledger {
     pub codex_hosts: std::collections::HashMap<String, CodexHost>,
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub pending_pushes: std::collections::HashMap<String, PendingPush>,
-    /// Reminders queued for hosts that have not run `wait` since, by queued message ID.
+    /// Codex queue IDs kept until a reminder is confirmed absent or replaced.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub doorbells: std::collections::HashMap<String, String>,
     /// The last event sequence number given out, as of the last gc, which may have removed the

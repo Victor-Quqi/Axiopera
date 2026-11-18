@@ -352,16 +352,13 @@ impl Daemon {
     /// Tell the caller of its events. Tried again later if that fails.
     async fn push(self: &Arc<Self>, caller: &str) {
         let delivering = self.delivery(caller).lock_owned().await;
-        {
+        let needs_push = {
             let st = self.lock();
-            if !self
-                .unseen(&st, caller, &[])
-                .iter()
-                .any(|e| is_news(e, caller))
-                && !st.ledger.pending_pushes.contains_key(caller)
-            {
-                return;
-            }
+            !self.news(&st, caller, &[]).is_empty() || st.ledger.pending_pushes.contains_key(caller)
+        };
+        if !needs_push {
+            self.retract_doorbell(caller).await;
+            return;
         }
         let host = self.lock().ledger.codex_hosts.get(caller).cloned();
         let Some(host) = host else {
@@ -379,25 +376,26 @@ impl Daemon {
                     self.schedule_push(caller.to_string(), GATHER);
                 }
             }
-            Err(e) => {
-                let failures = {
-                    let mut st = self.lock();
-                    st.host_checked.remove(caller);
-                    let n = st.push_failures.entry(caller.to_string()).or_default();
-                    *n += 1;
-                    *n
-                };
-                let delay = RETRY
-                    .saturating_mul(1 << (failures - 1).min(5))
-                    .min(RETRY_MAX);
-                self.log(&format!(
-                    "{caller} kept its events: {e}; trying again in {}s",
-                    delay.as_secs()
-                ));
-                drop(delivering);
-                self.schedule_push(caller.to_string(), delay);
-            }
+            Err(e) => self.retry_push(caller, &e),
         }
+    }
+
+    fn retry_push(self: &Arc<Self>, caller: &str, error: &str) {
+        let failures = {
+            let mut st = self.lock();
+            st.host_checked.remove(caller);
+            let n = st.push_failures.entry(caller.to_string()).or_default();
+            *n += 1;
+            *n
+        };
+        let delay = RETRY
+            .saturating_mul(1 << (failures - 1).min(5))
+            .min(RETRY_MAX);
+        self.log(&format!(
+            "{caller}: {error}; trying again in {}s",
+            delay.as_secs()
+        ));
+        self.schedule_push(caller.to_string(), delay);
     }
 
     async fn push_to_host(
@@ -547,42 +545,48 @@ impl Daemon {
         }
     }
 
-    /// After the host ran `inbox`: a reminder still queued would start a turn for nothing.
-    pub(super) fn retract_doorbell(self: &Arc<Self>, caller: &str) {
+    /// Called under the caller's delivery lock, including when recovering an old ledger.
+    pub(super) async fn retract_doorbell(self: &Arc<Self>, caller: &str) {
         let (id, host) = {
-            let mut st = self.lock();
+            let st = self.lock();
+            let Some(id) = st.ledger.doorbells.get(caller) else {
+                return;
+            };
             if !self.news(&st, caller, &[]).is_empty() {
                 return;
             }
-            let Some(id) = st.ledger.doorbells.remove(caller) else {
+            let Some(host) = st.ledger.codex_hosts.get(caller) else {
                 return;
             };
-            if let Err(e) = st.ledger.save(&self.opts.home) {
-                self.log(&format!("saving the ledger: {e:#}"));
-            }
-            (id, st.ledger.codex_hosts.get(caller).cloned())
+            (id.clone(), host.clone())
         };
-        let Some(host) = host else {
-            return;
-        };
-        let d = self.clone();
-        let caller = caller.to_string();
-        tokio::spawn(async move {
-            let deleted = tokio::time::timeout(TIMEOUT, async {
+        let result = async {
+            let deleted = tokio::time::timeout(PROBE, async {
                 Remote::private(&host.exe, host.codex_home.as_deref())
                     .await?
                     .dequeue(&host.thread, &id)
                     .await
             })
-            .await;
-            let how = match deleted {
-                Ok(Ok(true)) => "withdrew its queued reminder".to_string(),
-                Ok(Ok(false)) => return,
-                Ok(Err(e)) => format!("could not withdraw its queued reminder: {e:#}"),
-                Err(_) => "could not withdraw its queued reminder: timed out".to_string(),
-            };
-            d.log(&format!("{caller} {how}"));
-        });
+            .await
+            .context("withdrawing reminder timed out")??;
+            // A lost acknowledgement is safe to retry: Codex returns false for an absent ID.
+            let mut st = self.lock();
+            let mut ledger = st.ledger.clone();
+            ledger.doorbells.remove(caller);
+            ledger.save(&self.opts.home)?;
+            st.ledger = ledger;
+            st.push_failures.remove(caller);
+            anyhow::Ok(deleted)
+        }
+        .await;
+        match result {
+            Ok(true) => self.log(&format!("{caller} withdrew its queued reminder")),
+            Ok(false) => (),
+            Err(e) => self.retry_push(
+                caller,
+                &format!("could not withdraw queued reminder: {e:#}"),
+            ),
+        }
     }
 }
 
@@ -786,7 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn waiting_withdraws_the_reminder_once_nothing_needs_the_host() {
+    async fn failed_withdrawal_keeps_the_queue_id_for_retry_after_inbox_or_restart() {
         let f = fixture();
         {
             let mut st = f.d.lock();
@@ -804,22 +808,24 @@ mod tests {
                 .insert("codex:host".into(), "queued".into());
         }
         f.d.emit("test", "stalled", serde_json::json!({"quiet_secs": 60}));
-        f.d.retract_doorbell("codex:host");
-        assert!(f.d.lock().ledger.doorbells.contains_key("codex:host"));
-        let events = f.d.unseen(&f.d.lock(), "codex:host", &[]);
-        f.d.mark_seen("codex:host", &events, &[], &[]).unwrap();
-        f.d.retract_doorbell("codex:host");
-        assert!(f.d.lock().ledger.doorbells.is_empty());
-        assert!(
-            crate::store::Ledger::load(&f.d.opts.home)
-                .unwrap()
-                .doorbells
-                .is_empty()
+        f.d.retract_doorbell("codex:host").await;
+        assert!(f.d.lock().pushing.is_empty());
+        f.d.inbox("codex:host", &[], &mut Out::new(&mut Vec::new()))
+            .await
+            .unwrap();
+        let saved = crate::store::Ledger::load(&f.d.opts.home).unwrap();
+        assert_eq!(saved.doorbells["codex:host"], "queued");
+        assert!(f.d.lock().pushing.contains_key("codex:host"));
+        let restored = Arc::new(
+            Daemon::load(super::super::options(f.d.opts.home.clone()).unwrap(), None).unwrap(),
         );
+        restored.push("codex:host").await;
+        assert!(restored.lock().pushing.contains_key("codex:host"));
+        assert_eq!(restored.lock().ledger.doorbells["codex:host"], "queued");
     }
 
     #[tokio::test]
-    async fn the_reminder_goes_once_only_requests_handed_over_or_decided_are_left() {
+    async fn withdrawal_is_attempted_once_only_handled_approvals_and_notes_remain() {
         let f = fixture();
         f.d.update("test", |t| t.tier = crate::ipc::Tier::Work);
         let ring = || {
@@ -869,9 +875,10 @@ command: {summary}"
         );
         let _first = request("rm -rf build");
         inbox().await;
-        assert!(f.d.lock().ledger.doorbells.is_empty());
+        assert!(f.d.lock().pushing.contains_key("codex:host"));
         inbox().await;
 
+        f.d.lock().pushing.clear();
         // A request decided before the host took it.
         ring();
         let _second = request("ls");
@@ -879,7 +886,7 @@ command: {summary}"
         f.d.resolve(&rid, Some("user"), crate::agent::Decision::Approve)
             .unwrap();
         inbox().await;
-        assert!(f.d.lock().ledger.doorbells.is_empty());
+        assert!(f.d.lock().pushing.contains_key("codex:host"));
     }
 }
 

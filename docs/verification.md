@@ -112,3 +112,5 @@ AGY 终端模型偏好（Windows，1.5.11）：同一工作目录中，直接启
 Windows 上用安装版 `axiopera models agy` 对照 AGY 1.5.11 的 ACP 菜单。文本与 JSON 均列出 Argon、Flash、Opus 和 Sonnet 的 low、medium、high 三档，Hydrogen 另有 xhigh。Orchestrator 和 GPT-OSS 均无强度菜单，GPT-OSS 的原生名称标明 Medium。逐个切换后，查询结果仍报告用户的派发默认值 Hydrogen / High。
 
 AGY 1.5.11 只读目录实测（Windows）：在任务目录和中文子目录分别放入一份未告知文件名的 CSV。AGY 调用两次 `list_directory`、两次 `read_file`，得到正确总额 14.74。升级前缺少目录工具的只读会话用 `send` 续接后也能发现并读取 CSV。指向工作区外的 Windows 目录联接被目录工具拒绝。先回答币种再收取第一轮结果，回执没有重复催答，下一轮给出 14.74 EUR；任务空闲后，`inbox` 和 `wait` 均返回退出码 4。
+
+Windows、Codex 0.169.0 的提醒撤回复测：AGY 子任务返回 7.59，Codex 宿主保持当前轮运行。确认提醒已入真实队列后执行 `inbox` 并立即停止 daemon，再结束宿主当前轮，队列为空，宿主没有额外轮次。另回放同一结果，在收件前暂时移走隔离环境的 Codex 可执行文件，确认结果交付成功、队列 ID 仍在 ledger；恢复文件并重启 daemon 后自动撤回。提前从 Codex 队列删掉提醒的对照也清除了本地 ID。

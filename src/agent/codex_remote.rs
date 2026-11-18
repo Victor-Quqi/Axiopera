@@ -263,7 +263,9 @@ impl Remote {
                 json!({"threadId": thread, "queuedSubmissionId": id}),
             )
             .await?;
-        Ok(r["deleted"] == true)
+        r["deleted"]
+            .as_bool()
+            .context("thread/queue/delete omitted its deletion status")
     }
 
     /// Delete keys from the user's `config.toml`, editing it the way Codex itself does.
