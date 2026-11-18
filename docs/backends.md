@@ -78,9 +78,9 @@ AGY 在任务进程内创建或恢复 ACP 会话，注册任务专用 stdio MCP�
 
 ## 模型查询
 
-AGY 1.5.11 的 `agy acp` 新会话和交互终端可能使用不同的默认模型与强度。新任务只取终端设置 `~/.gemini/antigravity-cli/settings.json` 的 `model` 字段，在当前 ACP 返回的 `availableModels` 中匹配标签或 ID，通过 `session/set_model` 选中包含强度的组合。偏好缺失或匹配不到唯一选项时沿用 ACP 默认。模型和强度选项取自当前会话，查询结束后关闭会话。AGY 跨进程续接时可能恢复成 ACP 的默认值，适配器会重新应用任务记录中上次实际使用的模型和强度。
+AGY 1.5.11 的 `agy acp` 新会话和交互终端可能使用不同的默认模型与强度。新任务只取终端设置 `~/.gemini/antigravity-cli/settings.json` 的 `model` 字段，在当前 ACP 返回的 `availableModels` 中匹配标签或 ID，通过 `session/set_model` 选中包含强度的组合。偏好缺失或匹配不到唯一选项时沿用 ACP 默认。`axiopera models agy` 先记录默认值，再在同一个临时会话中逐个选择模型，读取各自的 `thought_level` 菜单。查询结束后关闭会话，全程不发送提示词。AGY 跨进程续接时可能恢复成 ACP 的默认值，适配器会重新应用任务记录中上次实际使用的模型和强度。
 
-模型列表通过原生进程查询，保留可直接选用的 ID，包括别名和第三方模型。查询只握手和读取目录：Claude 取 stream-json `initialize` 响应的 `models`；Codex 取 app-server `model/list` 并遍历分页；Grok 取 ACP 扩展 `_x.ai/models/list`。旧版缺少接口时返回错误。
+模型列表通过原生进程查询，保留可直接选用的 ID，包括别名和第三方模型。Claude 取 stream-json `initialize` 响应的 `models`；Codex 取 app-server `model/list` 并遍历分页；Grok 取 ACP 扩展 `_x.ai/models/list`。旧版缺少接口时返回错误。
 
 Claude 的 `resolvedModel` 保留为 `resolved_model`，缺失时只显示原 ID。Claude 的 `default` 入口和 Codex 的 `isDefault` 记录为 `default_model`，即目录自身的默认值。
 

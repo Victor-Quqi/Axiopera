@@ -90,7 +90,10 @@ impl Catalog {
                 row.push_str(&format!(" → {}", single_line(resolved)));
             }
             if let Some(name) = &model.name
-                && name_key(name) != name_key(&model.id)
+                && (name_key(name) != name_key(&model.id)
+                    || (agent == Agent::Agy
+                        && model.efforts.as_deref() == Some(&[])
+                        && name.ends_with(')')))
                 && !(agent == Agent::Claude && model.id == "default")
             {
                 row.push_str(&format!("  {}", single_line(name)));
@@ -374,6 +377,7 @@ async fn discover(
             let inherits_effort = preference.is_some_and(|label| {
                 super::agy::preferred_variant(&session, label, configured_model).is_some()
             });
+            let mut configured_picker = None;
             if let Some(model) = configured_model
                 && !inherits_effort
                 && super::agy::option(&session, "model")
@@ -390,6 +394,7 @@ async fn discover(
                 .await?;
                 catalog.configured_effort = super::agy::option(&configured, "thought_level")
                     .and_then(|o| string(o, "currentValue"));
+                configured_picker = Some(configured);
             }
             if let Some(variant) = preferred {
                 rpc(
@@ -418,20 +423,49 @@ async fn discover(
                 if configured_model.is_some() && inherits_effort {
                     catalog.configured_effort.clone_from(&catalog.native_effort);
                 }
-                if let Some(current) = catalog
-                    .models
-                    .iter_mut()
-                    .find(|m| Some(&m.id) == catalog.native_model.as_ref())
+            }
+            // ACP returns the effort picker for the selected family only.
+            // Switch models on the disposable catalog session, without starting a turn.
+            for (index, model) in catalog.models.iter_mut().enumerate() {
+                let switched;
+                let picker = if Some(&model.id) == catalog.native_model.as_ref() {
+                    &session
+                } else if Some(model.id.as_str()) == configured_model
+                    && let Some(picker) = &configured_picker
                 {
-                    current.efforts = effort["options"]
-                        .as_array()
-                        .map(|rows| rows.iter().filter_map(|r| string(r, "value")).collect());
+                    picker
+                } else {
+                    let Ok(reply) = rpc(
+                        proc,
+                        lines,
+                        6 + index as u64,
+                        "session/set_config_option",
+                        json!({"sessionId":id,"configId":"model","value":model.id}),
+                    )
+                    .await
+                    else {
+                        continue;
+                    };
+                    switched = reply;
+                    &switched
+                };
+                if super::agy::option(picker, "model").and_then(|o| o["currentValue"].as_str())
+                    == Some(model.id.as_str())
+                {
+                    model.efforts = Some(
+                        super::agy::option(picker, "thought_level")
+                            .and_then(|o| o["options"].as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|r| string(r, "value"))
+                            .collect(),
+                    );
                 }
             }
             rpc(
                 proc,
                 lines,
-                6,
+                6 + catalog.models.len() as u64,
                 "session/close",
                 json!({"sessionId":session["sessionId"]}),
             )
@@ -630,6 +664,26 @@ mod tests {
             }
             let result = match msg["method"].as_str() {
                 Some("initialize") => json!({}),
+                Some("session/new") => json!({"sessionId":"catalog","configOptions":[
+                    {"id":"model","currentValue":"first","options":[
+                        {"value":"first","name":"First"},{"value":"second","name":"Second"},
+                        {"value":"fixed-medium","name":"Fixed (Medium)"},{"value":"unavailable","name":"Unavailable"}]},
+                    {"id":"thought_level","currentValue":"low","options":[{"value":"low"}]}]}),
+                Some("session/set_config_option") => {
+                    let model = &msg["params"]["value"];
+                    if model == "unavailable" {
+                        send(
+                            json!({"jsonrpc":"2.0","id":msg["id"],"error":{"code":-32602,"message":"unavailable"}}),
+                        );
+                        continue;
+                    }
+                    let mut options = vec![json!({"id":"model","currentValue":model})];
+                    if model == "second" {
+                        options.push(json!({"id":"thought_level","currentValue":"deep","options":[{"value":"deep"},{"value":"extra"}]}));
+                    }
+                    json!({"configOptions":options})
+                }
+                Some("session/close") => json!({}),
                 Some("model/list") => {
                     if msg["params"]["cursor"].is_null() {
                         send(
@@ -669,6 +723,21 @@ mod tests {
             };
             send(json!({"jsonrpc":"2.0","id":msg["id"],"result":result}));
         }
+    }
+
+    #[tokio::test]
+    async fn agy_catalog_reports_each_models_own_effort_picker() {
+        let agy = fixture(Agent::Agy, "ok", Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(
+            agy.render(Agent::Agy),
+            "Without --model, spawns use first, effort low.\nfirst  effort: low\nsecond  effort: deep, extra\nfixed-medium  Fixed (Medium)\nunavailable"
+        );
+        let rows = serde_json::to_value(&agy).unwrap()["models"].clone();
+        assert_eq!(rows[1]["efforts"], json!(["deep", "extra"]));
+        assert_eq!(rows[2]["efforts"], json!([]));
+        assert!(rows[3].get("efforts").is_none());
     }
 
     #[tokio::test]
