@@ -884,7 +884,10 @@ impl Daemon {
             && entry.task.session.as_deref() == Some(session)
             && matches!(
                 (entry.task.agent, host),
-                (Agent::Claude, "claude") | (Agent::Codex, "codex") | (Agent::Grok, "grok")
+                (Agent::Claude, "claude")
+                    | (Agent::Codex, "codex")
+                    | (Agent::Grok, "grok")
+                    | (Agent::Agy, "agy")
             )
         {
             return format!("task:{id}");
@@ -1083,15 +1086,13 @@ impl Daemon {
             }
         }
         let host = identity::task_session(caller).map_or(caller, |(_, native)| native);
-        let grok_host = host.starts_with("grok:")
-            || host.strip_prefix("task:").is_some_and(|id| {
-                self.lock()
-                    .tasks
-                    .get(id)
-                    .is_some_and(|e| e.task.agent == Agent::Grok)
-            });
-        let take = if grok_host {
+        let task_agent = host
+            .strip_prefix("task:")
+            .and_then(|id| self.lock().tasks.get(id).map(|entry| entry.task.agent));
+        let take = if host.starts_with("grok:") || task_agent == Some(Agent::Grok) {
             "Take results and questions with `axiopera inbox` when your watch monitor reports news."
+        } else if host.starts_with("agy:") || task_agent == Some(Agent::Agy) {
+            "Run `axiopera wait` as a background command. When it finishes, run `axiopera inbox`."
         } else {
             "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some."
         };
@@ -1269,6 +1270,14 @@ impl Daemon {
                         format!(
                             "{id} is still running or has queued input; wait until it is idle before changing --tier"
                         ),
+                    );
+                }
+                if entry.task.agent == Agent::Agy
+                    && (entry.task.tier == ipc::Tier::Read || tier == ipc::Tier::Read)
+                {
+                    return refuse(
+                        ErrorCode::Invalid,
+                        "AGY keeps its read-only tool list for the life of a session; spawn a new task to switch into or out of read",
                     );
                 }
                 if let Some(parent) = identity::task_of(&entry.task.parent)
@@ -1576,6 +1585,7 @@ impl Daemon {
                 Agent::Claude => format!("claude --resume {session}"),
                 Agent::Codex => format!("codex resume {session}"),
                 Agent::Grok => format!("grok -r {session}"),
+                Agent::Agy => format!("agy --conversation {session}"),
             };
             let mut task = entry.task.clone();
             task.detached = true;

@@ -47,7 +47,20 @@ pub async fn serve(client: Client, codex_hooks: bool, caller: Option<String>) ->
             "tools/list" if codex_hooks => json!({"tools": hook_tools()}),
             "tools/list" => json!({"tools": tools()}),
             "tools/call" if codex_hooks => hook(&client, params, &mut reminded).await,
-            "tools/call" => call(&client, caller.clone(), params).await,
+            "tools/call" => {
+                let session = params["_meta"]["antigravity.google/conversation_id"]
+                    .as_str()
+                    .and_then(|id| uuid::Uuid::parse_str(id).ok());
+                let sender = match (caller.as_deref(), session) {
+                    (Some(task), Some(session))
+                        if task.starts_with("task:") && !task.contains('/') =>
+                    {
+                        Some(format!("{task}/agy:{session}"))
+                    }
+                    _ => caller.clone(),
+                };
+                call(&client, sender, params).await
+            }
             other => {
                 let error = json!({"code": -32601, "message": format!("unknown method {other}")});
                 reply(

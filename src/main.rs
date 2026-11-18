@@ -459,6 +459,7 @@ fn guide(host: Option<Agent>, caller: &str) -> String {
         let (name, label) = match tag {
             "claude" => (Agent::Claude, "Claude Code"),
             "codex" => (Agent::Codex, "Codex"),
+            "agy" => (Agent::Agy, "Antigravity CLI"),
             _ => (Agent::Grok, "Grok"),
         };
         match host {
@@ -508,6 +509,7 @@ mod tests {
             ("claude", skill::Host::Claude),
             ("codex", skill::Host::Codex),
             ("grok", skill::Host::Grok),
+            ("agy", skill::Host::Agy),
             ("all", skill::Host::All),
         ] {
             for force in [false, true] {
@@ -619,7 +621,12 @@ mod tests {
     fn the_guide_gives_each_host_its_part() {
         let all = guide(None, "user");
         assert!(!all.contains('@'));
-        for label in ["  Claude Code:\n    ", "  Codex:\n    ", "  Grok:\n    "] {
+        for label in [
+            "  Claude Code:\n    ",
+            "  Codex:\n    ",
+            "  Grok:\n    ",
+            "  Antigravity CLI:\n    ",
+        ] {
             assert_eq!(all.matches(label).count(), 1, "{label}");
         }
         let claude = guide(Some(Agent::Claude), "claude:s0");

@@ -13,6 +13,7 @@ pub enum Host {
     Claude,
     Codex,
     Grok,
+    Agy,
     All,
 }
 
@@ -26,7 +27,8 @@ fn install_into(home: &Path, host: Host, force: bool, json: bool) -> i32 {
         Host::Claude => &[Agent::Claude],
         Host::Codex => &[Agent::Codex],
         Host::Grok => &[Agent::Grok],
-        Host::All => &[Agent::Claude, Agent::Codex, Agent::Grok],
+        Host::Agy => &[Agent::Agy],
+        Host::All => &[Agent::Claude, Agent::Codex, Agent::Grok, Agent::Agy],
     };
     let mut results = Vec::new();
     let mut code = crate::ipc::exit::OK;
@@ -76,6 +78,7 @@ fn install_at(home: &Path, host: Agent, force: bool) -> Result<(PathBuf, bool)> 
         Agent::Claude => ".claude",
         Agent::Codex => ".agents",
         Agent::Grok => ".grok",
+        Agent::Agy => ".gemini/config",
     };
     let dir = home.join(root).join("skills").join("axiopera");
     let path = dir.join("SKILL.md");
@@ -127,6 +130,7 @@ mod tests {
             (Agent::Claude, ".claude"),
             (Agent::Codex, ".agents"),
             (Agent::Grok, ".grok"),
+            (Agent::Agy, ".gemini/config"),
         ] {
             let expected = home.0.join(root).join("skills/axiopera/SKILL.md");
             let (path, changed) = install_at(&home.0, host, false).unwrap();
@@ -162,7 +166,7 @@ mod tests {
             crate::ipc::exit::ERROR
         );
         assert_eq!(fs::read_to_string(&conflict).unwrap(), "custom skill");
-        for root in [".agents", ".grok"] {
+        for root in [".agents", ".grok", ".gemini/config"] {
             assert_eq!(
                 fs::read(home.0.join(root).join("skills/axiopera/SKILL.md")).unwrap(),
                 CONTENT

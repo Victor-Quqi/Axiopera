@@ -1,5 +1,6 @@
 //! Agent adapters: one native process per running turn, driven over its stdio protocol.
 
+mod agy;
 mod claude;
 mod codex;
 pub mod codex_remote;
@@ -143,6 +144,7 @@ async fn decided(rx: oneshot::Receiver<Decision>) -> Decision {
 pub fn extra_env(agent: Agent) -> &'static [(&'static str, &'static str)] {
     match agent {
         Agent::Grok => &grok::ENV,
+        Agent::Agy => &[("AGY_CLI_DISABLE_AUTO_UPDATE", "true")],
         _ => &[],
     }
 }
@@ -222,7 +224,7 @@ fn content_text(content: &Value) -> String {
 
 /// Instructions every sub-agent gets on top of its own system prompt.
 fn protocol_text(spec: &StartSpec) -> String {
-    let ask = if spec.agent == Agent::Codex {
+    let ask = if matches!(spec.agent, Agent::Codex | Agent::Agy) {
         "call the `ask` tool of the axiopera MCP server"
     } else {
         "run `axiopera ask \"<question>\"`"
@@ -289,6 +291,7 @@ pub enum Backend {
     Claude(claude::Claude),
     Codex(codex::Codex),
     Grok(grok::Grok),
+    Agy(agy::Agy),
 }
 
 impl Backend {
@@ -297,6 +300,7 @@ impl Backend {
         Ok(match spec.agent {
             Agent::Claude => Backend::Claude(claude::Claude::start(spec, exe, events).await?),
             Agent::Codex => Backend::Codex(codex::Codex::start(spec, exe, events).await?),
+            Agent::Agy => Backend::Agy(agy::Agy::start(spec, exe, events).await?),
             Agent::Grok => Backend::Grok(grok::Grok::start(spec, exe, events).await?),
         })
     }
@@ -305,6 +309,7 @@ impl Backend {
         match self {
             Backend::Claude(a) => a.turn(text).await,
             Backend::Codex(a) => a.turn(text).await,
+            Backend::Agy(a) => a.turn(text).await,
             Backend::Grok(a) => a.turn(text).await,
         }
     }
@@ -313,6 +318,7 @@ impl Backend {
         match self {
             Backend::Claude(a) => a.steer(text, id).await,
             Backend::Codex(a) => a.steer(text, id).await,
+            Backend::Agy(a) => a.steer(text, id).await,
             Backend::Grok(a) => a.steer(text).await,
         }
     }
@@ -321,6 +327,7 @@ impl Backend {
         match self {
             Backend::Claude(a) => a.interrupt().await,
             Backend::Codex(a) => a.interrupt().await,
+            Backend::Agy(a) => a.interrupt().await,
             Backend::Grok(a) => a.interrupt().await,
         }
     }
@@ -330,6 +337,7 @@ impl Backend {
         match self {
             Backend::Claude(a) => a.busy(),
             Backend::Codex(a) => a.busy(),
+            Backend::Agy(a) => a.busy(),
             Backend::Grok(a) => a.busy(),
         }
     }
@@ -339,6 +347,7 @@ impl Backend {
         match self {
             Backend::Claude(a) => a.in_turn(),
             Backend::Codex(a) => a.busy(),
+            Backend::Agy(a) => a.in_turn(),
             Backend::Grok(a) => a.in_turn(),
         }
     }
@@ -347,6 +356,7 @@ impl Backend {
         match self {
             Backend::Claude(a) => &mut a.proc,
             Backend::Codex(a) => &mut a.proc,
+            Backend::Agy(a) => &mut a.proc,
             Backend::Grok(a) => &mut a.proc,
         }
     }
@@ -541,6 +551,7 @@ pub fn resolve_exe(
         Agent::Claude => "claude",
         Agent::Codex => "codex",
         Agent::Grok => "grok",
+        Agent::Agy => "agy",
     };
     if agent == Agent::Grok {
         let home = var("GROK_HOME")
@@ -584,7 +595,7 @@ fn npm_native(dir: &Path, agent: Agent) -> Option<PathBuf> {
         Agent::Codex => modules.join(format!(
             "@openai/codex/node_modules/@openai/codex-win32-{arch}/vendor/{triple}/bin/codex.exe"
         )),
-        Agent::Grok => return None,
+        Agent::Grok | Agent::Agy => return None,
     };
     exe.is_file().then_some(exe)
 }

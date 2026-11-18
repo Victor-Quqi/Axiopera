@@ -6,16 +6,17 @@ use anyhow::{Result, bail};
 pub const TASK_VAR: &str = "AXIOPERA_TASK_ID";
 
 /// Session variables hosts inject into their shell commands, and the caller prefix for each.
-pub const HOST_VARS: [(&str, &str); 3] = [
+pub const HOST_VARS: [(&str, &str); 4] = [
     ("CLAUDE_CODE_SESSION_ID", "claude"),
     ("CODEX_THREAD_ID", "codex"),
     ("GROK_SESSION_ID", "grok"),
+    ("ANTIGRAVITY_CONVERSATION_ID", "agy"),
 ];
 
 /// Host identity variables a sub-agent must not inherit from its caller, including the
 /// credentials of a Claude Code session's inbox, and the client name the Codex app and IDE
 /// extension give their sessions.
-pub const STRIP_VARS: [&str; 11] = [
+pub const STRIP_VARS: [&str; 13] = [
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_PID",
@@ -25,6 +26,8 @@ pub const STRIP_VARS: [&str; 11] = [
     "CODEX_INTERNAL_ORIGINATOR_OVERRIDE",
     "GROK_SESSION_ID",
     "GROK_AGENT",
+    "ANTIGRAVITY_CONVERSATION_ID",
+    "ANTIGRAVITY_AGENTAPI_EXE",
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
 ];
@@ -166,7 +169,11 @@ mod tests {
 
     #[test]
     fn native_children_keep_their_own_identity_and_task_ancestry() {
-        for (var, host) in [("CODEX_THREAD_ID", "codex"), ("GROK_SESSION_ID", "grok")] {
+        for (var, host) in [
+            ("CODEX_THREAD_ID", "codex"),
+            ("GROK_SESSION_ID", "grok"),
+            ("ANTIGRAVITY_CONVERSATION_ID", "agy"),
+        ] {
             let parent = detect(env(&[(TASK_VAR, "t1"), (var, "parent")]), no_ancestors);
             let child = detect(env(&[(TASK_VAR, "t1"), (var, "child")]), no_ancestors);
             assert_ne!(parent, child);

@@ -6,15 +6,17 @@
 
 接入遵循用户对 harness 及其权限机制的选择。用户使用未加载权限插件的 Pi 时，托管任务沿用该原生行为。Axiopera 不为统一后端能力额外实现权限门控、安装权限插件、增加 reviewer，或启用用户未选择的自动审查组件。原生后端发出的审批请求由 Axiopera 转交，裁决只作用于本次请求。
 
-`read/work/full` 映射各后端已有的权限模式和工具开关，具体行为随后端而异；没有原生对应能力的档位标为不支持。缺少自动审查是原生能力差异，不作为接入缺口。消息通知、steer 所需的扩展另行评估，不承担新增权限控制。以下为现有三个适配器的映射。
+`read/work/full` 映射各后端已有的权限模式和工具开关，具体行为随后端而异；没有原生对应能力的档位标为不支持。缺少自动审查是原生能力差异，不作为接入缺口。消息通知、steer 所需的扩展另行评估，不承担新增权限控制。各后端的具体映射如下。
 
-| 档位 | Claude Code | Codex | Grok Build |
-|---|---|---|---|
-| read | `default`，移除 Edit、Write、NotebookEdit、Agent；通过 stdio 接审批 | `read-only`，`never`，reviewer 为 `user` | ask 模式，移除写入、子 agent、工作流、定时任务、媒体生成和 MCP 入口 |
-| work | `auto` | `workspace-write`，`on-request`，reviewer 为 `auto_review` | `autoMode:true`、`yoloMode:false` |
-| full | `bypassPermissions` | `danger-full-access`，`on-request`，reviewer 为 `user` | `yoloMode:true` |
+| 档位 | Claude Code | Codex | Grok Build | Antigravity CLI |
+|---|---|---|---| --- |
+| read | `default`，移除 Edit、Write、NotebookEdit、Agent；通过 stdio 接审批 | `read-only`，`never`，reviewer 为 `user` | ask 模式，移除写入、子 agent、工作流、定时任务、媒体生成和 MCP 入口 | 任务专用 agent，仅开放 `read_file` 和 Axiopera 的 ask、tell、answers |
+| work | `auto` | `workspace-write`，`on-request`，reviewer 为 `auto_review` | `autoMode:true`、`yoloMode:false` | 原生 `--sandbox` 和 `auto` 模式 |
+| full | `bypassPermissions` | `danger-full-access`，`on-request`，reviewer 为 `user` | `yoloMode:true` | 原生 `--dangerously-skip-permissions` |
 
-新建和续接会话都显式设置权限模式，用户已有的允许和拒绝规则仍参与后端判断。同档位的能力存在差异，`spawn` 回执会报告影响任务的限制。
+新建和续接会话都显式设置权限模式，用户规则由各后端执行。同档位的能力存在差异，`spawn` 回执会报告影响任务的限制。
+
+**AGY 1.5.11 的已知限制**：在 ACP 会话中，用户自定义的 deny 规则可能失效。例如，本应直接禁止的命令仍会进入审批，批准后可能执行。Axiopera 转发 AGY 的单次审批。AGY 续接时保留建会话时的工具列表，进出 read 档都要新建任务。
 
 read 档允许 Claude 和 Codex 使用标注 `readOnlyHint:true` 且没有 `destructiveHint:true` 的 MCP 工具。Claude 适配器在每次调用时查询 `mcp_status`，按完整工具名检查注解；查询失败或 10 秒未返回就拒绝。Codex 使用原生注解判断。Grok 隐藏 `search_tool`、`use_tool`，因为 `agentProfile.disallowedTools` 无法逐个禁用 MCP 工具，ACP 状态也不提供注解。
 
@@ -52,6 +54,7 @@ read 档按上述只读规则裁决，其他需要批准的请求直接拒绝。
 | Claude | `can_use_tool` | allow 或 deny，不写 `updatedPermissions` |
 | Codex | `item/commandExecution/requestApproval`、`item/fileChange/requestApproval`、`item/permissions/requestApproval` | accept、decline 或仅本轮的 permissions |
 | Grok | `session/request_permission` | allow-once 或 reject-once |
+| AGY | `session/request_permission`，按会话和工具调用区分 | allow-once 或 reject-once，原生子 agent 的审批注明子会话 ID |
 
 Claude 其他 control request 返回 unsupported。Codex 的 MCP elicitation 返回 decline，`requestUserInput` 返回空 answers。Grok 其他请求直接拒绝。上述情况均记为 `blocked`，由轮末汇总。
 
@@ -60,6 +63,8 @@ Codex decline 不能带拒绝理由，适配器另用 steer 送入理由。Grok 
 Codex 不再等待某个请求的应答时发出 `serverRequest/resolved`，应答之后也会发出；0.167 起，网络审批对应的请求在裁决前结束时同样发出。转发的请求尚无裁决时，适配器撤回它：不应答，也不送入拒绝理由。
 
 后端自己拒绝且没有请求批准的操作，按原生错误返回给子 agent。适配器通过 Claude 的 `permission_denials`、Codex 的 auto-review 结果、Grok 工具错误中的 `Auto mode blocked this action` 识别并记录。
+
+AGY 在任务进程内创建或恢复 ACP 会话，注册任务专用 stdio MCP。read 的 agent 定义保存在 Axiopera 任务目录。原生子 agent 的 ID 来自父会话记录，适配器核对其首条系统记录的发送者，再在同一进程载入子会话接收审批。
 
 ## 可执行文件与配置继承
 
@@ -72,6 +77,8 @@ Codex 不再等待某个请求的应答时发出 `serverRequest/resolved`，应�
 - Codex 在线程中设置 reviewer、sandbox 和 MCP；读取配置时只取所需的 MCP 服务器名。
 
 ## 模型查询
+
+AGY 通过新建 ACP 会话返回的 `configOptions` 读取模型列表和当前模型的推理强度，查询后关闭会话。派发时用 `session/set_config_option` 设置模型和强度。
 
 模型列表通过原生进程查询，保留可直接选用的 ID，包括别名和第三方模型。查询只握手和读取目录：Claude 取 stream-json `initialize` 响应的 `models`；Codex 取 app-server `model/list` 并遍历分页；Grok 取 ACP 扩展 `_x.ai/models/list`。旧版缺少接口时返回错误。
 
@@ -114,13 +121,14 @@ Grok 工具开始事件提供工具名和原始参数，后续更新可补齐规
 
 并发续接同一会话时，Claude 和 Grok 可以出现各自写入、互相看不到新轮次的情况，Codex 则拒绝第二个 writer。因此 Axiopera 在空闲时释放进程，并在续接前核对会话文件。
 
-Codex 和 Grok 内置子 agent 的终端命令分别带有独立的 `CODEX_THREAD_ID` 和 `GROK_SESSION_ID`，Axiopera 按各自线程或会话隔离收件箱；由 Axiopera 启动的宿主再开内置子 agent 时同样隔离，并保留外层任务的归属和限制。Claude 主 agent 与内置子 agent 共享原生会话身份；内置子 agent 使用 Axiopera 时，所有参与者都应使用带任务 ID 的 `wait`、`inbox`，避免取走彼此的消息。
+Codex、Grok 和 AGY 内置子 agent 的终端命令分别带有独立的 `CODEX_THREAD_ID`、`GROK_SESSION_ID` 和 `ANTIGRAVITY_CONVERSATION_ID`，Axiopera 按各自线程或会话隔离收件箱；由 Axiopera 启动的宿主再开内置子 agent 时同样隔离，并保留外层任务的归属和限制。Claude 主 agent 与内置子 agent 共享原生会话身份；内置子 agent 使用 Axiopera 时，所有参与者都应使用带任务 ID 的 `wait`、`inbox`，避免取走彼此的消息。
 
 ## 宿主通知
 
 | 宿主 | 本轮结束后 | 本轮进行中 | 方式 |
 |---|---|---|---|
 | Claude Code，含 VS Code 扩展 | 自动开启一轮 | 下一次工具调用前送达 | 后台运行 `wait`，退出后 `inbox` |
+| AGY | 后台命令完成后唤醒宿主 | 收到后台命令的完成消息后收取 | 后台运行 `axiopera wait`，收到完成消息后运行 `axiopera inbox` |
 | Grok | 自动开启一轮 | 用 monitor 时下一次工具调用后送达；后台命令等本轮结束 | 用 monitor 运行 `watch`，再 `inbox` |
 | Codex TUI | 自动开启一轮 | 送入当前轮 | 推送 |
 | Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 默认等本轮结束；启用[插件](usage.md#skill-与-codex-插件) hook 后，下一次工具调用后提醒 | 门铃，插件 hook |

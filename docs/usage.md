@@ -40,11 +40,11 @@
 
 `top` 只读取数据目录，不连接 daemon：不会启动 daemon，不取走消息，不标记结果已交付，也不写请求日志。daemon 异常退出后，任务停留在退出前的状态，下次启动时才改为 interrupted。
 
-其他命令中，`status --all` 和 `log` 同样不改变交付状态。`result` 会把该轮标为已交付，主 agent 之后只拿到文件路径。`inbox` 取走调用方的消息：在 Claude Code、Codex、Grok 的命令工具或它们启动的 shell 中，调用方是该会话；在独立终端中是 `user`，即你本人。识别不到会话的 agent 要用 `--caller` 指明会话，见[指定调用方](#指定调用方)。
+其他命令中，`status --all` 和 `log` 同样不改变交付状态。`result` 会把该轮标为已交付，主 agent 之后只拿到文件路径。`inbox` 取走调用方的消息：在 Claude Code、Codex、Grok、AGY 的命令工具或它们启动的 shell 中，调用方是该会话；在独立终端中是 `user`，即你本人。识别不到会话的 agent 要用 `--caller` 指明会话，见[指定调用方](#指定调用方)。
 
 ## 指定调用方
 
-调用方身份决定任务名称的作用范围、`status` 列出的任务和 `inbox` 取走的消息。Axiopera 从 Claude Code、Codex、Grok 注入命令环境的会话变量识别调用方，经 ssh、`docker exec`、WSL 等调用另一处的 Axiopera 时，这些变量通常传不过去，agent 会被当成终端前的你（`user`）：与终端共用收件箱，审批时也像你一样不必先读全文。这时用全局选项 `--caller <名称>:<会话 ID>` 指明会话，每条命令带同一个值，变量在宿主一侧展开：
+调用方身份决定任务名称的作用范围、`status` 列出的任务和 `inbox` 取走的消息。Axiopera 从 Claude Code、Codex、Grok、AGY 注入命令环境的会话变量识别调用方，经 ssh、`docker exec`、WSL 等调用另一处的 Axiopera 时，这些变量通常传不过去，agent 会被当成终端前的你（`user`）：与终端共用收件箱，审批时也像你一样不必先读全文。这时用全局选项 `--caller <名称>:<会话 ID>` 指明会话，每条命令带同一个值，变量在宿主一侧展开：
 
 ```sh
 ssh 主机 axiopera --caller "claude:$CLAUDE_CODE_SESSION_ID" spawn codex --cwd /srv/app - < task.md
@@ -52,7 +52,7 @@ ssh 主机 axiopera --caller "claude:$CLAUDE_CODE_SESSION_ID" wait    # 后台�
 ssh 主机 axiopera --caller "claude:$CLAUDE_CODE_SESSION_ID" inbox
 ```
 
-三家的会话 ID 分别在 `CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`GROK_SESSION_ID` 中。`--caller claude:<ID>` 与在命令前设置 `CLAUDE_CODE_SESSION_ID=<ID>` 是同一个调用方，此前这样派发的任务可以接着操作。其他 agent 同样要用自己的名称和会话 ID 指明会话，没有会话 ID 时生成一个随机值并一直沿用。取值规则及子 agent 中的限制见[身份与 IPC](design.md#身份与-ipc)。
+四家的会话 ID 分别在 `CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`GROK_SESSION_ID`、`ANTIGRAVITY_CONVERSATION_ID` 中。`--caller claude:<ID>` 与在命令前设置 `CLAUDE_CODE_SESSION_ID=<ID>` 是同一个调用方，此前这样派发的任务可以接着操作。其他 agent 同样要用自己的名称和会话 ID 指明会话，没有会话 ID 时生成一个随机值并一直沿用。取值规则及子 agent 中的限制见[身份与 IPC](design.md#身份与-ipc)。
 
 Axiopera 不负责连接、认证和文件同步。`--cwd`、`-f` 和结果中的路径都按运行 Axiopera 的一侧解释。Windows 的 Git Bash 会把传给 `wsl.exe` 等原生程序、以 `/` 开头的参数改写成 Windows 路径，这时设置 `MSYS_NO_PATHCONV=1`。子 agent 使用该侧调用命令的环境，非交互 ssh 的 PATH 可能找不到 agent CLI，这时在[配置](#配置)中指定 `path`。ssh 断开后 daemon 和任务继续运行，前提是系统不在登出时结束用户进程，例如 systemd-logind 未启用 `KillUserProcesses`。跨机器时各宿主怎样收到结果，见[宿主通知](backends.md#宿主通知)。
 
@@ -76,7 +76,7 @@ model = "haiku"
 # path = "/absolute/path/to/claude"
 ```
 
-同样支持 `[agents.codex]`、`[agents.grok]`。`--model` 覆盖默认模型。`path` 必须指向真实可执行文件；Windows 上应使用 `.exe`。省略时按[后端的路径查找规则](backends.md#可执行文件与配置继承)定位。
+同样支持 `[agents.codex]`、`[agents.grok]`、`[agents.agy]`。`--model` 覆盖默认模型。`path` 必须指向真实可执行文件；Windows 上应使用 `.exe`。省略时按[后端的路径查找规则](backends.md#可执行文件与配置继承)定位。
 
 `axiopera models <agent>` 查询模型 ID 和支持的推理强度。别名有解析结果时显示为 `别名 → 具体模型 ID`；重复名称省略，说明保留在 `--json`。首行写明不带 `--model` 派发时使用的模型：有 Axiopera 配置时是配置值，否则是原生 CLI 按用户自己的设置选出的模型和推理强度。列表中的 `account default` 是 Claude 的账户默认入口，`backend default` 是 Codex 目录的默认，二者不一定是派发所用的模型。Grok 的默认模型可能在查询之后变化，任务实际所用以 `status` 和每轮结果为准。`--cwd` 指定工作目录，默认当前目录。
 
@@ -95,6 +95,7 @@ skill 让 agent 在派发任务前先运行 `axiopera guide --host <宿主>`，�
 | Claude Code | `claude` | `~/.claude/skills/axiopera/` |
 | Codex | `codex` | `~/.agents/skills/axiopera/` |
 | Grok | `grok` | `~/.grok/skills/axiopera/` |
+| Antigravity CLI | `agy` | `~/.gemini/config/skills/axiopera/` |
 
 `~` 取 Windows 的 `USERPROFILE`，其他平台取 `HOME`。命令使用表中的固定位置；自定义 skill 目录可手动复制文件。Grok 默认也读取 Claude Code 和 Codex 的上述位置，已有一份时可直接使用。
 

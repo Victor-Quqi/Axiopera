@@ -199,6 +199,7 @@ pub async fn query(
 ) -> Result<Catalog> {
     let args: Vec<String> = match agent {
         Agent::Codex => vec!["app-server"],
+        Agent::Agy => vec!["acp"],
         Agent::Grok => vec!["agent", "--no-leader", "stdio"],
         Agent::Claude => vec![
             "-p",
@@ -332,6 +333,41 @@ async fn discover(
             }
             catalog.native_model = model;
         }
+        Agent::Agy => {
+            rpc(proc, lines, 1, "initialize", super::agy::initialize()).await?;
+            let session = rpc(
+                proc,
+                lines,
+                2,
+                "session/new",
+                json!({"cwd":cwd,"mcpServers":[]}),
+            )
+            .await?;
+            let choices =
+                super::agy::option(&session, "model").context("missing AGY model picker")?;
+            catalog.models = parse_models(agent, &choices["options"])?;
+            catalog.native_model = string(choices, "currentValue");
+            if let Some(effort) = super::agy::option(&session, "thought_level") {
+                catalog.native_effort = string(effort, "currentValue");
+                if let Some(current) = catalog
+                    .models
+                    .iter_mut()
+                    .find(|m| Some(&m.id) == catalog.native_model.as_ref())
+                {
+                    current.efforts = effort["options"]
+                        .as_array()
+                        .map(|rows| rows.iter().filter_map(|r| string(r, "value")).collect());
+                }
+            }
+            rpc(
+                proc,
+                lines,
+                3,
+                "session/close",
+                json!({"sessionId":session["sessionId"]}),
+            )
+            .await?;
+        }
         Agent::Grok => {
             rpc(proc, lines, 1, "initialize", json!({"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false},"terminal":false},"clientInfo":{"name":"axiopera","version":env!("CARGO_PKG_VERSION")}})).await?;
             let response = rpc(proc, lines, 2, "_x.ai/models/list", json!({})).await?;
@@ -429,6 +465,7 @@ fn parse_models(agent: Agent, value: &Value) -> Result<Vec<Model>> {
             let (id_key, name_key, efforts) = match agent {
                 Agent::Claude => ("value", "displayName", row.get("supportedEffortLevels")),
                 Agent::Codex => ("model", "displayName", row.get("supportedReasoningEfforts")),
+                Agent::Agy => ("value", "name", None),
                 Agent::Grok => ("modelId", "name", row["_meta"].get("reasoningEfforts")),
             };
             let id = string(row, id_key)

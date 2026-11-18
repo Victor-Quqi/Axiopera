@@ -64,6 +64,7 @@ pub fn agent_name(a: Agent) -> &'static str {
         Agent::Claude => "claude",
         Agent::Codex => "codex",
         Agent::Grok => "grok",
+        Agent::Agy => "agy",
     }
 }
 
@@ -83,7 +84,7 @@ pub fn capability_notes(agent: Agent, tier: Tier) -> Vec<String> {
         ],
         _ => Vec::new(),
     };
-    if cfg!(windows) && agent != Agent::Codex && tier != Tier::Full {
+    if cfg!(windows) && !matches!(agent, Agent::Codex | Agent::Agy) && tier != Tier::Full {
         notes.push("no OS sandbox on Windows".into());
     }
     if tier == Tier::Read {
@@ -92,6 +93,7 @@ pub fn capability_notes(agent: Agent, tier: Tier) -> Vec<String> {
                 "MCP: only tools marked read-only without a destructive hint are allowed".into()
             }
             Agent::Grok => "MCP: unavailable".into(),
+            Agent::Agy => "MCP: Axiopera communication tools only; no shell".into(),
         });
         notes.push(match agent {
             Agent::Grok => "shell commands other than plain axiopera commands are refused".into(),

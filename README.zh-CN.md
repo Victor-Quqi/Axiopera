@@ -4,7 +4,7 @@
 
 **更轻量、更高效、更易用，低侵入性的 agent 协作工具**
 
-Axiopera 为 Claude Code、Codex 和 Grok Build 提供跨工具协作。
+Axiopera 为 Claude Code、Codex、Grok Build 和 Antigravity CLI 提供跨工具协作。
 
 你可以在 Claude Code 中说：
 
@@ -16,8 +16,8 @@ Axiopera 为 Claude Code、Codex 和 Grok Build 提供跨工具协作。
 - 沿用现有 agent 登录状态和额度。
 - 默认不改 agent 配置。
 - 平时约一行 Skill 简介，操作说明按需加载。
-- 三家子 agent 都支持 Steer，运行中追加要求、调整方向。
-- 三家主 agent 都能边工作边[接收子任务消息](docs/backends.md#宿主通知)，及时跟进。
+- 四家子 agent 都支持 Steer，运行中追加要求、调整方向。
+- 四家主 agent 都能边工作边[接收子任务消息](docs/backends.md#宿主通知)，及时跟进。
 - 另开终端运行 `axiopera top`，实时查看全部子任务，不影响主 agent。
 
 ## 安装
@@ -41,6 +41,7 @@ Windows、Linux 已实测，macOS 待验证。[验证范围](docs/verification.m
 | Claude Code | `axiopera skill install claude` |
 | Codex | `axiopera skill install codex` |
 | Grok Build | `axiopera skill install grok` |
+| Antigravity CLI | `axiopera skill install agy` |
 
 为所有支持的 Harness 安装：`axiopera skill install all`。
 

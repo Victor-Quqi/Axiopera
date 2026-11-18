@@ -93,3 +93,9 @@ python spikes/read_mcp.py grok
 手动验证 daemon 时，用临时 `AXIOPERA_HOME` 隔离数据目录。测试结束后停止该 daemon，删除测试目录和测试创建的原生会话。`probe.forget_sessions` 清理指定测试工作目录下的 Claude、Grok 会话；Codex 会话需按探针取得的 thread ID 清理，`resume.py` 有 `thread/delete` 示例。
 
 协议排查可在启动测试 daemon 前设置 `AXIOPERA_TRACE_PROTOCOL=1`。原始收发内容写入 `tasks/<id>/protocol.log`，可能包含任务内容和工具参数。测试结束后连同测试数据目录删除。
+
+## Antigravity CLI 1.5.11
+
+2026-11-19 在 Windows 11 上使用隔离的 Axiopera daemon、工作区和 AGY 会话目录实测。通过 `axiopera models agy` 取得原生模型与强度。read 档用相对路径读到指定文件，通过会话 MCP 调用 `answers`，同会话续接取得第二轮结果。full 用 shell 写入标记文件，中途追加的要求出现在最终答复中。full 任务切到 work 后可续接，再切入 read 时被拒绝。运行中的任务可取消。
+
+work 档派发原生子 agent 写文件，父任务在首轮结束后收到子任务结果并交付了第二轮答复。另一次测试中，子 agent 运行需要审批的命令，Axiopera 的审批详情显示子会话 ID 和完整命令，经 `axiopera approve` 批准后脚本写出了标记。原生 ACP 双子会话探针另核对了分别允许、拒绝和取消时的审批归属。

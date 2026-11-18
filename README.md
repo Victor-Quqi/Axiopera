@@ -4,7 +4,7 @@
 
 **Lighter, more efficient, easier agent collaboration with minimal setup changes.**
 
-Axiopera connects Claude Code, Codex, and Grok Build.
+Axiopera connects Claude Code, Codex, Grok Build, and Antigravity CLI.
 
 In Claude Code, ask:
 
@@ -16,8 +16,8 @@ Advantages:
 - Uses your existing agent sign-ins and usage allowances.
 - Leaves agent configuration unchanged by default.
 - About one line for skill discovery; instructions load on demand.
-- All three sub-agents support Steer: add instructions and change direction while they run.
-- All three lead agents can [receive sub-task messages](docs/backends.md#宿主通知) while working and follow up.
+- All four sub-agents support Steer: add instructions and change direction while they run.
+- All four lead agents can [receive sub-task messages](docs/backends.md#宿主通知) while working and follow up.
 - Run `axiopera top` in another terminal to watch every sub-task live without affecting the lead agent.
 
 ## Install
@@ -41,6 +41,7 @@ Run the command for your host agent, then start a new session:
 | Claude Code | `axiopera skill install claude` |
 | Codex | `axiopera skill install codex` |
 | Grok Build | `axiopera skill install grok` |
+| Antigravity CLI | `axiopera skill install agy` |
 
 For all supported harnesses: `axiopera skill install all`.
 
