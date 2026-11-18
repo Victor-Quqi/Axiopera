@@ -547,13 +547,19 @@ impl Driver {
                 .inputs
                 .read(u["content"]["text"].as_str().unwrap_or(""), &self.events),
             "agent_message_chunk" if root => {
-                s.text.push_str(u["content"]["text"].as_str().unwrap_or(""))
+                if let Some(text) = u["content"]["text"].as_str().filter(|s| !s.is_empty()) {
+                    self.events.progress();
+                    s.text.push_str(text);
+                }
             }
             "tool_call" | "tool_call_update" => {
                 let Some(id) = u["toolCallId"].as_str() else {
                     return;
                 };
                 let key = format!("{session}:{id}");
+                if u["sessionUpdate"] == "tool_call_update" {
+                    self.events.progress();
+                }
                 let name = u["name"].as_str().unwrap_or("tool");
                 let finish = matches!(u["status"].as_str(), Some("completed" | "failed"));
                 if finish {

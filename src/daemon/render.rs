@@ -109,6 +109,16 @@ fn get<'a>(e: &'a Event, k: &str) -> &'a Value {
     e.data.get(k).unwrap_or(&Value::Null)
 }
 
+pub fn stall_description(e: &Event) -> String {
+    let seconds = get(e, "quiet_secs").as_u64().unwrap_or(0);
+    let elapsed = duration(seconds.saturating_mul(1000));
+    if get(e, "initial") == &Value::Bool(true) {
+        format!("no message or tool call in the first {elapsed}")
+    } else {
+        format!("no activity for {elapsed}")
+    }
+}
+
 pub fn event_line(e: &Event, agent: Agent) -> String {
     let who = format!("[{} {}]", e.task, agent_name(agent));
     let s = |k: &str| get(e, k).as_str().unwrap_or("").to_string();
@@ -181,6 +191,9 @@ pub fn event_line(e: &Event, agent: Agent) -> String {
                 line.push_str(&format!("; waiting for your answer to {}", open.join(", ")));
             }
             line
+        }
+        "stalled" if get(e, "initial") == &Value::Bool(true) => {
+            format!("{who} {} (still running)", stall_description(e))
         }
         "stalled" => format!("{who} no activity for {}s (still running)", n("quiet_secs")),
         "failed" => format!("{who} failed: {}", clip(&s("error"), LINE)),

@@ -429,7 +429,10 @@ fn on_update(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
                 s.text.clear();
                 s.response_complete = false;
             }
-            s.text.push_str(u["content"]["text"].as_str().unwrap_or(""));
+            if let Some(text) = u["content"]["text"].as_str().filter(|s| !s.is_empty()) {
+                events.progress();
+                s.text.push_str(text);
+            }
             s.said = false;
         }
         "response_completed" => {
@@ -472,6 +475,7 @@ fn on_update(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
             });
         }
         "tool_call_update" => {
+            events.progress();
             let mut s = state.lock().unwrap();
             if let Some(id) = u["toolCallId"].as_str() {
                 if let Some(call) = s.tools.get_mut(id) {
@@ -675,7 +679,7 @@ mod tests {
     #[test]
     fn tool_updates_refine_one_call_and_keep_output_out_of_the_summary() {
         let state = Mutex::new(State::default());
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         update(
             &state,
             &events,
@@ -730,7 +734,7 @@ mod tests {
     #[test]
     fn admission_is_not_consumption_and_background_completion_keeps_session_alive() {
         let state = Mutex::new(State::default());
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         state.lock().unwrap().interjections.insert("one".into());
         on_notification(
             "_x.ai/session/interjection",
@@ -770,7 +774,7 @@ mod tests {
             active: true,
             ..State::default()
         });
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         chunk(&state, &events, "FIRST-");
         on_notification("_x.ai/session/interjection", &json!({}), &state, &events);
         chunk(&state, &events, "ANSWER");
@@ -801,7 +805,7 @@ mod tests {
             outstanding: 1,
             ..State::default()
         });
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         chunk(&state, &events, "old answer");
         mark(&state, &events, "response_completed");
         chunk(&state, &events, "final ");
@@ -819,7 +823,7 @@ mod tests {
     #[test]
     fn tool_preamble_is_not_part_of_final_answer() {
         let state = Mutex::new(State::default());
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         chunk(&state, &events, "Checking files.");
         mark(&state, &events, "tool_call");
         mark(&state, &events, "response_completed");
@@ -843,7 +847,7 @@ mod tests {
             loading: true,
             ..State::default()
         });
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         let update = json!({"update": {"sessionUpdate": "model_changed", "model_id": "grok-4.6",
                                        "reasoning_effort": "low"}});
         on_notification("_x.ai/session_notification", &update, &state, &events);
@@ -868,7 +872,7 @@ mod tests {
             loading: true,
             ..State::default()
         });
-        let (events, _rx) = mpsc::unbounded_channel();
+        let (events, _rx) = Events::channel();
         chunk(&state, &events, "History");
         mark(&state, &events, "response_completed");
 

@@ -344,6 +344,13 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                 }
             }
         }
+        "item/agentMessage/delta"
+        | "item/commandExecution/outputDelta"
+        | "item/fileChange/outputDelta"
+            if p["delta"].as_str().is_some_and(|s| !s.is_empty()) =>
+        {
+            events.progress()
+        }
         "item/started" => match item["type"].as_str() {
             Some("commandExecution") => {
                 let detail = clip(item["command"].as_str().unwrap_or(""), 400);
@@ -354,6 +361,7 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                 });
             }
             Some("fileChange") => {
+                events.progress();
                 if let Some(id) = item["id"].as_str() {
                     state
                         .lock()
@@ -374,6 +382,13 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                     detail: String::new(),
                 });
             }
+            Some(
+                "webSearch"
+                | "dynamicToolCall"
+                | "collabAgentToolCall"
+                | "imageGeneration"
+                | "imageView",
+            ) => events.progress(),
             _ => {}
         },
         "item/completed" => match item["type"].as_str() {
@@ -394,6 +409,7 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                 state.lock().unwrap().last_message = text;
             }
             Some("fileChange") => {
+                events.progress();
                 if let Some(id) = item["id"].as_str() {
                     state.lock().unwrap().patches.remove(id);
                 }
@@ -591,7 +607,7 @@ mod tests {
     #[test]
     fn a_failed_review_is_told_once_apart_from_refusals() {
         let state = Mutex::new(State::default());
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         let review = |rationale: &str| {
             on_notification(
                 "item/autoApprovalReview/completed",
@@ -618,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_codex_resolves_is_withdrawn_unanswered() {
         let state = Mutex::new(State::default());
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         let (gone_tx, gone) = oneshot::channel();
         state
             .lock()
@@ -652,7 +668,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_decided_request_is_not_withdrawn() {
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         let (_gone_tx, gone) = oneshot::channel();
         let decision = tokio::spawn(super::super::ask_withdrawable_approval(
             &events,
@@ -682,7 +698,7 @@ mod tests {
     #[test]
     fn a_rerouted_turn_reports_the_model_it_moved_to() {
         let state = Mutex::new(State::default());
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         let rerouted = json!({"fromModel": "gpt-a", "toModel": "gpt-b", "reason": "x"});
         state.lock().unwrap().model = Some("gpt-a".into());
         on_notification("model/rerouted", &rerouted, &state, &events);
@@ -702,7 +718,7 @@ mod tests {
     #[test]
     fn user_item_needs_a_following_model_response() {
         let state = Mutex::new(State::default());
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         state.lock().unwrap().inputs.push(Some(1), "first");
         state.lock().unwrap().inputs.push(Some(2), "second");
         recorded(&state, &events, "first");
@@ -721,7 +737,7 @@ mod tests {
     #[test]
     fn each_agent_message_is_said_and_the_last_is_the_result() {
         let state = Mutex::new(State::default());
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         for text in ["Looking at the tests.", "  ", "All pass."] {
             on_notification(
                 "item/completed",
@@ -746,7 +762,7 @@ mod tests {
     #[test]
     fn recorded_at_turn_end_is_not_confirmed_by_the_next_turn() {
         let state = Mutex::new(State::default());
-        let (events, mut rx) = mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         state.lock().unwrap().inputs.push(Some(1), "late");
         recorded(&state, &events, "late");
         on_notification(

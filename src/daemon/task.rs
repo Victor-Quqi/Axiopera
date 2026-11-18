@@ -2,12 +2,13 @@
 //! process as soon as a turn ends with nothing else to do.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use serde_json::json;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
 use super::{Daemon, agent_env};
@@ -221,7 +222,107 @@ fn finish_exit(d: &Daemon, id: &str, exit: Exit) -> Result<()> {
     Ok(())
 }
 
+/// What an execution leaves for `drive` to wind up, however the execution ends.
+struct Live {
+    backend: Option<Backend>,
+    session_file: Option<PathBuf>,
+    events: mpsc::UnboundedReceiver<AgentEvent>,
+}
+
 async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>) -> Result<Exit> {
+    let (events, incoming) = agent::Events::channel();
+    let activity = events.activity();
+    let deadline = execution_deadline(d.lock().tasks.get(id).and_then(|e| e.task.timeout_secs));
+    let mut live = Live {
+        backend: None,
+        session_file: None,
+        events: incoming,
+    };
+    let execution = drive_agent(d, id, rx, events, &mut live, deadline);
+    let outcome = watch_stalls(d, id, activity, deadline, execution).await;
+    // A stall reminder that cannot be saved ends the execution from outside: the process is
+    // let go and its session recorded here, not by the execution.
+    let Some(backend) = &mut live.backend else {
+        return outcome;
+    };
+    backend.shutdown().await;
+    // Session announcements can precede a first turn whose admission never replies.
+    while let Ok(event) = live.events.try_recv() {
+        if let AgentEvent::Session { id: sid, file } = event {
+            d.try_update(id, |t| t.session = Some(sid))?;
+            if file.is_some() {
+                live.session_file = file;
+            }
+        }
+    }
+    record_session(d, id, live.session_file.as_deref())?;
+    outcome
+}
+
+/// Run an execution, telling the parent when its agent shows nothing for too long. The first
+/// reminder comes early: a start that hangs has nothing else to show for itself.
+async fn watch_stalls(
+    d: &Daemon,
+    id: &str,
+    mut activity: watch::Receiver<Option<Instant>>,
+    deadline: Option<Instant>,
+    execution: impl Future<Output = Result<Exit>>,
+) -> Result<Exit> {
+    tokio::pin!(execution);
+    let started = Instant::now();
+    let mut stalled = false;
+    let mut last = *activity.borrow_and_update();
+    loop {
+        let quiet_since = last.unwrap_or(started);
+        let limit = if last.is_some() {
+            d.stall_after()
+        } else {
+            d.stall_after().min(Duration::from_secs(120))
+        };
+        // No reminder due at the timeout or later: the timeout ends the execution first.
+        let warn_at = quiet_since
+            .checked_add(limit)
+            .filter(|at| deadline.is_none_or(|end| *at < end));
+        tokio::select! {
+            biased;
+            result = &mut execution => {
+                // The outcome stands even if the mark cannot be cleared; the next execution
+                // starts by clearing it.
+                if stalled && let Err(e) = d.try_update(id, |t| t.stalled = false) {
+                    d.log(&format!("clearing the stall mark of {id}: {e:#}"));
+                }
+                return result;
+            }
+            changed = activity.changed() => {
+                last = *activity.borrow_and_update();
+                if stalled {
+                    d.try_update(id, |t| t.stalled = false)?;
+                    stalled = false;
+                }
+                if changed.is_err() {
+                    return execution.await;
+                }
+            }
+            _ = sleep_until(warn_at), if !stalled => {
+                if !d.lock().tasks.get(id).is_some_and(|e| e.task.status == Status::Running && !e.releasing) {
+                    return execution.await;
+                }
+                d.try_update(id, |t| t.stalled = true)?;
+                d.try_emit(id, "stalled", json!({"quiet_secs": quiet_since.elapsed().as_secs(), "initial": last.is_none()}))?;
+                stalled = true;
+            }
+        }
+    }
+}
+
+async fn drive_agent(
+    d: &Arc<Daemon>,
+    id: &str,
+    rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    etx: agent::Events,
+    live: &mut Live,
+    deadline: Option<Instant>,
+) -> Result<Exit> {
     let (task, env, mut inputs) = {
         let mut st = d.lock();
         let e = st
@@ -266,7 +367,6 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
             .filter(|v| v == "1")
             .map(|_| d.opts.home.join("tasks").join(id).join("protocol.log")),
     };
-    let deadline = execution_deadline(task.timeout_secs);
     let timed_out = || {
         d.interrupt_children(id);
         Cancellation {
@@ -276,12 +376,11 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
         }
     };
     begin_execution(d, id)?;
-    let (etx, mut erx) = mpsc::unbounded_channel();
     // Starting can hang (an MCP server, a slow handshake): keep honouring cancel and the
     // deadline. Dropping the half-started backend kills its process.
     let start = Backend::start(&spec, &exe, etx);
     tokio::pin!(start);
-    let mut backend = loop {
+    let started = loop {
         tokio::select! {
             b = &mut start => break b?,
             cmd = rx.recv() => match cmd {
@@ -293,14 +392,19 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
             _ = sleep_until(deadline) => return Ok(Exit::Stopped(timed_out())),
         }
     };
-    let mut session_file = task.session_file.as_ref().map(|f| f.path.clone());
+    let Live {
+        backend,
+        session_file,
+        events: erx,
+    } = live;
+    let backend = backend.insert(started);
+    *session_file = task.session_file.as_ref().map(|f| f.path.clone());
     let mut waiting = VecDeque::new();
-    let outcome = async {
     macro_rules! request {
         ($future:expr) => {
             match wait_request($future, rx, &mut waiting, deadline, &timed_out).await {
                 Ok(result) => result,
-                Err(Exit::Stopped(cause)) => return Ok(cancel(&mut backend, cause).await),
+                Err(Exit::Stopped(cause)) => return Ok(cancel(backend, cause).await),
                 Err(exit) => {
                     backend.kill();
                     return Ok(exit);
@@ -308,33 +412,33 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
             }
         };
     }
-    request!(start_turn(d, id, &mut backend, &inputs))?;
-    let mut last_activity = Instant::now();
-    let mut stalled = false;
-    let mut tick = tokio::time::interval(Duration::from_secs(30));
+    request!(start_turn(d, id, backend, &inputs))?;
     let mut last_ok = true;
     let mut tracking = InputTracking::default();
     let mut deferred = Vec::new();
     let mut turn_open = true;
+    // Adapters do not report every change of `busy`: a background task or a native subagent
+    // can end without an event. Only the check at the top of the loop lets go of the process
+    // then, so the loop comes back to it by itself.
+    let mut recheck = tokio::time::interval(Duration::from_secs(30));
 
     let exit = loop {
         if !turn_open && erx.is_empty() {
             if !deferred.is_empty() {
                 let input = std::mem::take(&mut deferred);
                 if backend.busy()
-                    && request!(tracking.steer(d, id, task.agent, &mut backend, &input))?
-                        .is_some()
+                    && request!(tracking.steer(d, id, task.agent, backend, &input))?.is_some()
                 {
                     continue;
                 }
-                request!(start_turn(d, id, &mut backend, &input))?;
+                request!(start_turn(d, id, backend, &input))?;
                 turn_open = true;
                 continue;
             }
             if !backend.busy() {
                 match release_or_continue(d, id, rx, &mut waiting) {
                     Next::Turn(input) => {
-                        request!(start_turn(d, id, &mut backend, &input))?;
+                        request!(start_turn(d, id, backend, &input))?;
                         turn_open = true;
                     }
                     Next::Stop(exit) => break exit,
@@ -343,21 +447,16 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
         }
         tokio::select! {
             biased;
-            _ = sleep_until(deadline) => break cancel(&mut backend, timed_out()).await,
+            _ = sleep_until(deadline) => break cancel(backend, timed_out()).await,
             ev = erx.recv() => {
                 let Some(ev) = ev else {
                     break Exit::Failed("agent event stream closed".into());
                 };
-                last_activity = Instant::now();
-                if stalled {
-                    stalled = false;
-                    d.try_update(id, |t| t.stalled = false)?;
-                }
                 match ev {
                     AgentEvent::Session { id: sid, file } => {
                         d.try_update(id, |t| t.session = Some(sid))?;
                         if file.is_some() {
-                            session_file = file;
+                            *session_file = file;
                         }
                     }
                     AgentEvent::Tool { id: call, name, detail } => d.try_emit(id, "tool", json!({"id": call, "name": name, "detail": detail}))?,
@@ -394,7 +493,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                         }
                         last_ok = ok;
                         turn_open = false;
-                        let next = next_input(d, id, rx, &mut waiting, &mut backend).await;
+                        let next = next_input(d, id, rx, &mut waiting, backend).await;
                         let mut stop = None;
                         match next {
                             Some(Next::Turn(input)) => deferred.extend(input),
@@ -434,7 +533,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
             } => match cmd {
                 Some(Cmd::Input(input)) => {
                     if backend.busy() {
-                        match request!(tracking.steer(d, id, task.agent, &mut backend, std::slice::from_ref(&input.text)))? {
+                        match request!(tracking.steer(d, id, task.agent, backend, std::slice::from_ref(&input.text)))? {
                             Some(how) => {
                                 let _ = input.reply.send(how);
                             }
@@ -446,7 +545,7 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                         deferred.push(input.queued());
                     } else {
                         let text = input.queued();
-                        request!(start_turn(d, id, &mut backend, &[text]))?;
+                        request!(start_turn(d, id, backend, &[text]))?;
                         turn_open = true;
                     }
                 }
@@ -458,37 +557,20 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
                         keep_mail(d, id, msg);
                     }
                 }
-                Some(Cmd::Cancel(cause)) => break cancel(&mut backend, cause).await,
+                Some(Cmd::Cancel(cause)) => break cancel(backend, cause).await,
                 Some(Cmd::Abort) | None => {
                     backend.kill();
                     break Exit::Aborted;
                 }
             },
-            _ = tick.tick() => {
-                if backend.busy() && !stalled && last_activity.elapsed() >= d.stall_after() {
-                    stalled = true;
-                    d.try_update(id, |t| t.stalled = true)?;
-                    d.try_emit(id, "stalled", json!({"quiet_secs": last_activity.elapsed().as_secs()}))?;
-                }
-            }
+            _ = recheck.tick() => {}
         }
     };
 
-    if let Exit::Released = exit { settle_release(d, id, last_ok)?; }
-    Ok(exit)
-    }.await;
-    backend.shutdown().await;
-    // Session announcements can precede a first turn whose admission never replies.
-    while let Ok(event) = erx.try_recv() {
-        if let AgentEvent::Session { id: sid, file } = event {
-            d.try_update(id, |t| t.session = Some(sid))?;
-            if file.is_some() {
-                session_file = file;
-            }
-        }
+    if let Exit::Released = exit {
+        settle_release(d, id, last_ok)?;
     }
-    record_session(d, id, session_file.as_deref())?;
-    outcome
+    Ok(exit)
 }
 
 /// Keep control commands live while a backend request holds the actor. Data commands
@@ -1308,12 +1390,19 @@ mod request_tests {
     }
 
     fn compile_peer(f: &Fixture) -> PathBuf {
-        let exe = directory(f).join(if cfg!(windows) { "codex.exe" } else { "codex" });
-        let source =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/fixtures/timeout_agent.rs");
+        compile(f, "codex", "timeout_agent")
+    }
+
+    /// The fixture `source`, built as the executable of the agent `name`.
+    fn compile(f: &Fixture, name: &str, source: &str) -> PathBuf {
+        let exe = directory(f).join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/daemon/fixtures")
+            .join(format!("{source}.rs"));
         let output = std::process::Command::new("rustc")
-            .args(["--edition=2021", "--crate-name=timeout_agent"])
-            .arg(source)
+            .arg("--edition=2021")
+            .arg(format!("--crate-name={source}"))
+            .arg(path)
             .arg("-o")
             .arg(&exe)
             .output()
@@ -1418,6 +1507,182 @@ mod request_tests {
         })
         .await
         .expect("fake peer was not reaped");
+    }
+
+    #[tokio::test]
+    async fn silence_before_and_after_admission_wakes_the_parent_once_until_output() {
+        let binary = fixture();
+        let exe = compile_peer(&binary);
+        for hang in ["initialize", "turn/start", "none"] {
+            let mut f = fixture();
+            Arc::get_mut(&mut f.d).unwrap().opts.stall = Duration::from_secs(600);
+            let dir = directory(&f);
+            prepare(&f, &exe, hang, 3600);
+            std::fs::write(dir.join("stream"), "").unwrap();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let d = f.d.clone();
+            let runner = tokio::spawn(async move { drive(&d, "test", &mut rx).await });
+            observed(&dir.join(if hang == "initialize" {
+                "initialize"
+            } else {
+                "turn-start"
+            }))
+            .await;
+
+            let stalls = || {
+                f.d.lock().tasks["test"]
+                    .deliverable
+                    .iter()
+                    .filter(|e| e.kind == "stalled")
+                    .map(|e| e.data["initial"].as_bool().unwrap())
+                    .collect::<Vec<_>>()
+            };
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(110)).await;
+            tokio::task::yield_now().await;
+            assert!(stalls().is_empty(), "{hang}");
+            tokio::time::advance(Duration::from_secs(11)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(stalls(), [true], "{hang}");
+            assert!(
+                f.d.reminder("codex:host")
+                    .unwrap()
+                    .0
+                    .contains("no message or tool call")
+            );
+            tokio::time::advance(Duration::from_secs(600)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(stalls(), [true]);
+            tokio::time::resume();
+
+            std::fs::write(dir.join("continue"), "").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !f.d.lock().tasks["test"].task.pending_inputs.is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                f.d.lock().tasks["test"].task.stalled,
+                "ACK cleared the warning"
+            );
+            std::fs::write(dir.join("speak"), "").unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while f.d.lock().tasks["test"].task.stalled {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(590)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(stalls(), [true]);
+            tokio::time::advance(Duration::from_secs(11)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(stalls(), [true, false]);
+            tokio::time::resume();
+            tx.send(Cmd::Abort).unwrap();
+            assert!(matches!(runner.await.unwrap().unwrap(), Exit::Aborted));
+            assert_reaped(&dir).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reminder_that_cannot_be_saved_still_winds_up_the_process_and_its_session() {
+        let binary = fixture();
+        let exe = compile_peer(&binary);
+        let f = fixture();
+        let dir = directory(&f);
+        prepare(&f, &exe, "turn/start", 3600);
+        let (_tx, mut rx) = mpsc::unbounded_channel();
+        let d = f.d.clone();
+        let runner = tokio::spawn(async move { drive(&d, "test", &mut rx).await });
+        observed(&dir.join("turn-start")).await;
+        // The session is announced by now, and the hung admission keeps it from being read.
+        assert!(f.d.lock().tasks["test"].task.session.is_none());
+        let blocker = dir.join("task.json.tmp");
+        std::fs::create_dir(&blocker).unwrap();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::task::yield_now().await;
+        std::fs::remove_dir(&blocker).unwrap();
+        tokio::time::resume();
+        // With its input closed, the peer exits once it has answered.
+        std::fs::write(dir.join("continue"), "").unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(10), runner)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_reaped(&dir).await;
+        assert!(outcome.is_err(), "the reminder was saved");
+        let saved = f.d.store.load_all().pop().unwrap();
+        assert!(!saved.stalled);
+        assert_eq!(saved.session.as_deref(), Some("fake-session"));
+        assert_eq!(
+            saved.session_file,
+            Fingerprint::of(&dir.join("session.jsonl"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_falls_idle_without_an_event_is_released() {
+        let binary = fixture();
+        let exe = compile(&binary, "claude", "background_agent");
+        let f = fixture();
+        let dir = directory(&f);
+        prepare(&f, &exe, "none", 3600);
+        f.d.try_update("test", |t| t.agent = Agent::Claude).unwrap();
+        // Keeps the adapter's session path out of the real Claude directory.
+        f.d.lock()
+            .tasks
+            .get_mut("test")
+            .unwrap()
+            .env
+            .as_mut()
+            .unwrap()
+            .push((
+                "CLAUDE_CONFIG_DIR".into(),
+                dir.to_string_lossy().into_owned(),
+            ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let d = f.d.clone();
+        let runner = tokio::spawn(async move { drive(&d, "test", &mut rx).await });
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while f.d.lock().tasks["test"].task.turns == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // The adapter reads the peer's lines in its own time: each round is one more check.
+        let check = || async {
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(31)).await;
+            tokio::time::resume();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        check().await;
+        let early = runner.is_finished();
+        std::fs::write(dir.join("continue"), "").unwrap();
+        observed(&dir.join("background-ended")).await;
+        for _ in 0..100 {
+            if runner.is_finished() {
+                break;
+            }
+            check().await;
+        }
+        // A process that is still held ends here, for a failure to leave nothing running.
+        let _ = tx.send(Cmd::Abort);
+        let exit = runner.await.unwrap().unwrap();
+        assert_reaped(&dir).await;
+        assert!(!early, "released under a running background task");
+        assert!(
+            matches!(exit, Exit::Released),
+            "the idle backend kept its process"
+        );
+        assert_eq!(f.d.lock().tasks["test"].task.status, Status::Idle);
     }
 
     #[tokio::test]
@@ -1544,7 +1809,7 @@ mod request_tests {
             resume: None,
             trace: None,
         };
-        let (events, _events) = mpsc::unbounded_channel();
+        let (events, _events) = agent::Events::channel();
         let mut backend = Backend::start(&spec, &exe, events).await.unwrap();
         let (tx, mut rx) = mpsc::unbounded_channel();
         // The backend startup completed, but the actor has not consumed the Mail command.

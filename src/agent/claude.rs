@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn merged_replay_confirms_both_inputs_and_ignores_tool_results() {
         let state = Mutex::new(State::default());
-        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         state.lock().unwrap().inputs.push(None, "initial");
         state.lock().unwrap().inputs.push(Some(1), "first");
         state.lock().unwrap().inputs.push(Some(2), "second");
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn text_blocks_are_said_in_order_with_tool_calls() {
-        let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (events, mut rx) = Events::channel();
         on_assistant(
             &json!([
                 {"type": "thinking", "thinking": "private"},

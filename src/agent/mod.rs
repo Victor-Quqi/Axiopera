@@ -17,7 +17,8 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::time::Instant;
 
 use crate::ipc::{Agent, Tier};
 use crate::platform;
@@ -68,7 +69,46 @@ pub enum AgentEvent {
     Exited(String),
 }
 
-pub type Events = mpsc::UnboundedSender<AgentEvent>;
+#[derive(Clone)]
+pub struct Events {
+    tx: mpsc::UnboundedSender<AgentEvent>,
+    activity: watch::Sender<Option<Instant>>,
+}
+
+impl Events {
+    pub fn channel() -> (Self, mpsc::UnboundedReceiver<AgentEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (activity, _) = watch::channel(None);
+        (Self { tx, activity }, rx)
+    }
+
+    pub fn activity(&self) -> watch::Receiver<Option<Instant>> {
+        self.activity.subscribe()
+    }
+
+    // Streamed text is visible progress even before the completed message is journaled.
+    fn progress(&self) {
+        self.activity.send_replace(Some(Instant::now()));
+    }
+
+    fn send(&self, event: AgentEvent) -> Result<(), mpsc::error::SendError<AgentEvent>> {
+        let progress = matches!(
+            event,
+            AgentEvent::Said(_)
+                | AgentEvent::Tool { .. }
+                | AgentEvent::ToolUpdated { .. }
+                | AgentEvent::Approval(_)
+                | AgentEvent::Blocked(_)
+                | AgentEvent::FileChanged(_)
+                | AgentEvent::TurnEnded { .. }
+                | AgentEvent::Exited(_)
+        );
+        if progress || self.activity.borrow().is_some() {
+            self.progress();
+        }
+        self.tx.send(event)
+    }
+}
 
 #[derive(Debug)]
 pub struct Approval {

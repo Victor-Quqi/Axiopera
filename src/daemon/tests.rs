@@ -1353,6 +1353,22 @@ fn top_level_spawns_stop_at_the_limit_while_nested_ones_go_on() {
 }
 
 #[test]
+fn the_stall_time_is_a_minute_at_least_and_never_overflows() {
+    let f = fixture();
+    let stall = |minutes: u64| {
+        std::fs::write(
+            f.home.join("config.toml"),
+            format!("stall_minutes = {minutes}\n"),
+        )
+        .unwrap();
+        super::options(f.home.clone()).unwrap().stall
+    };
+    assert_eq!(stall(0), Duration::from_secs(60));
+    assert_eq!(stall(3), Duration::from_secs(180));
+    assert_eq!(stall(i64::MAX as u64), Duration::from_secs(u64::MAX));
+}
+
+#[test]
 fn sequence_numbers_go_on_after_gc_removed_every_task() {
     let f = fixture();
     f.d.emit("test", "turn_ended", json!({"turn": 1}));

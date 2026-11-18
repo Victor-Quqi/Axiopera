@@ -60,5 +60,14 @@ fn main() {
         };
         println!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}");
         std::io::stdout().flush().unwrap();
+        if method == "turn/start" && root.join("stream").exists() {
+            while !root.join("speak").exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            println!(
+                r#"{{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{{"delta":"Working"}}}}"#
+            );
+            std::io::stdout().flush().unwrap();
+        }
     }
 }

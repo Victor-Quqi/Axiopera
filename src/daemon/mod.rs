@@ -2306,10 +2306,7 @@ impl Daemon {
                 s("id"),
                 agent::clip(s("summary"), render::PREVIEW)
             ),
-            "stalled" => format!(
-                "{who} no activity for {}",
-                render::duration(n("quiet_secs") * 1000)
-            ),
+            "stalled" => format!("{who} {}", render::stall_description(e)),
             "failed" => format!("{who} failed: {}", agent::clip(s("error"), render::PREVIEW)),
             "interrupted" => format!("{who} interrupted: {}", s("reason")),
             "cancelled" => format!("{who} cancelled: {}", s("reason")),
@@ -2902,11 +2899,13 @@ fn trim_log(path: &Path, cutoff_ms: u64) -> Result<()> {
 /// Defaults, overridden by `config.toml` in `home`.
 pub fn options(home: PathBuf) -> Result<Options> {
     let c = config::load(&home)?;
-    let minutes = |m: Option<u64>, default: u64| Duration::from_secs(m.unwrap_or(default) * 60);
+    let minutes =
+        |m: Option<u64>, default: u64| Duration::from_secs(m.unwrap_or(default).saturating_mul(60));
     Ok(Options {
         idle: Duration::from_secs(600),
         concurrency: c.concurrency.unwrap_or(50).max(1),
-        stall: minutes(c.stall_minutes, 10),
+        // Zero would call every pause between two outputs a stall.
+        stall: minutes(c.stall_minutes.map(|m| m.max(1)), 10),
         // Short, because a sub-agent waits for the decision and some hosts only see the request
         // when their turn ends; a denied sub-agent reports what it needed instead.
         approval_timeout: minutes(c.approval_timeout_minutes, 2),
