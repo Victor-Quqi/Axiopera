@@ -1,6 +1,6 @@
 # 后端协议与权限
 
-本文记录 Axiopera 依赖的后端行为，参数映射以 `src/agent/` 的实现为准。这些行为受版本限制，依据和已测版本见[验证与依据](verification.md)。
+本文记录 Axiopera 依赖的后端行为，参数映射以 `src/agent/` 的实现为准。已测版本见[验证与依据](verification.md)，升级时需重新判断的限制见[上游问题与复测](upstream-issues.md)。
 
 ## 权限
 
@@ -128,11 +128,13 @@ Codex、Grok 和 AGY 内置子 agent 的终端命令分别带有独立的 `CODEX
 | 宿主 | 本轮结束后 | 本轮进行中 | 方式 |
 |---|---|---|---|
 | Claude Code，含 VS Code 扩展 | 自动开启一轮 | 下一次工具调用前送达 | 后台运行 `wait`，退出后 `inbox` |
-| AGY | 后台命令完成后唤醒宿主 | 收到后台命令的完成消息后收取 | 后台运行 `axiopera wait`，收到完成消息后运行 `axiopera inbox` |
+| AGY | 后台 `wait` 完成后自动开新一轮 | 可在当前命令结束后、下一项工作开始前调用 `inbox` | 后台运行 `axiopera wait`，收到完成消息后运行 `axiopera inbox` |
 | Grok | 自动开启一轮 | 用 monitor 时下一次工具调用后送达；后台命令等本轮结束 | 用 monitor 运行 `watch`，再 `inbox` |
 | Codex TUI | 自动开启一轮 | 送入当前轮 | 推送 |
 | Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 默认等本轮结束；启用[插件](usage.md#skill-与-codex-插件) hook 后，下一次工具调用后提醒 | 门铃，插件 hook |
 | 其他 Codex 会话 | 不唤醒 | 不送达 | 轮询 `wait`，再 `inbox` |
+
+Windows 上 AGY 的命令沙箱会阻止 `wait` 和 `inbox` 连接本机 daemon。若命令提示需要提升权限，应通过 AGY 的单次审批在沙箱外运行该命令。宿主取子任务结果依赖正在等待的 `wait`；父级用 `axiopera send` 给托管 AGY 任务追加要求则直接走 ACP。
 
 Codex 的 guide 另要求派发或续接后在后台终端运行 [`watch --status`](usage.md#结果与接管)，用于显示任务进展。后台终端结束不会自动唤醒主 agent，结果交付仍按上表进行。CLI 可用 `/ps` 查看已登记的后台终端及最近输出；0.166.0 曾出现后台接口已有任务、`/ps` 未显示的情况，源码排查指向审批启动事件与实际启动事件的去重，尚未取得该次完整事件流确认。桌面端和 VS Code 扩展的显示效果尚未实测。
 

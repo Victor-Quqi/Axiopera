@@ -46,6 +46,7 @@ cargo package --locked --target-dir target/package-verify
 - `src/guide.md`：`axiopera guide` 的输出，面向主 agent，只保留完成协作所需的操作说明。以 `@claude `、`@codex `、`@grok `、`@agy ` 开头的行只属于该宿主，以 `@user` 开头的行只在调用方被识别为 `user` 时输出。修改命令时同步。
 - `docs/usage.md`：用户配置、任务操作和维护。
 - `docs/backends.md`：权限映射和协议差异。修改适配器前先查，修改后端行为时同步。
+- `docs/upstream-issues.md`：按宿主记录升级时要复测的上游问题，以及通过后可以撤除的限制或兼容代码。
 - `docs/verification.md`：已测版本、后端结论的依据和探针用法。新增或修改后端结论时在此登记依据，正文不标注来源。
 - `docs/design.md`：内部状态、持久化和并发机制。修改状态或交付逻辑时同步。
 - `plugins/axiopera/`：skill 只让 agent 去读 `axiopera guide --host`，说明写在 guide 里。插件改动可能让用户重新信任 hook，条件见[使用文档](usage.md#skill-与-codex-插件)；插件在 Codex 中留下的内容有变化时，同步 `src/plugin.rs` 和使用文档。`.codex-plugin/plugin.json` 的版本号与 `Cargo.toml` 一致，发版时一起改。
