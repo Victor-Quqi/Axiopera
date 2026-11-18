@@ -942,7 +942,15 @@ impl Daemon {
         let exe = agent::resolve_exe(agent, config.path.as_deref(), env)?;
         let mut query_env = agent_env(env, "", agent, &self.opts.home);
         query_env.retain(|(k, _)| !k.eq_ignore_ascii_case(identity::TASK_VAR));
-        let mut catalog = agent::models::query(agent, &exe, cwd, &query_env, timeout).await?;
+        let mut catalog = agent::models::query(
+            agent,
+            &exe,
+            cwd,
+            &query_env,
+            config.model.as_deref(),
+            timeout,
+        )
+        .await?;
         catalog.configured_model = config.model.clone();
         Ok(catalog)
     }

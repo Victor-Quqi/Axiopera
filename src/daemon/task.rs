@@ -247,13 +247,19 @@ async fn drive(d: &Arc<Daemon>, id: &str, rx: &mut mpsc::UnboundedReceiver<Cmd>)
         d.opts.agents.get(task.agent).path.as_deref(),
         &env,
     )?;
+    // AGY can restore the conversation with ACP defaults in a fresh process.
+    let (model, effort) = if task.agent == Agent::Agy && task.session.is_some() {
+        task.running_on()
+    } else {
+        (task.model.as_deref(), task.effort.as_deref())
+    };
     let spec = StartSpec {
         task_id: id.to_string(),
         agent: task.agent,
         tier: task.tier,
         cwd: task.cwd.clone(),
-        model: task.model.clone(),
-        effort: task.effort.clone(),
+        model: model.map(str::to_owned),
+        effort: effort.map(str::to_owned),
         env: agent_env(&env, id, task.agent, &d.opts.home),
         resume: task.session.clone(),
         trace: std::env::var_os("AXIOPERA_TRACE_PROTOCOL")

@@ -34,6 +34,60 @@ fn settings(reply: &Value, events: &Events) {
     }
 }
 
+fn data_dir(env: &[(String, String)]) -> PathBuf {
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    env.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(home))
+        .map(|(_, v)| PathBuf::from(v))
+        .unwrap_or_else(super::home_dir)
+        .join(".gemini/antigravity-cli")
+}
+
+pub(super) fn saved_model(env: &[(String, String)]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Preference {
+        model: String,
+    }
+    let file = std::fs::File::open(data_dir(env).join("settings.json")).ok()?;
+    let pref: Preference = serde_json::from_reader(std::io::BufReader::new(file)).ok()?;
+    Some(pref.model)
+}
+
+// The TUI saves a display label. ACP advertises the combined model/effort IDs
+// alongside its separate model-family picker.
+pub(super) fn preferred_variant<'a>(
+    session: &'a Value,
+    label: &str,
+    requested: Option<&str>,
+) -> Option<&'a str> {
+    let mut matches = session["models"]["availableModels"]
+        .as_array()?
+        .iter()
+        .filter(|row| row["name"] == label || row["modelId"] == label);
+    let variant = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    if let Some(model) = requested {
+        let family = option(session, "model")?["options"]
+            .as_array()?
+            .iter()
+            .find(|entry| entry["value"] == model)?["name"]
+            .as_str()?;
+        let name = variant["name"].as_str()?;
+        if name != family
+            && name
+                .rsplit_once(" (")
+                .filter(|(_, end)| end.ends_with(')'))
+                .map(|(base, _)| base)
+                != Some(family)
+        {
+            return None;
+        }
+    }
+    variant["modelId"].as_str()
+}
+
 #[derive(Default)]
 struct State {
     prompts: usize,
@@ -127,13 +181,31 @@ impl Agy {
         params["sessionId"] = json!(session);
         // Re-install session MCP tools on custom agents before the first prompt.
         let mut reply = rpc.call("session/resume", params).await?;
+        let mut model = spec.model.as_deref();
+        if spec.resume.is_none()
+            && (model.is_none() || spec.effort.is_none())
+            && let Some(label) = saved_model(&spec.env)
+            && let Some(variant) = preferred_variant(&reply, &label, model)
+        {
+            rpc.call(
+                "session/set_model",
+                json!({"sessionId":session,"modelId":variant}),
+            )
+            .await?;
+            model = None;
+        } else if spec.resume.is_some()
+            && option(&reply, "model").and_then(|v| v["currentValue"].as_str()) == model
+        {
+            // Re-selecting the same family can reset the resumed thinking level.
+            model = None;
+        }
         let mode = if spec.tier == Tier::Work {
             "auto"
         } else {
             "default"
         };
         for (key, value) in [
-            ("model", spec.model.as_deref()),
+            ("model", model),
             ("thought_level", spec.effort.as_deref()),
             ("mode", Some(mode)),
         ] {
@@ -148,15 +220,7 @@ impl Agy {
             }
         }
         settings(&reply, &events);
-        let brain = spec
-            .env
-            .iter()
-            .find(|(k, _)| {
-                k.eq_ignore_ascii_case(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
-            })
-            .map(|(_, v)| PathBuf::from(v))
-            .unwrap_or_else(super::home_dir)
-            .join(".gemini/antigravity-cli/brain");
+        let brain = data_dir(&spec.env).join("brain");
         let path = transcript(&brain, &session);
         let cursor = std::fs::metadata(&path).map_or(0, |f| f.len());
         let _ = events.send(AgentEvent::Session {
@@ -756,6 +820,45 @@ mod tests {
         std::fs::write(&path, format!("{done}{tail}")).unwrap();
         assert_eq!(indices(&mut journal), [3]);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn terminal_selection_uses_live_ids_and_matches_the_requested_family() {
+        let mut session = json!({
+            "models": {"availableModels":[
+                {"name":"Future (Preview) (Deep)", "modelId":"opaque-variant"},
+                {"name":"Fixed (Built-in)", "modelId":"fixed-variant"}
+            ]},
+            "configOptions":[{"id":"model","options":[
+                {"name":"Future (Preview)","value":"future-family"},
+                {"name":"Fixed (Built-in)","value":"fixed-family"}
+            ]}]
+        });
+        let label = "Future (Preview) (Deep)";
+        for saved in [label, "opaque-variant"] {
+            assert_eq!(
+                preferred_variant(&session, saved, None),
+                Some("opaque-variant")
+            );
+            assert_eq!(
+                preferred_variant(&session, saved, Some("future-family")),
+                Some("opaque-variant")
+            );
+            assert_eq!(
+                preferred_variant(&session, saved, Some("fixed-family")),
+                None
+            );
+        }
+        assert_eq!(
+            preferred_variant(&session, "Fixed (Built-in)", Some("fixed-family")),
+            Some("fixed-variant")
+        );
+        assert_eq!(preferred_variant(&session, "removed", None), None);
+        session["models"]["availableModels"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"name":label,"modelId":"another-variant"}));
+        assert_eq!(preferred_variant(&session, label, None), None);
     }
 
     #[test]

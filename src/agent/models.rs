@@ -27,6 +27,8 @@ pub struct Catalog {
     /// Axiopera's configured model, passed to spawns without --model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub configured_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configured_effort: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -57,7 +59,14 @@ impl Catalog {
             &self.native_model,
             &self.native_effort,
         ) {
-            (Some(model), _, _) => Some(format!("{} (Axiopera config)", single_line(model))),
+            (Some(model), _, _) => {
+                let effort = self
+                    .configured_effort
+                    .as_deref()
+                    .map(|v| format!(", effort {}", single_line(v)))
+                    .unwrap_or_default();
+                Some(format!("{}{effort} (Axiopera config)", single_line(model)))
+            }
             (None, Some(model), Some(effort)) => Some(format!(
                 "{}, effort {}",
                 single_line(model),
@@ -195,6 +204,7 @@ pub async fn query(
     exe: &Path,
     cwd: &Path,
     env: &[(String, String)],
+    configured_model: Option<&str>,
     timeout: Duration,
 ) -> Result<Catalog> {
     let args: Vec<String> = match agent {
@@ -220,7 +230,18 @@ pub async fn query(
     .map(str::to_owned)
     .collect();
     let (proc, stdout) = Proc::spawn_with(exe, &args, cwd, env, None)?;
-    query_process(agent, proc, stdout, cwd, timeout).await
+    let preference = (agent == Agent::Agy)
+        .then(|| super::agy::saved_model(env))
+        .flatten();
+    query_process(
+        agent,
+        proc,
+        stdout,
+        cwd,
+        timeout,
+        (preference.as_deref(), configured_model),
+    )
+    .await
 }
 
 async fn query_process(
@@ -229,9 +250,11 @@ async fn query_process(
     stdout: ChildStdout,
     cwd: &Path,
     timeout: Duration,
+    defaults: (Option<&str>, Option<&str>),
 ) -> Result<Catalog> {
     let mut lines = super::lines(stdout);
-    let result = tokio::time::timeout(timeout, discover(agent, &proc, &mut lines, cwd)).await;
+    let result =
+        tokio::time::timeout(timeout, discover(agent, &proc, &mut lines, cwd, defaults)).await;
     // Kill the whole job on success and error, including any startup helper processes.
     proc.job.kill();
     let _ = proc.child.wait().await;
@@ -243,6 +266,7 @@ async fn discover(
     proc: &Proc,
     lines: &mut Lines<BufReader<ChildStdout>>,
     cwd: &Path,
+    (preference, configured_model): (Option<&str>, Option<&str>),
 ) -> Result<Catalog> {
     let mut catalog = Catalog::default();
     match agent {
@@ -335,7 +359,7 @@ async fn discover(
         }
         Agent::Agy => {
             rpc(proc, lines, 1, "initialize", super::agy::initialize()).await?;
-            let session = rpc(
+            let mut session = rpc(
                 proc,
                 lines,
                 2,
@@ -343,12 +367,57 @@ async fn discover(
                 json!({"cwd":cwd,"mcpServers":[]}),
             )
             .await?;
+            let id = session["sessionId"].clone();
+            let preferred = preference
+                .and_then(|label| super::agy::preferred_variant(&session, label, None))
+                .map(str::to_owned);
+            let inherits_effort = preference.is_some_and(|label| {
+                super::agy::preferred_variant(&session, label, configured_model).is_some()
+            });
+            if let Some(model) = configured_model
+                && !inherits_effort
+                && super::agy::option(&session, "model")
+                    .and_then(|o| o["options"].as_array())
+                    .is_some_and(|rows| rows.iter().any(|row| row["value"] == model))
+            {
+                let configured = rpc(
+                    proc,
+                    lines,
+                    3,
+                    "session/set_config_option",
+                    json!({"sessionId":id,"configId":"model","value":model}),
+                )
+                .await?;
+                catalog.configured_effort = super::agy::option(&configured, "thought_level")
+                    .and_then(|o| string(o, "currentValue"));
+            }
+            if let Some(variant) = preferred {
+                rpc(
+                    proc,
+                    lines,
+                    4,
+                    "session/set_model",
+                    json!({"sessionId":id,"modelId":variant}),
+                )
+                .await?;
+                session = rpc(
+                    proc,
+                    lines,
+                    5,
+                    "session/resume",
+                    json!({"sessionId":id,"cwd":cwd,"mcpServers":[]}),
+                )
+                .await?;
+            }
             let choices =
                 super::agy::option(&session, "model").context("missing AGY model picker")?;
             catalog.models = parse_models(agent, &choices["options"])?;
             catalog.native_model = string(choices, "currentValue");
             if let Some(effort) = super::agy::option(&session, "thought_level") {
                 catalog.native_effort = string(effort, "currentValue");
+                if configured_model.is_some() && inherits_effort {
+                    catalog.configured_effort.clone_from(&catalog.native_effort);
+                }
                 if let Some(current) = catalog
                     .models
                     .iter_mut()
@@ -362,7 +431,7 @@ async fn discover(
             rpc(
                 proc,
                 lines,
-                3,
+                6,
                 "session/close",
                 json!({"sessionId":session["sessionId"]}),
             )
@@ -514,7 +583,15 @@ mod tests {
             &env,
             None,
         )?;
-        query_process(agent, proc, stdout, &std::env::current_dir()?, timeout).await
+        query_process(
+            agent,
+            proc,
+            stdout,
+            &std::env::current_dir()?,
+            timeout,
+            (None, None),
+        )
+        .await
     }
 
     #[test]
@@ -723,6 +800,7 @@ mod tests {
             native_model: Some("claude-opus".into()),
             native_effort: Some("xhigh".into()),
             configured_model: Some("custom".into()),
+            configured_effort: None,
         };
         // A configured model may take another default effort: none is named.
         assert_eq!(
