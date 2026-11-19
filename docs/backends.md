@@ -4,9 +4,7 @@
 
 ## 权限
 
-接入遵循用户对 harness 及其权限机制的选择。用户使用未加载权限插件的 Pi 时，托管任务沿用该原生行为。Axiopera 不为统一后端能力额外实现权限门控、安装权限插件、增加 reviewer，或启用用户未选择的自动审查组件。原生后端发出的审批请求由 Axiopera 转交，裁决只作用于本次请求。
-
-`read/work/full` 映射各后端已有的权限模式和工具开关，具体行为随后端而异；没有原生对应能力的档位标为不支持。缺少自动审查是原生能力差异，不作为接入缺口。消息通知、steer 所需的扩展另行评估，不承担新增权限控制。各后端的具体映射如下。
+`read/work/full` 使用各后端的原生权限模式和工具开关。Axiopera 转发原生审批，批准或拒绝只对该请求生效。
 
 | 档位 | Claude Code | Codex | Grok Build | Antigravity CLI |
 |---|---|---|---| --- |
@@ -16,7 +14,7 @@
 
 新建和续接会话都显式设置权限模式，用户规则由各后端执行。同档位的能力存在差异，`spawn` 回执会报告影响任务的限制。
 
-**AGY 1.5.11 的已知限制**：在 ACP 会话中，用户自定义的 deny 规则可能失效。例如，本应直接禁止的命令仍会进入审批，批准后可能执行。Axiopera 转发 AGY 的单次审批。AGY 续接时保留建会话时的工具列表，进出 read 档都要新建任务。
+AGY 1.5.11 的 ACP 默认权限模式会为用户在 `permissions.deny` 中明确禁止的命令请求审批。Axiopera 转发这类请求时，应选择拒绝。AGY 续接时保留建会话时的工具列表，进出 read 档都要新建任务。
 
 read 档允许 Claude 和 Codex 使用标注 `readOnlyHint:true` 且没有 `destructiveHint:true` 的 MCP 工具。Claude 适配器在每次调用时查询 `mcp_status`，按完整工具名检查注解；查询失败或 10 秒未返回就拒绝。Codex 使用原生注解判断。Grok 隐藏 `search_tool`、`use_tool`，因为 `agentProfile.disallowedTools` 无法逐个禁用 MCP 工具，ACP 状态也不提供注解。
 
@@ -78,7 +76,7 @@ AGY 在任务进程内创建或恢复 ACP 会话，注册任务专用 stdio MCP�
 
 ## 模型查询
 
-AGY 1.5.11 的 `agy acp` 新会话和交互终端可能使用不同的默认模型与强度。新任务只取终端设置 `~/.gemini/antigravity-cli/settings.json` 的 `model` 字段，在当前 ACP 返回的 `availableModels` 中匹配标签或 ID，通过 `session/set_model` 选中包含强度的组合。偏好缺失或匹配不到唯一选项时沿用 ACP 默认。`axiopera models agy` 先记录默认值，再在同一个临时会话中逐个选择模型，读取各自的 `thought_level` 菜单。查询结束后关闭会话，全程不发送提示词。AGY 跨进程续接时可能恢复成 ACP 的默认值，适配器会重新应用任务记录中上次实际使用的模型和强度。
+AGY 1.5.11 的 `agy acp` 新会话和交互终端可能使用不同的默认模型与强度。新任务只取终端设置 `~/.gemini/antigravity-cli/settings.json` 的 `model` 字段，在当前 ACP 返回的 `availableModels` 中匹配标签或 ID，通过 `session/set_model` 选中包含强度的组合。终端偏好缺失、匹配不到唯一选项或被 ACP 拒绝时，派发和查询均沿用 ACP 默认值，显式指定的模型和强度仍按请求设置。`axiopera models agy` 先记录默认值，再在同一个临时会话中逐个选择模型，读取各自的 `thought_level` 菜单。查询结束后关闭会话，全程不发送提示词。AGY 跨进程续接时可能恢复成 ACP 的默认值，适配器会重新应用任务记录中上次实际使用的模型和强度。
 
 模型列表通过原生进程查询，保留可直接选用的 ID，包括别名和第三方模型。Claude 取 stream-json `initialize` 响应的 `models`；Codex 取 app-server `model/list` 并遍历分页；Grok 取 ACP 扩展 `_x.ai/models/list`。旧版缺少接口时返回错误。
 
@@ -90,18 +88,20 @@ Claude 查询使用 `--no-session-persistence`，通过单次参数关闭 hook �
 
 ## 会话与消息
 
-| 接口 | Claude | Codex | Grok |
-|---|---|---|---|
-| 进程协议 | `-p`，stream-json 输入输出，启用 verbose、replay-user-messages 和 permission-prompts host | `app-server` JSON-RPC | `agent --no-leader stdio` ACP |
-| 新建 / 续接 | `--session-id` / `--resume` | `thread/start` / `thread/resume` | `session/new` / `session/load` |
-| 注入任务协议 | `--append-system-prompt` | `developerInstructions` | `_meta.rules` |
-| 模型 / 推理强度 | `--model` / `--effort` | `thread/start` 的 `model` / 每轮 `turn/start` 的 `effort` | `session/set_config_option` 的 `model` / `reasoning_effort` |
-| 实际模型 / 推理强度 | 启动后 `get_settings` 的 `applied`，每轮 `system/init` 的 `model`，`model_fallback` 的 `fallbackModel` | `thread/start`、`thread/resume` 回复的 `model`、`reasoningEffort`，`model/rerouted` 的 `toModel` | `model_changed` 更新的 `model_id`、`reasoning_effort`，`session/prompt` 回复的 `_meta.modelId` |
-| 开始一轮 | stdin user 消息 | `turn/start` | `session/prompt` |
-| 中途消息 | stdin user 消息 | `turn/steer` | `_x.ai/interject` |
-| 中断 | interrupt control request | `turn/interrupt` | `session/cancel` |
-| agent 说的话 | assistant 消息的 text block | 完成的 `agentMessage` | `agent_message_chunk` 累积到下一次工具调用、`response_completed` 或轮末 |
-| 最终结果 | `result.result` | 最后一条 `agentMessage` | 最后一段答复中，最后一次工具调用之后的文字 |
+| 接口 | Claude | Codex | Grok | AGY |
+|---|---|---|---| --- |
+| 进程协议 | `-p`，stream-json 输入输出，启用 verbose、replay-user-messages 和 permission-prompts host | `app-server` JSON-RPC | `agent --no-leader stdio` ACP | `agy acp` |
+| 新建 / 续接 | `--session-id` / `--resume` | `thread/start` / `thread/resume` | `session/new` / `session/load` | `session/new` 后接 `session/resume` / `session/resume` |
+| 注入任务协议 | `--append-system-prompt` | `developerInstructions` | `_meta.rules` | `_meta.antigravity.systemPrompt.append` |
+| 模型 / 推理强度 | `--model` / `--effort` | `thread/start` 的 `model` / 每轮 `turn/start` 的 `effort` | `session/set_config_option` 的 `model` / `reasoning_effort` | 见[模型查询](#模型查询) |
+| 实际模型 / 推理强度 | 启动后 `get_settings` 的 `applied`，每轮 `system/init` 的 `model`，`model_fallback` 的 `fallbackModel` | `thread/start`、`thread/resume` 回复的 `model`、`reasoningEffort`，`model/rerouted` 的 `toModel` | `model_changed` 更新的 `model_id`、`reasoning_effort`，`session/prompt` 回复的 `_meta.modelId` | 会话回复及 `config_option_update` 的 `model`、`thought_level` |
+| 开始一轮 | stdin user 消息 | `turn/start` | `session/prompt` | `session/prompt` |
+| 中途消息 | stdin user 消息 | `turn/steer` | `_x.ai/interject` | 同一会话追加 `session/prompt` |
+| 中断 | interrupt control request | `turn/interrupt` | `session/cancel` | `session/cancel` |
+| agent 说的话 | assistant 消息的 text block | 完成的 `agentMessage` | `agent_message_chunk` 累积到下一次工具调用、`response_completed` 或轮末 | `agent_message_chunk` 累积至工具调用或轮末 |
+| 最终结果 | `result.result` | 最后一条 `agentMessage` | 最后一段答复中，最后一次工具调用之后的文字 | 最后一次工具调用之后的文字，后台唤醒的答复取自父会话记录 |
+
+AGY 在审批期间拒收中途消息时，父级输入排入下一轮，兄弟留言随下一轮输入交付。
 
 Claude read 档另加 `--permission-prompt-tool stdio`，只加 `host` 时收不到该档位的审批请求。
 
@@ -136,7 +136,7 @@ Codex、Grok 和 AGY 内置子 agent 的终端命令分别带有独立的 `CODEX
 
 Windows 上 AGY 的命令沙箱会阻止 `wait` 和 `inbox` 连接本机 daemon。若命令提示需要提升权限，应通过 AGY 的单次审批在沙箱外运行该命令。宿主取子任务结果依赖正在等待的 `wait`；父级用 `axiopera send` 给托管 AGY 任务追加要求则直接走 ACP。
 
-Codex 的 guide 另要求派发或续接后在后台终端运行 [`watch --status`](usage.md#结果与接管)，用于显示任务进展。后台终端结束不会自动唤醒主 agent，结果交付仍按上表进行。CLI 可用 `/ps` 查看已登记的后台终端及最近输出；0.166.0 曾出现后台接口已有任务、`/ps` 未显示的情况，源码排查指向审批启动事件与实际启动事件的去重，尚未取得该次完整事件流确认。桌面端和 VS Code 扩展的显示效果尚未实测。
+Codex 的 guide 另要求派发或续接后在后台终端运行 [`watch --status`](usage.md#结果与接管)，用于显示任务进展。后台终端结束不会自动唤醒主 agent，结果交付仍按上表进行。CLI 可用 `/ps` 查看已登记的后台终端及最近输出；0.166.0 的 `/ps` 可能漏列已登记的后台终端。桌面端和 VS Code 扩展的显示效果尚未实测。
 
 Claude 和 Grok 由宿主进程在后台命令退出时唤醒，与界面无关。Claude 的内置子 agent 同样会被唤醒；agent team 的 teammate 空闲时不会被后台命令或 Monitor 唤醒，完成通知要等消息让它开启下一轮、再调用一次工具后才送达，因此 teammate 在前台运行 `wait`。子 agent 都会收到同会话可寻址 agent 的名单，普通子 agent 会因此自认 teammate；只有 teammate 收到的消息标明来自 `team-lead`，guide 用它区分两者。分屏模式的 teammate 未验证。Grok 的 monitor 把命令的每行输出作为一个事件：宿主忙时在当前这次工具调用之后送入本轮，空闲时开启一轮。monitor 每行保留 500 字节，最多连发 10 个事件，之后每 2 秒补 1 个，超出的丢弃；命令自行退出时，最后几行可能丢失。monitor 启动的命令没有 `GROK_SESSION_ID`，因此 `watch` 用 `--caller grok:<会话>` 指明调用方；`guide` 直接给出填好调用方的命令：Grok 会话填会话 ID，Grok 子 agent 填任务 ID。无人值守的 `grok -p` 默认等所有后台任务结束才退出，而 persistent monitor 不会自行结束，因此这样运行 Grok 时加 `--no-wait-for-background`，该选项不在 `--help` 中列出。Axiopera 不向 Claude inbox socket 推送，因为 Linux 上脱离宿主进程树的 daemon 会触发入站批准，而且该接口没有送达回执。
 

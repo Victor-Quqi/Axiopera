@@ -178,7 +178,7 @@ enum Command {
         #[arg(long, value_enum)]
         host: Option<Agent>,
     },
-    /// Serve ask, tell and answers as MCP tools; axiopera sets this up for Codex sub-agents.
+    /// Serve ask, tell and answers as MCP tools; axiopera sets this up for Codex and AGY sub-agents.
     #[command(hide = true)]
     Mcp {
         /// Serve the Codex plugin's hooks instead.

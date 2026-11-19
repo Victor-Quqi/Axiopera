@@ -53,6 +53,6 @@ cargo package --locked --target-dir target/package-verify
 
 增删命令或选项前，参考数据目录中 `daemon/requests.jsonl` 记录的实际用法，字段见[存储](design.md#存储)。
 
-事实的条件和例外与它写在一起；未验证的结论在正文注明。删除过时表述。探索记录留在忽略目录 `.local/`。
+文档只写事实、适用条件和依据。验证范围用平台、版本或提交号标识；省去日历日期、执行经过和中间判断。调研底稿保留来源链接。
 
 代码注释用英文，解释代码本身看不出的原因。优先修复可确认的缺陷。提交使用 Conventional Commits，探针改动使用 `test(spikes)`。

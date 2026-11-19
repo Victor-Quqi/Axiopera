@@ -1,16 +1,18 @@
 # 验证与依据
 
-[后端文档](backends.md)只写结论。这些结论来自真实 CLI 探针、手动实验或上游源码，受版本限制。本文集中记录已测版本、每条结论的依据和探针用法。
+[后端行为](backends.md)的验证范围、依据与探针用法。
 
 ## 已测版本
 
 | 平台 | 已验证范围 | CLI 版本 |
 |---|---|---|
-| Windows 11 | 三家互相派发、中途消息、续接、取消；read 档 MCP、消息确认、Codex elevated sandbox、宿主通知和 Codex 插件另有补测；Codex 0.164.0 还补测了作为宿主的端到端流程和中途消息 | 基础端到端为 Claude Code 2.1.296、Codex 0.162.1、Grok 1.0.52；补测为 Claude Code 2.1.302 至 2.1.312 及其 VS Code 扩展 2.1.301、Codex 0.163.0 和 0.164.0（推送所连 daemon 为 0.160.0）、Codex 桌面端内置 0.162.0-alpha.17.2 和 0.163.0-alpha.10.2、Grok 1.0.62 和 1.0.67 |
+| Windows 11 | 跨宿主派发、消息、续接与取消 | Claude Code 2.1.296、Codex 0.162.1、Grok 1.0.52 |
+| Windows 11 | read 档 MCP、Codex elevated sandbox、消费确认、宿主通知和插件 | Claude Code 2.1.302 至 2.1.312、VS Code 扩展 2.1.301；Codex 0.163.0、0.164.0，共享 daemon 0.160.0，桌面端内置 0.162.0-alpha.17.2、0.163.0-alpha.10.2；Grok 1.0.62、1.0.67 |
+| Windows 11 | [个人命令禁令、AGY 派发与宿主收件](#antigravity-cli-1511) | Antigravity CLI 1.5.7、1.5.11 |
 | Linux，WSL2 Ubuntu 24.04 | 三家原生 Linux CLI 的端到端流程、sandbox 回连、进程组取消和 Codex 宿主推送 | Claude Code 2.1.296、Codex 0.162.1、Grok 1.0.52 |
 | macOS | 有平台实现，真实 agent、sandbox 检测及回连尚未实测 | 未验证 |
 
-基础验证在 2026-10-13 至 14 日，补测在 2026-10-17 至 26 日。表中记录已测组合，最低版本尚未确定。
+最低支持版本尚未确定。
 
 ## 依据
 
@@ -18,9 +20,10 @@
 
 | 结论 | 依据 |
 |---|---|
-| [模型查询](backends.md#模型查询)：三家原生目录查询及推理强度字段；Codex 无效强度错误附模型列表；不带 `--model` 的任务按派发默认值运行，带 `--model`、`--effort` 的任务按请求运行，`status` 和每轮结果首行显示实际模型 | `models.py`、`models.py codex --errors`、`models.py --tasks`（Claude Code 2.1.316、Codex 0.166.0、Grok 1.0.67），Windows，Claude Code 2.1.309、Codex 0.164.0、Grok 1.0.67；查询不发推理请求，错误探针使用 Codex 在 `turn/start` 拒绝的非法强度。Claude 2.1.312 的 `resolvedModel` 另由 `axiopera models claude --json` 实测。派发默认值另经手动实验，Windows，Claude Code 2.1.316、Codex 0.166.0、Grok 1.0.67：Claude `get_settings` 与一轮中 `system/init` 的模型一致，Codex `config/read` 与 `thread/start` 回复一致，Grok `currentModelId` 与 `session/new` 一致；Grok 曾在同一配置下先后报告不同默认模型；Grok 1.0.67 的 info 日志显示新会话套用 campaign 的默认模型，规则见源码 [campaigns.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/util/config/campaigns.rs#L14-L56)、[session_setup.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs#L516-L535)，进程重新选择默认模型见 [resolution.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/remote_config/resolution.rs#L135-L232)、[manager/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/remote_config/manager/mod.rs#L1225-L1375)。字段映射、渲染、分页、空列表、禁用项、超时回收及错误分类由单元测试覆盖 |
-| [会话与消息](backends.md#会话与消息)：实际模型与推理强度的来源 | 手动实验，Windows：Claude Code 2.1.316 不经 initialize、不开启一轮即可 `get_settings`，`applied` 随 `--model`、`--effort` 变化，与一轮中 `system/init` 和 assistant 消息的模型一致；Codex 0.166.0 `thread/start` 回复的模型和强度与 `config/read` 一致；Grok 1.0.67 建立会话和每次设置配置项都发出 `model_changed`，`session/prompt` 回复的 `_meta.modelId` 与会话文件一致。Codex `model/rerouted` 依据 0.166.0 `generate-json-schema`，只影响当轮及空强度回退到目录默认值见源码 [session/mod.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/mod.rs#L4348-L4375)、[step_settings.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/step_settings.rs#L76-L87)；Claude `model_fallback` 的字段依据 2.1.316 二进制 |
-| [会话与消息](backends.md#会话与消息)：Grok ACP 会话忽略 `-m`、`--reasoning-effort`，`session/set_config_option` 生效，无效值返回 `-32602` | 手动实验，Windows，Grok 1.0.67：带参数和设置配置项各跑一轮，比较 `session/prompt` 回复的 `_meta.modelId`、`model_changed` 通知和会话文件中的模型与强度；无效模型和强度各设置一次。`GROK_DEFAULT_MODEL` 同样不改变新会话的模型。切换到另一 harness 时重建 agent、丢弃 profile 见源码 [model_switch.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs#L60-L175)、[mvp_agent/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs#L935-L948)；1.0.67 目录中的模型都是 `grok-build-plan`，拒绝路径由单元测试覆盖 |
+| [AGY 中途消息](backends.md#会话与消息) | Windows、AGY 1.5.2，接受追加消息时旧 prompt 提前返回 `end_turn`，等待审批时新 prompt 返回 `-32603`。本地协议测试覆盖两种应答、拒收后的持久化和下一轮交付。 |
+| [模型查询](backends.md#模型查询)：三家原生目录查询及推理强度字段；Codex 无效强度错误附模型列表；不带 `--model` 的任务按派发默认值运行，带 `--model`、`--effort` 的任务按请求运行，`status` 和每轮结果首行显示实际模型 | Windows，`models.py` 验证原生目录；`models.py codex --errors` 验证非法强度错误；`models.py --tasks` 验证派发默认值及显式覆盖。目录覆盖 Claude 2.1.309、Codex 0.164.0、Grok 1.0.67，派发覆盖 Claude 2.1.316、Codex 0.166.0、Grok 1.0.67。Claude 2.1.312 的 JSON 目录含 `resolvedModel`。Grok 的会话默认模型受服务端 campaign 影响。[campaigns.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/util/config/campaigns.rs#L14-L56)、[session_setup.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs#L516-L535)、[resolution.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/remote_config/resolution.rs#L135-L232)、[manager/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/remote_config/manager/mod.rs#L1225-L1375) |
+| [会话与消息](backends.md#会话与消息)：实际模型与推理强度的来源 | Windows。Claude 2.1.316 的 `get_settings.applied` 随显式模型、强度变化，可在首轮前读取；`model_fallback` 字段依据二进制。Codex 0.166.0 的 `thread/start` 与 `config/read` 一致，`model/rerouted` 的作用域和强度回退依据 schema 与源码。Grok 1.0.67 用 `model_changed` 报告配置变化，`session/prompt` 的 `_meta.modelId` 与会话文件一致。[session/mod.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/mod.rs#L4348-L4375)、[step_settings.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/step_settings.rs#L76-L87) |
+| [会话与消息](backends.md#会话与消息)：Grok ACP 会话忽略 `-m`、`--reasoning-effort`，`session/set_config_option` 生效，无效值返回 `-32602` | Windows、Grok 1.0.67 的 prompt 回复、`model_changed` 和会话文件。环境变量 `GROK_DEFAULT_MODEL` 也不覆盖新会话模型。该版本原生目录只有 `grok-build-plan`，跨 harness 重建 agent 的行为依据源码，read 档拒绝路径由单元测试覆盖。[model_switch.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs#L60-L175)、[mvp_agent/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs#L935-L948) |
 | [已测版本](#已测版本)中的端到端流程：主 agent 仅凭 `guide --host` 完成派发、收结果、追问和取消 | `host_e2e.py` |
 | [宿主通知](backends.md#宿主通知)：`grok -p` 等 persistent monitor 结束才退出，`--no-wait-for-background` 让它在本轮结束时退出 | `host_e2e.py grok` |
 | [权限](backends.md#权限)：read 档 MCP 工具按注解过滤 | `read_mcp.py` |
@@ -33,26 +36,26 @@
 | [权限](backends.md#权限)：Grok auto 分类器使用会话模型，失败或超时转为审批，无法解析时拒绝 | 源码 [sampler_turn.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs#L830-L873)、[manager/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-workspace/src/permission/manager/mod.rs#L1063-L1078)、[auto_mode/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-workspace/src/permission/auto_mode/mod.rs#L1480-L1499) |
 | [审批](backends.md#审批)：不使用持久化批准选项 | `codex_escalate.py`：Codex 的 amendment 会写入用户规则，`acceptForSession` 只缓存完全相同的命令 |
 | [审批](backends.md#审批)：后端自行拒绝时的返回形式 | `native_block.py` |
-| [审批](backends.md#审批)：Codex 撤回请求 | 手动实验，Windows、Codex 0.167.0，2026-11-07：read-only 加 on-request 的线程中，命令审批应答 decline 之后收到 `serverRequest/resolved`，`requestId` 与请求的 JSON-RPC ID 相同。网络请求在裁决前结束时撤回依据源码 0.167.0 [bespoke_event_handling.rs](https://github.com/openai/codex/blob/rust-v0.167.0/codex-rs/app-server/src/bespoke_event_handling.rs#L836-L846)、[outgoing_message.rs](https://github.com/openai/codex/blob/rust-v0.167.0/codex-rs/app-server/src/outgoing_message.rs#L232-L241)，未实测触发。适配器按 ID 撤回、daemon 作废并记录 `withdrawn` 由单元测试覆盖 |
+| [审批](backends.md#审批)：Codex 撤回请求 | Windows、Codex 0.167.0。命令审批收到 `decline` 后，`serverRequest/resolved.requestId` 与原 JSON-RPC 请求 ID 一致。网络请求在裁决前结束时的撤回行为依据上游源码。[bespoke_event_handling.rs](https://github.com/openai/codex/blob/rust-v0.167.0/codex-rs/app-server/src/bespoke_event_handling.rs#L836-L846)、[outgoing_message.rs](https://github.com/openai/codex/blob/rust-v0.167.0/codex-rs/app-server/src/outgoing_message.rs#L232-L241) |
 | [会话与消息](backends.md#会话与消息)：Claude read 档需另加 `--permission-prompt-tool stdio` | `read_mcp.py` |
 | [会话与消息](backends.md#会话与消息)：中途消息和消费确认 | `steer.py`、`message_receipts.py`；源码 [Codex tasks/mod.rs](https://github.com/openai/codex/blob/ce0323f2f2d3b25e82806cd555237da3db4e1897/codex-rs/core/src/tasks/mod.rs)、[Grok interjection.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/interjection.rs) |
-| [任务与工作目录](usage.md#任务与工作目录)：`send --tier` 保留会话并切换权限 | `tier_resume.py`，Windows，2026-10-29，Claude Code 2.1.312、Codex 0.165.0、Grok 1.0.67：`read → full → read` 三轮会话 ID 一致，full 轮将首轮记住的标记写入文件，切回 read 后文件保持不变。档位持久化、父子权限约束、运行中切换的拒绝和同档位中途消息由单元测试覆盖 |
+| [任务与工作目录](usage.md#任务与工作目录)：`send --tier` 保留会话并切换权限 | `tier_resume.py`，Windows、Claude Code 2.1.312、Codex 0.165.0、Grok 1.0.67。从 read 切至 full 再切回 read，会话 ID 一致，只有 full 档能写文件。档位持久化、父子档位约束和运行中切档由单元测试覆盖 |
 | [会话与消息](backends.md#会话与消息)：Grok 空闲时的消息，以及一次 prompt 内的多段答复 | `grok_idle_interject.py`、`grok_response_boundary.py` |
-| [会话与消息](backends.md#会话与消息)：Grok 工具名、参数摘要及后续更新 | 上游 [tool_calls.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs)、[use_tool/input.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/use_tool/input.rs)；适配器、daemon 和 `top` 的单元测试覆盖参数提取、MCP 展开、更新去重与调用计数；未新增真实 agent 探针 |
+| [会话与消息](backends.md#会话与消息)：Grok 工具名、参数摘要及后续更新 | 上游工具事件与 MCP 输入结构。适配器、daemon 和 `top` 单元测试覆盖参数提取、MCP 展开、更新去重和调用计数。[tool_calls.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs)、[use_tool/input.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/use_tool/input.rs) |
 | [会话与消息](backends.md#会话与消息)：后台命令结束后自行开启一轮 | `background.py` |
 | [结果与接管](usage.md#结果与接管)：审批请求先于更早的结果交出，交出前不能批准；过长的提问和留言只给首尾，全文写入文件；agent 自行开启的一轮从开始就计入进度 | `delivery.py` |
 | [会话与消息](backends.md#会话与消息)：并发续接 | `resume.py` |
-| [会话与消息](backends.md#会话与消息)：Grok 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `grok_native_identity.py`，Windows、Grok 1.0.67，2026-10-26：直接启动使用 auto，经 Axiopera 启动使用 work，再各派一个原生子 agent；原生子 agent 实际派发只读 Axiopera 任务，主代理先 `inbox` 未取走结果，子 agent 随后成功收取；另用采集的身份与预置结果检查原任务及子会话的归属 |
-| [会话与消息](backends.md#会话与消息)：Codex 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `codex_native_identity.py`，Windows、Codex 0.164.0，2026-10-26：直接启动使用 `danger-full-access`，经 Axiopera 启动使用 full，再各派一个原生子 agent；原生子 agent 实际派发只读 Axiopera 任务，主代理先 `inbox` 未取走结果，子 agent 随后成功收取；另用采集的身份与预置结果检查原任务及子线程的归属 |
+| [会话与消息](backends.md#会话与消息)：Grok 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `grok_native_identity.py`，Windows、Grok 1.0.67。原生 auto 宿主和 Axiopera work 宿主下，主会话均无法取走子会话的结果 |
+| [会话与消息](backends.md#会话与消息)：Codex 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `codex_native_identity.py`，Windows、Codex 0.164.0。原生 full 权限宿主（`danger-full-access`）和 Axiopera work 宿主下，主会话均无法取走子线程的结果 |
 | [宿主通知](backends.md#宿主通知)：Claude 和 Grok 在本轮进行中能否收到后台命令的完成通知 | `background.py busy` |
-| [宿主通知](backends.md#宿主通知)：Codex 后台状态显示 | `status_watch_*` 单元测试覆盖排队、工具进展、轮末后台工作、调用方隔离、交付并行和自动退出；guide 与 CLI 参数由单元测试覆盖。Windows、Codex 0.166.0，2026-11-03：`thread/backgroundTerminals/list` 已有 `watch --status`，用户反馈 `/ps` 未显示。源码 [启动事件去重](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/bespoke_event_handling.rs#L1075)与[界面登记](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/tui/src/chatwidget/command_lifecycle.rs#L35)符合审批先发无 process ID 事件的缺陷路径，归因尚缺该次事件流。后台命令结束不唤醒见 [async_watcher.rs](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/core/src/unified_exec/async_watcher.rs#L155-L243)。桌面端和 VS Code 扩展的显示效果未实测 |
-| [宿主通知](backends.md#宿主通知)：Claude 内置子 agent 和 agent team teammate 空闲时能否被唤醒 | 手动实验，Windows、Claude Code 2.1.312，2026-10-29：内置子 agent 和 in-process teammate 各后台运行 30 秒命令后结束本轮，用标记文件判断唤醒；子 agent 被唤醒，teammate 直到收到消息并再调用一次工具才收到通知；teammate 的 Monitor 事件同样不唤醒它。端到端：子 agent 后台运行 `axiopera wait` 后被唤醒并取到结果；teammate 前台运行 `wait`，自行调长 Bash 超时，等待 2 分 45 秒后取到结果。只给 guide 的取结果说明时，按现写法 3 个普通子 agent 后台运行 `wait`、2 个 teammate 前台运行，全部带任务 ID；不点明 `team-lead` 时普通子 agent 会自认 teammate，任务 ID 一句不说明共享收件箱或不以子 agent 为主语时常被跳过。已知问题见 [claude-code#91503](https://github.com/anthropics/claude-code/issues/91503) |
-| [宿主通知](backends.md#宿主通知)：Codex 推送通道，以及 TUI 退出后会话的卸载时间 | `codex_host_push.py`；手动实验：TUI 退出后轮询 `thread/loaded/list`，daemon 0.160.0 和 `--remote` 连接的 0.164.0 app-server 各一次；源码 0.162.0 [config_toml.rs](https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/config/src/config_toml.rs#L346-L348)、0.164.0 [config_toml.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/config/src/config_toml.rs#L349-L352) |
-| [宿主通知](backends.md#宿主通知)：Codex 用户消息的 `clientUserMessageId` 按 `clientId` 读回 | `codex_client_message_id.py`，Windows，2026-11-10 至 11 日，Codex 0.167.0 的私有 app-server：`turn/start` 和 `turn/steer` 的消息都按 `clientId` 读回，含制表符、行尾空格、CRLF 和末尾空行的正文逐字一致；`turn/steer` 的消息在被接受后立即读回时不在列表中，本轮结束后在；`thread/queue/add` 排入空闲会话的消息在它开启的一轮结束后按 `clientId` 读回；另起进程读未加载的会话，以及 `thread/resume` 之后，结果相同。旧版本未运行，只查源码：0.160.0 [turn_processor.rs](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/app-server/src/request_processors/turn_processor.rs#L618)、[thread_history.rs](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L517)；该字段及其处理自 0.136.0 的源码起存在，0.135.0 没有 |
+| [宿主通知](backends.md#宿主通知)：Codex 后台状态显示 | `status_watch_*` 测试覆盖后台状态与调用方隔离。Codex CLI 0.166.0 的 `thread/backgroundTerminals/list` 可列出 `/ps` 遗漏的任务；后台终端结束不会唤醒宿主。[启动事件去重](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/bespoke_event_handling.rs#L1075)、[界面登记](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/tui/src/chatwidget/command_lifecycle.rs#L35)、[async_watcher.rs](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/core/src/unified_exec/async_watcher.rs#L155-L243) |
+| [宿主通知](backends.md#宿主通知)：Claude 内置子 agent 和 agent team teammate 空闲时能否被唤醒 | Windows、Claude Code 2.1.312。后台 `wait` 完成可唤醒内置子 agent；in-process teammate 需要前台 `wait`，空闲时 Monitor 也无法唤醒它。[claude-code#91503](https://github.com/anthropics/claude-code/issues/91503) |
+| [宿主通知](backends.md#宿主通知)：Codex 推送通道，以及 TUI 退出后会话的卸载时间 | `codex_host_push.py`；TUI 退出后的 `thread/loaded/list`，覆盖共享 daemon 0.160.0 和 `--remote` 连接的 app-server 0.164.0。[config_toml.rs](https://github.com/openai/codex/blob/c1382380de69521303b416720a52f42d51af6248/codex-rs/config/src/config_toml.rs#L346-L348)、[config_toml.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/config/src/config_toml.rs#L349-L352) |
+| [宿主通知](backends.md#宿主通知)：Codex 用户消息的 `clientUserMessageId` 按 `clientId` 读回 | `codex_client_message_id.py`，Windows、Codex 0.167.0。start、steer 和 queue 消息在轮末可按 `clientId` 逐字读回，跨进程及 resume 后仍有效。steer 刚被接受时可能尚未入列表。字段自 0.136.0 源码起存在。[turn_processor.rs](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/app-server/src/request_processors/turn_processor.rs#L618)、[thread_history.rs](https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/codex-rs/app-server-protocol/src/protocol/thread_history.rs#L517) |
 | [宿主通知](backends.md#宿主通知)：只开关 feature 的 `-c` 不让 TUI 离开共享 daemon | 源码 Codex 0.164.0 [daemon_startup.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/tui/src/daemon_startup.rs#L90-L126) |
-| [宿主通知](backends.md#宿主通知)：Codex 门铃，包括宿主自行 `inbox` 后撤回提醒；app-server 客户端会话的来源为 `vscode` | `codex_doorbell.py` |
-| [宿主通知](backends.md#宿主通知)：Codex 插件 hook 在工具调用之后提醒，隐藏的工具仍可由 hook 调用；不调工具时由本轮之后的门铃提醒 | `codex_hooks.py`：hook 和 MCP 服务器经线程配置提供；原提示额外要求服从工具调用之间到达的指令，删去该句后的自主收件行为尚未复测；手动实验：在桌面端安装并信任插件后新建会话复测，缓存中插件的 `mcp.json` 临时直接设了 `AXIOPERA_HOME` |
-| [宿主通知](backends.md#宿主通知)：Grok monitor 在工具调用之后和空闲时送达 `watch` 的输出，以及它的速率和行长限制；monitor 启动的命令没有 `GROK_SESSION_ID` | `grok_monitor.py`：原提示额外要求服从调用间指令，删去该句后的自主收件行为尚未复测；手动实验：同一命令经 monitor 和终端工具各运行一次；源码 [Grok monitor rate_limiter.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/rate_limiter.rs)、[event.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/event.rs) |
+| [宿主通知](backends.md#宿主通知)：Codex 门铃，包括宿主自行 `inbox` 后撤回提醒；app-server 客户端会话的来源为 `vscode` | `codex_doorbell.py`；Windows、Codex 0.169.0 实测：宿主收件后队列提醒被撤回。撤回失败时 ledger 保留队列 ID，daemon 重启后重试；原生队列已无该项时清理本地 ID |
+| [宿主通知](backends.md#宿主通知)：Codex 插件 hook 在工具调用之后提醒，隐藏的工具仍可由 hook 调用；不调工具时由本轮之后的门铃提醒 | `codex_hooks.py` 验证 hook 与 MCP 的线程配置；桌面端实测覆盖已安装、已信任插件。自主收件的模型实测使用了服从调用间指令的提示 |
+| [宿主通知](backends.md#宿主通知)：Grok monitor 在工具调用之后和空闲时送达 `watch` 的输出，以及它的速率和行长限制；monitor 启动的命令没有 `GROK_SESSION_ID` | `grok_monitor.py`。会话变量依据 monitor 与终端子进程的环境差异；送达实测使用了服从调用间指令的提示；字节数与速率上限依据源码。[Grok monitor rate_limiter.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/rate_limiter.rs)、[event.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/grok_build/monitor/event.rs) |
 | [Skill 与 Codex 插件](usage.md#skill-与-codex-插件)：skill 的读取位置 | Grok 在隔离的主目录中用 `grok inspect` 实测；文档 [Claude skills](https://code.claude.com/docs/en/skills)；源码 [Codex host_roots.rs](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/ext/skills/src/host_roots.rs) |
 | [Skill 与 Codex 插件](usage.md#skill-与-codex-插件)：Codex 插件的安装、卸载和卸载后的残留，包括 hook 的信任记录和内容基线 | 手动实验：在临时 `CODEX_HOME` 中和桌面端分别安装、信任和卸载，再运行 `axiopera plugin cleanup`；源码 Codex 0.164.0 [plugin_trust.rs](https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/hooks/src/engine/plugin_trust.rs#L51-L117) |
 | [Skill 与 Codex 插件](usage.md#skill-与-codex-插件)：卸载不结束已打开会话中的 hook 进程 | 手动实验：桌面端 |
@@ -64,11 +67,24 @@
 | [宿主通知](backends.md#宿主通知)：不向 Claude inbox socket 推送 | 手动实验；文档 [Claude 跨会话消息](https://code.claude.com/docs/en/cross-session-messaging) |
 | [宿主通知](backends.md#宿主通知)：Windows 上 Codex 的退出码 | 手动实验；源码 [Codex shell.rs](https://github.com/openai/codex/blob/ce0323f2f2d3b25e82806cd555237da3db4e1897/codex-rs/core/src/shell.rs#L34-L40) |
 | [daemon 生命周期](design.md#daemon-生命周期)：Windows 进程存活、Job 取消和命名管道权限 | `daemon_job.py`、`ipc_sandbox.py`、`winproc/` |
-| [身份与 IPC](design.md#身份与-ipc)：Codex Windows sandbox 中的进程不能为 daemon 的管道另建实例，抢先创建的管道被客户端拒绝；sandbox 中的新旧客户端仍能连接 | `pipe_squat.py`，Windows、Codex 0.166.0，2026-11-04；未收紧 DACL 时，8 次连接中有 3 次落到 sandbox 另建的实例，且服务端进程核对没有发现 |
-| [身份与 IPC](design.md#身份与-ipc)：Linux 客户端在 sandbox 中启动 daemon 的条件 | 手动实验，WSL2、Grok 1.0.52、2026-11-04：`--sandbox workspace` 中数据目录在工作区外时启动失败，在工作区内时 daemon 在 sandbox 中启动、Grok 退出后仍在运行，且同一 sandbox 的 `gc` 被接受；Codex 0.162.1 `codex sandbox -P :read-only`、`:workspace` 不论 daemon 是否运行，`connect` 都收到 EPERM。Claude Code 2.1.296（装有 socat）默认 sandbox 中不论 daemon 是否运行都收到 EPERM；`sandbox.network.allowAllUnixSockets` 为 true 且数据目录在工作区内时，daemon 在 sandbox 中启动并接受同一 sandbox 的 `gc`，该条命令结束时随 PID 命名空间终止。macOS 依据用户反馈：Claude Code 命令 sandbox 中的首次调用启动了 daemon |
-| [指定调用方](usage.md#指定调用方)、跨机器的[宿主通知](backends.md#宿主通知)：会话变量传不过边界时用 `--caller` 分开收件，Claude 的后台 `wait` 和 Grok monitor 照常送达；子 agent 的 `--caller` 离不开所在任务 | 用户反馈，Ubuntu 24.04、Axiopera 0.3.2、本机 Claude Code 经 ssh 调用：spawn、send、后台 `wait` 唤醒和 `inbox` 正常，ssh 断开后 daemon 与任务继续运行，调用方因会话变量没有传过去成为 `user`。手动实验，2026-11-10：Windows 上的 Claude Code 2.1.322 经 `wsl.exe` 调用 WSL2 Ubuntu 中的 Axiopera，会话变量没有进入 WSL；带 `--caller` 派发的 Claude Code 2.1.296 read 档任务只对该会话可见，`user` 和另一会话的 `status` 都为空，`user` 的 `inbox` 也没有消息；后台 `wait` 退出后唤醒宿主，`inbox` 取到结果；不带 `--caller` 的 `guide --host claude` 给出指明调用方的提示。该子 agent 运行 `--caller user` 和 `--caller task:<其他任务>` 被客户端拒绝，以 `--caller claude:<任意>` 派发 full 档任务被 daemon 按档位拒绝。Grok 1.0.67 作宿主（ACP、yolo）时，提示只说明 Axiopera 在另一台机器上、经 `wsl.exe -d Ubuntu -e <axiopera>` 调用，未提 `--caller`：Grok 读 guide 后从 `GROK_SESSION_ID` 取会话 ID，此后每条命令都带 `--caller grok:<会话>`；monitor 经 `wsl.exe` 运行的 `watch` 在它忙时、下一次工具调用之后送达子任务完成的消息，随后 `inbox` 取到结果。组合规则和格式检查另由单元测试覆盖 |
+| [身份与 IPC](design.md#身份与-ipc)：Codex Windows sandbox 中的进程不能为 daemon 的管道另建实例，抢先创建的管道被客户端拒绝；sandbox 中的新旧客户端仍能连接 | `pipe_squat.py`，Windows、Codex 0.166.0；覆盖服务端进程身份与管道实例权限 |
+| [身份与 IPC](design.md#身份与-ipc)：Linux 客户端在 sandbox 中启动 daemon 的条件 | WSL2。Grok 1.0.52 允许工作区内的 daemon 启动并在宿主退出后继续运行。Codex 0.162.1 的 read-only、workspace 模式均阻止 socket 连接。Claude 2.1.296 默认阻止连接；允许 Unix socket 且数据目录在工作区内时，daemon 跟随 PID 命名空间退出。macOS 的 Claude sandbox 启动行为依据用户反馈 |
+| [指定调用方](usage.md#指定调用方)、跨机器的[宿主通知](backends.md#宿主通知)：会话变量传不过边界时用 `--caller` 分开收件，Claude 的后台 `wait` 和 Grok monitor 照常送达；子 agent 的 `--caller` 离不开所在任务 | Ubuntu 24.04、Axiopera 0.3.2 的 SSH 用户反馈；Windows Claude 2.1.322 和 Grok 1.0.67 经 WSL2 的实测。显式调用方隔离收件，Claude 后台 wait 可唤醒，Grok monitor 在工具调用之间送达；子任务仍受原任务的身份和档位限制 |
 
-提示词审查后的协议核对：`question_receipts_match_the_task_answer_route` 验证主会话与原生子会话的回执、实际回答队列和查询；`grok_spawn_receipts_use_the_callers_monitor` 验证 Grok 宿主、任务及混合原生会话的收件指引。拒绝原因按只读限制、审批通道断开和后端缺少批准选项分别表述。探针提示已删冗余和额外行为引导，历史实测对应原提示；新版仅作语法与本地断言核对，尚未重新调用真实模型。
+问题回执和回答队列由 `question_receipts_match_the_task_answer_route` 覆盖；Grok 宿主及子任务的收件指引由 `grok_spawn_receipts_use_the_callers_monitor` 覆盖。
+
+## Antigravity CLI 1.5.11
+
+Windows 11 上的原生 CLI 与 Axiopera 任务验证结果如下。
+
+| 范围 | 结果 |
+|---|---|
+| 个人命令禁令 | 对同一条按名称禁止的命令，`agy -p` 报告命中 `permissions.deny`。`agy acp --process-per-session` 在默认权限模式下，无论有无该规则都发出 `session/request_permission`。探针在两种条件下均回复拒绝；1.5.7 实测命令和文件操作经批准后执行。 |
+| 任务权限与续接 | read 可用 `list_directory` 查找未知文件、用 `read_file` 读取，并通过会话 MCP 调用 `answers`。目录工具拒绝指向工作区外的 Windows 目录联接。已有只读会话续接后也能使用目录工具。full 可写文件，可在原会话切至 work；切入 read 需要新任务。运行中的任务可取消。 |
+| 中途消息与宿主收件 | work 子任务可在本轮采纳 `send`，轮末未读数为零。宿主的后台 `wait` 可唤醒空闲会话；工作中的宿主可在相邻工具调用间用 `inbox` 取结果。Windows auto 沙箱中的 `wait` 和 `inbox` 需要获准在沙箱外运行。 |
+| 原生子会话 | work 父任务能在首轮结束后交付子任务结果。审批包含子会话 ID 和完整命令；双子会话的批准、拒绝和取消各自独立。模拟 ACP 覆盖并发创建部分失败、创建回复与子会话记录乱序、父会话答复先于子会话记录可读时的唤醒。 |
+| 模型与强度 | 同一目录下，原生终端使用 Hydrogen / High，原生 ACP 新会话使用 Argon / Medium。Axiopera 的查询及新任务继承可用的终端偏好；显式指定的模型和强度生效。跨进程续接保留任务原值。模拟 ACP 覆盖终端偏好被拒时的启动和目录回退。 |
+| 模型目录 | 文本和 JSON 均按模型列出强度。实测目录中，Argon、Flash、Opus、Sonnet 有 low、medium、high，Hydrogen 另有 xhigh，Orchestrator、GPT-OSS 无独立强度菜单。逐模型查询保留派发默认值。 |
 
 ## 探针
 
@@ -93,26 +109,3 @@ python spikes/read_mcp.py grok
 手动验证 daemon 时，用临时 `AXIOPERA_HOME` 隔离数据目录。测试结束后停止该 daemon，删除测试目录和测试创建的原生会话。`probe.forget_sessions` 清理指定测试工作目录下的 Claude、Grok 会话；Codex 会话需按探针取得的 thread ID 清理，`resume.py` 有 `thread/delete` 示例。
 
 协议排查可在启动测试 daemon 前设置 `AXIOPERA_TRACE_PROTOCOL=1`。原始收发内容写入 `tasks/<id>/protocol.log`，可能包含任务内容和工具参数。测试结束后连同测试数据目录删除。
-
-## Antigravity CLI 1.5.11
-
-2026-11-19 在 Windows 11 上使用隔离的 Axiopera daemon、工作区和 AGY 会话目录实测。通过 `axiopera models agy` 取得原生模型与强度。read 档用相对路径读到指定文件，通过会话 MCP 调用 `answers`，同会话续接取得第二轮结果。full 用 shell 写入标记文件，中途追加的要求出现在最终答复中。full 任务切到 work 后可续接，再切入 read 时被拒绝。运行中的任务可取消。
-
-work 档派发原生子 agent 写文件，父任务在首轮结束后收到子任务结果并交付了第二轮答复。另一次测试中，子 agent 运行需要审批的命令，Axiopera 的审批详情显示子会话 ID 和完整命令，经 `axiopera approve` 批准后脚本写出了标记。原生 ACP 双子会话探针另核对了分别允许、拒绝和取消时的审批归属。
-
-另用隔离 daemon 与模拟 ACP 回放两个并发创建请求，一次成功、一次失败。让成功子会话的创建记录、完成消息和父会话的第二轮答复在同一次读取中出现。修复前仅交付第一轮，修复后两轮均可取回。单元测试另覆盖子会话记录早于创建回复，以及不同父会话同时创建子会话。
-
-AGY 作为宿主的收件实测使用两个独立的 ACP 会话和隔离的 Axiopera daemon。子任务返回一个只有它知道的随机值。以宿主实际运行 `axiopera inbox` 并把该值写入文件作为送达证据。
-
-- 空闲唤醒：宿主后台启动 `axiopera wait`，收到首轮 `end_turn` 后才放行子任务。子任务结束后，宿主自行调用 `inbox`，正确写回随机值；期间没有再发送 prompt。
-- 工作中收件：在宿主执行第一条独立命令时放行子任务，收到结果后才让该命令结束。关闭命令审批的对照中，实际顺序是第一条命令结束、`inbox`、写回随机值，宿主首轮仍未结束。
-- Windows 沙箱宿主（auto 模式）：后台 `wait` 首次在沙箱内执行，返回无法连接 daemon。AGY 自行重试，测试客户端对 `wait` 和 `inbox` 的沙箱外请求分别批准一次。宿主在第二条与第三条命令之间写回正确值，随后完成第三条命令并结束本轮。本次从子任务结果就绪到宿主写回约 135 秒。另测空闲宿主直接申请在沙箱外运行等待命令，结束首轮后才放行子任务。宿主自行申请收件权限并写回正确值，结果就绪到写回约 80 秒。
-- AGY 作为 work 档子任务：等第一条 shell 命令确已启动，再用 `axiopera send` 更改下一步要写入的值。该任务只调用一次 `write_file`，文件内容是新值，轮末未读数为零。
-
-AGY 终端模型偏好（Windows，1.5.11）：同一工作目录中，直接启动交互终端显示 Hydrogen / High，原生 ACP 新会话报告 Argon / Medium。适配后用独立 daemon 和会话目录实测：终端偏好为 Hydrogen / High 时，模型查询、无参数派发、显式选 Hydrogen 都得到 Hydrogen / High；只指定 low 得到 Hydrogen / Low；只选 Argon 得到 Argon / Medium。将偏好改为 Argon / Low 后，重新查询得到新值，跨进程续接之前的 Hydrogen 任务仍运行在 High。匹配新型号的单元测试使用虚构模型名和不含型号信息的 ID。
-
-Windows 上用安装版 `axiopera models agy` 对照 AGY 1.5.11 的 ACP 菜单。文本与 JSON 均列出 Argon、Flash、Opus 和 Sonnet 的 low、medium、high 三档，Hydrogen 另有 xhigh。Orchestrator 和 GPT-OSS 均无强度菜单，GPT-OSS 的原生名称标明 Medium。逐个切换后，查询结果仍报告用户的派发默认值 Hydrogen / High。协议回归测试另覆盖 Axiopera 配置的默认模型仍在目录中、选择时被 ACP 拒绝的情况，其余模型和强度菜单仍可查询。
-
-AGY 1.5.11 只读目录实测（Windows）：在任务目录和中文子目录分别放入一份未告知文件名的 CSV。AGY 调用两次 `list_directory`、两次 `read_file`，得到正确总额 14.74。升级前缺少目录工具的只读会话用 `send` 续接后也能发现并读取 CSV。指向工作区外的 Windows 目录联接被目录工具拒绝。先回答币种再收取第一轮结果，回执没有重复催答，下一轮给出 14.74 EUR；任务空闲后，`inbox` 和 `wait` 均返回退出码 4。
-
-Windows、Codex 0.169.0 的提醒撤回复测：AGY 子任务返回 7.59，Codex 宿主保持当前轮运行。确认提醒已入真实队列后执行 `inbox` 并立即停止 daemon，再结束宿主当前轮，队列为空，宿主没有额外轮次。另回放同一结果，在收件前暂时移走隔离环境的 Codex 可执行文件，确认结果交付成功、队列 ID 仍在 ledger；恢复文件并重启 daemon 后自动撤回。提前从 Codex 队列删掉提醒的对照也清除了本地 ID。

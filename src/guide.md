@@ -60,7 +60,7 @@ Answer questions
 Use `send <task> -f msg.md` or `reply <question> -f answer.md`; use `-` to read stdin.
 
 Sub-agents can talk to each other: give them each other's task IDs and tell them to run
-`axiopera tell <task> "..."` (Codex sub-agents have it as the `tell` tool). You get a copy of
+`axiopera tell <task> "..."` (Codex and AGY sub-agents have it as the `tell` tool). You get a copy of
 every note.
 
 Inspect and stop
