@@ -20,8 +20,12 @@ pub enum Incoming {
         method: String,
         params: Value,
     },
-    /// The reply to a `request_in_order`, queued behind the messages that preceded it.
-    Reply(Result<Value, RpcError>),
+    /// The reply to the `request_in_order` with this ID, queued behind the messages that
+    /// preceded it.
+    Reply {
+        id: u64,
+        result: Result<Value, RpcError>,
+    },
 }
 
 #[derive(Debug)]
@@ -75,18 +79,40 @@ impl Rpc {
         params: Value,
     ) -> std::io::Result<oneshot::Receiver<Result<Value, RpcError>>> {
         let (tx, rx) = oneshot::channel();
-        self.send_request(Slot::Waiter(tx), method, params).await?;
+        self.send_request(self.reserve(), Slot::Waiter(tx), method, params)
+            .await?;
         Ok(rx)
     }
 
     /// Send a request whose reply arrives as `Incoming::Reply`, after every notification the
     /// agent sent before it. A separate waiter could see the reply before those.
     pub async fn request_in_order(&self, method: &str, params: Value) -> std::io::Result<()> {
-        self.send_request(Slot::InOrder, method, params).await
+        self.request_in_order_as(self.reserve(), method, params)
+            .await
     }
 
-    async fn send_request(&self, slot: Slot, method: &str, params: Value) -> std::io::Result<()> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+    /// The ID of a request to come, for a caller that must know it before the reply can arrive.
+    pub fn reserve(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// `request_in_order` under an ID from `reserve`.
+    pub async fn request_in_order_as(
+        &self,
+        id: u64,
+        method: &str,
+        params: Value,
+    ) -> std::io::Result<()> {
+        self.send_request(id, Slot::InOrder, method, params).await
+    }
+
+    async fn send_request(
+        &self,
+        id: u64,
+        slot: Slot,
+        method: &str,
+        params: Value,
+    ) -> std::io::Result<()> {
         self.pending.lock().unwrap().insert(id, slot);
         self.writer
             .send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
@@ -152,10 +178,8 @@ async fn read_loop(
                 let _ = tx.send(Incoming::Notification { method, params });
             }
             (Some(id), None) => {
-                let Some(slot) = id
-                    .as_u64()
-                    .and_then(|id| pending.lock().unwrap().remove(&id))
-                else {
+                let Some(id) = id.as_u64() else { continue };
+                let Some(slot) = pending.lock().unwrap().remove(&id) else {
                     continue;
                 };
                 let result = match msg.get("error") {
@@ -171,7 +195,7 @@ async fn read_loop(
                 };
                 let _ = match slot {
                     Slot::Waiter(tx) => tx.send(result).ok(),
-                    Slot::InOrder => tx.send(Incoming::Reply(result)).ok(),
+                    Slot::InOrder => tx.send(Incoming::Reply { id, result }).ok(),
                 };
             }
             (None, None) => {}
@@ -179,4 +203,19 @@ async fn read_loop(
     }
     // Fail whatever is still waiting.
     pending.lock().unwrap().clear();
+}
+
+#[cfg(test)]
+impl Rpc {
+    /// Without an agent: every request fails as it is sent.
+    pub fn closed() -> Rpc {
+        Rpc {
+            writer: Writer {
+                stdin: Arc::default(),
+                trace: super::Trace::default(),
+            },
+            next_id: Arc::new(AtomicU64::new(1)),
+            pending: Arc::default(),
+        }
+    }
 }

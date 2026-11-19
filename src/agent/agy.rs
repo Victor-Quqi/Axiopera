@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use super::rpc::{Incoming, Rpc};
+use super::rpc::{Incoming, Rpc, RpcError};
 use super::{AgentEvent, Decision, Events, Inputs, Proc, StartSpec, Steer};
 use crate::{identity, ipc::Tier, paths};
 
@@ -88,9 +88,16 @@ pub(super) fn preferred_variant<'a>(
     variant["modelId"].as_str()
 }
 
+struct PendingSteer {
+    request: u64,
+    input: Option<u64>,
+    admitted: oneshot::Sender<Steer>,
+}
+
 #[derive(Default)]
 struct State {
-    prompts: usize,
+    prompt: Option<u64>,
+    steering: Option<PendingSteer>,
     inputs: Inputs,
     text: String,
     // Root tools still running beyond the end of the originating prompt.
@@ -99,6 +106,47 @@ struct State {
     spawns: HashMap<String, Option<Instant>>,
     children: HashSet<String>,
     waking: bool,
+}
+
+impl State {
+    fn replied(&mut self, id: u64, reply: Result<Value, RpcError>, events: &Events) {
+        if self.prompt != Some(id) && !self.steering.as_ref().is_some_and(|s| s.request == id) {
+            return;
+        }
+        if let Some(steer) = self.steering.take() {
+            // AGY either ends the previous prompt on admission or rejects the new
+            // prompt while the previous one keeps running (e.g. during approval).
+            if id == steer.request && reply.is_err() {
+                if steer.input.is_some() {
+                    self.inputs.0.retain(|(id, _)| *id != steer.input);
+                }
+                let _ = steer.admitted.send(Steer::NoActiveTurn);
+                return;
+            }
+            self.prompt = Some(steer.request);
+            let _ = steer.admitted.send(Steer::Accepted);
+            if id != steer.request {
+                return;
+            }
+        }
+        self.prompt = None;
+        let (error, usage) = match reply {
+            Ok(r) => {
+                let stop = r["stopReason"].as_str().unwrap_or("unknown");
+                (
+                    (stop != "end_turn").then(|| stop.to_owned()),
+                    r.get("usage").cloned(),
+                )
+            }
+            Err(e) => (Some(e.to_string()), None),
+        };
+        let _ = events.send(AgentEvent::TurnEnded {
+            ok: error.is_none(),
+            result: std::mem::take(&mut self.text),
+            error,
+            usage,
+        });
+    }
 }
 
 pub struct Agy {
@@ -195,12 +243,11 @@ impl Agy {
             && let Some(label) = saved_model(&spec.env)
             && let Some(variant) = preferred_variant(&reply, &label, model)
         {
-            rpc.call(
-                "session/set_model",
-                json!({"sessionId":session,"modelId":variant}),
-            )
-            .await?;
-            model = None;
+            // An unavailable terminal preference must not prevent explicit overrides below.
+            let choice = json!({"sessionId":session,"modelId":variant});
+            if rpc.call("session/set_model", choice).await.is_ok() {
+                model = None;
+            }
         } else if spec.resume.is_some()
             && option(&reply, "model").and_then(|v| v["currentValue"].as_str()) == model
         {
@@ -266,45 +313,54 @@ impl Agy {
     }
 
     pub async fn turn(&mut self, text: &str) -> Result<()> {
-        self.prompt(text, None).await
-    }
-    async fn prompt(&self, text: &str, id: Option<u64>) -> Result<()> {
+        let request = self.rpc.reserve();
         {
-            let mut s = self.state.lock().unwrap();
-            if s.prompts == 0 {
-                s.text.clear();
-            }
-            s.prompts += 1;
-            if id.is_some() {
-                s.inputs.push(id, text);
-            }
+            let mut state = self.state.lock().unwrap();
+            state.text.clear();
+            state.prompt = Some(request);
         }
-        let result = self
+        self.send_prompt(request, text).await
+    }
+
+    async fn send_prompt(&self, request: u64, text: &str) -> Result<()> {
+        Ok(self
             .rpc
-            .request_in_order(
+            .request_in_order_as(
+                request,
                 "session/prompt",
                 json!({"sessionId":self.session,"prompt":[{"type":"text","text":text}]}),
             )
-            .await;
-        if result.is_err() {
-            let mut state = self.state.lock().unwrap();
-            state.prompts = state.prompts.saturating_sub(1);
-        }
-        Ok(result?)
+            .await?)
     }
-    pub async fn steer(&mut self, text: &str, id: Option<u64>) -> Result<Steer> {
-        if !self.in_turn() {
-            return Ok(Steer::NoActiveTurn);
+
+    pub async fn steer(&mut self, text: &str, input: Option<u64>) -> Result<Steer> {
+        let request = self.rpc.reserve();
+        let (admitted, receipt) = oneshot::channel();
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.prompt.is_none() {
+                return Ok(Steer::NoActiveTurn);
+            }
+            if input.is_some() {
+                state.inputs.push(input, text);
+            }
+            state.steering = Some(PendingSteer {
+                request,
+                input,
+                admitted,
+            });
         }
-        self.prompt(text, id).await?;
-        Ok(Steer::Accepted)
+        self.send_prompt(request, text).await?;
+        receipt
+            .await
+            .context("AGY exited before admitting the message")
     }
     pub fn in_turn(&self) -> bool {
-        self.state.lock().unwrap().prompts > 0
+        self.state.lock().unwrap().prompt.is_some()
     }
     pub fn busy(&self) -> bool {
         let s = self.state.lock().unwrap();
-        s.prompts > 0
+        s.prompt.is_some()
             || !s.tools.is_empty()
             || !s.spawns.is_empty()
             || !s.children.is_empty()
@@ -332,9 +388,19 @@ struct Journal {
     unmatched_children: usize,
     delivered_after_pending: HashSet<u64>,
     version: Option<(std::time::SystemTime, u64)>,
+    // Rows read and not acted on yet, oldest first.
+    held: Vec<Value>,
 }
 
 impl Journal {
+    // The rows to act on now, in order: all read so far up to the first that `waits`, which
+    // stays with those after it for a later call.
+    fn ready(&mut self, rows: Vec<Value>, waits: impl Fn(&Value) -> bool) -> Vec<Value> {
+        self.held.extend(rows);
+        let end = self.held.iter().position(waits).unwrap_or(self.held.len());
+        self.held.drain(..end).collect()
+    }
+
     // The transcript identifies the child and parent, but has no ACP tool call ID.
     // A discovered child accounts for one successful spawn, never an in-flight one.
     fn match_spawns(&mut self, parent: &str, spawns: &mut HashMap<String, Option<Instant>>) {
@@ -467,6 +533,9 @@ struct Driver {
 
 impl Drop for Driver {
     fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        state.prompt = None;
+        state.steering.take();
         for (_, pending) in self.approvals.drain() {
             let _ = pending.send(());
         }
@@ -490,30 +559,10 @@ impl Driver {
 
     async fn receive(&mut self, msg: Incoming) {
         match msg {
-            Incoming::Reply(reply) => {
+            Incoming::Reply { id, result } => {
                 // AGY records interjections in its transcript without echoing a user chunk.
                 self.inspect().await;
-                let mut s = self.state.lock().unwrap();
-                s.prompts = s.prompts.saturating_sub(1);
-                if s.prompts > 0 {
-                    return;
-                }
-                let (error, usage) = match reply {
-                    Ok(r) => {
-                        let stop = r["stopReason"].as_str().unwrap_or("unknown");
-                        (
-                            (stop != "end_turn").then(|| stop.to_owned()),
-                            r.get("usage").cloned(),
-                        )
-                    }
-                    Err(e) => (Some(e.to_string()), None),
-                };
-                let _ = self.events.send(AgentEvent::TurnEnded {
-                    ok: error.is_none(),
-                    result: std::mem::take(&mut s.text),
-                    error,
-                    usage,
-                });
+                self.state.lock().unwrap().replied(id, result, &self.events);
             }
             Incoming::Notification { method, params } if method == "session/update" => {
                 self.update(&params)
@@ -567,7 +616,7 @@ impl Driver {
                     {
                         let _ = gone.send(());
                     }
-                    if root && s.tools.remove(&key) && s.prompts == 0 {
+                    if root && s.tools.remove(&key) && s.prompt.is_none() {
                         s.waking = true;
                     }
                     if u["status"] == "failed" {
@@ -682,10 +731,10 @@ impl Driver {
     async fn inspect(&mut self) {
         let mut updates = Vec::new();
         for (sid, journal) in &mut self.journals {
-            let Ok(rows) = journal.drain(&transcript(&self.brain, sid)) else {
-                continue;
-            };
-            if rows.is_empty() {
+            let rows = journal
+                .drain(&transcript(&self.brain, sid))
+                .unwrap_or_default();
+            if rows.is_empty() && journal.held.is_empty() {
                 continue;
             }
             journal.find_children(sid, &rows, &mut self.candidates);
@@ -698,9 +747,14 @@ impl Driver {
             .filter(|id| *id != &self.root)
             .cloned()
             .collect();
-        // A fast child's first message and spawn result can arrive in the same disk read.
+        // A child's wake and the parent's answer can both precede its readable transcript.
+        // Process them in order once the sender's identity is known.
         for (sid, rows) in updates {
             let journal = self.journals.get_mut(&sid).unwrap();
+            let rows = journal.ready(rows, |r| {
+                sid == self.root
+                    && system_sender(r).is_some_and(|id| self.candidates.contains_key(id))
+            });
             for r in rows {
                 let body = r["content"].as_str().unwrap_or("");
                 match r["type"].as_str() {
@@ -738,7 +792,7 @@ impl Driver {
                             } else if self.parent_woke {
                                 self.parent_woke = false;
                                 s.waking = false;
-                                if s.prompts == 0 {
+                                if s.prompt.is_none() {
                                     s.text.clear();
                                     let _ = self.events.send(AgentEvent::TurnEnded {
                                         ok: true,
@@ -762,7 +816,7 @@ impl Driver {
                         }
                         self.parent_woke = true;
                         s.waking = true;
-                        if s.prompts == 0 {
+                        if s.prompt.is_none() {
                             let _ = self.events.send(AgentEvent::TurnStarted);
                         }
                     }
@@ -832,6 +886,31 @@ impl Driver {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn accepting_a_steer_keeps_the_turn_open_until_its_own_reply() {
+        let (events, mut rx) = Events::channel();
+        let (admitted, receipt) = oneshot::channel();
+        let mut state = State {
+            prompt: Some(4),
+            steering: Some(PendingSteer {
+                request: 5,
+                input: Some(1),
+                admitted,
+            }),
+            text: "answer".into(),
+            ..Default::default()
+        };
+        let done = || Ok(json!({"stopReason":"end_turn"}));
+        state.replied(4, done(), &events);
+        assert!(matches!(receipt.await, Ok(Steer::Accepted)));
+        assert!(rx.try_recv().is_err());
+        state.replied(5, done(), &events);
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentEvent::TurnEnded { ok: true, result, .. }) if result == "answer")
+        );
+        assert!(state.prompt.is_none());
+    }
 
     #[test]
     fn journal_tracks_completed_steps_across_rewrites_and_partial_lines() {
@@ -942,5 +1021,62 @@ mod tests {
         assert_eq!(system_sender(&row), Some(parent));
         row["source"] = json!("MODEL");
         assert!(system_sender(&row).is_none());
+    }
+
+    #[tokio::test]
+    async fn child_wake_is_replayed_once_its_transcript_identifies_the_parent() {
+        let brain = std::env::temp_dir().join(format!("axiopera-agy-{}", Uuid::new_v4()));
+        let root = Uuid::new_v4().to_string();
+        let child = Uuid::new_v4().to_string();
+        let from = |sender: &str| {
+            json!({"type":"SYSTEM_MESSAGE","source":"SYSTEM",
+            "content":format!("[Message] timestamp=t sender={sender} priority=p content=hello")})
+        };
+        let write = |id: &str, rows: Vec<Value>| {
+            let path = transcript(&brain, id);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut body = String::new();
+            for (i, mut row) in rows.into_iter().enumerate() {
+                row["step_index"] = json!(i);
+                row["status"] = json!("DONE");
+                body.push_str(&row.to_string());
+                body.push('\n');
+            }
+            std::fs::write(path, body).unwrap();
+        };
+        write(
+            &root,
+            vec![
+                json!({"type":"PLANNER_RESPONSE","tool_calls":[{"name":"invoke_subagent"}]}),
+                json!({"type":"GENERIC","content":format!("Created the following subagent:\n{}",json!({"conversationId":child}))}),
+                from(&child),
+                json!({"type":"PLANNER_RESPONSE","content":"child finished"}),
+            ],
+        );
+        let (events, mut rx) = Events::channel();
+        let mut driver = Driver {
+            rpc: Rpc::closed(),
+            root: root.clone(),
+            brain: brain.clone(),
+            cwd: brain.clone(),
+            tier: Tier::Work,
+            events,
+            state: Arc::default(),
+            journals: HashMap::from([(root.clone(), Journal::default())]),
+            candidates: HashMap::new(),
+            approvals: HashMap::new(),
+            parent_woke: false,
+        };
+        driver.inspect().await;
+        assert!(rx.try_recv().is_err());
+        write(&child, vec![from(&root)]);
+        driver.inspect().await;
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::TurnStarted)));
+        assert!(
+            matches!(rx.try_recv(), Ok(AgentEvent::TurnEnded { ok: true, result, .. }) if result == "child finished")
+        );
+        driver.inspect().await;
+        assert!(rx.try_recv().is_err());
+        std::fs::remove_dir_all(brain).unwrap();
     }
 }

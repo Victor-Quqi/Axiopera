@@ -374,18 +374,21 @@ async fn discover(
             let preferred = preference
                 .and_then(|label| super::agy::preferred_variant(&session, label, None))
                 .map(str::to_owned);
-            let inherits_effort = preference.is_some_and(|label| {
-                super::agy::preferred_variant(&session, label, configured_model).is_some()
-            });
-            if let Some(variant) = preferred {
-                rpc(
+            let mut inherits_effort = false;
+            if let Some(variant) = preferred
+                && rpc(
                     proc,
                     lines,
                     4,
                     "session/set_model",
                     json!({"sessionId":id,"modelId":variant}),
                 )
-                .await?;
+                .await
+                .is_ok()
+            {
+                inherits_effort = preference.is_some_and(|label| {
+                    super::agy::preferred_variant(&session, label, configured_model).is_some()
+                });
                 session = rpc(
                     proc,
                     lines,
@@ -603,7 +606,10 @@ mod tests {
             stdout,
             &std::env::current_dir()?,
             timeout,
-            (None, mode.strip_prefix("configured-agy-")),
+            (
+                (mode == "configured-agy-first").then_some("First (High)"),
+                mode.strip_prefix("configured-agy-"),
+            ),
         )
         .await
     }
@@ -644,11 +650,18 @@ mod tests {
             }
             let result = match msg["method"].as_str() {
                 Some("initialize") => json!({}),
-                Some("session/new") => json!({"sessionId":"catalog","configOptions":[
+                Some("session/new") => json!({"sessionId":"catalog",
+                    "models":{"availableModels":[{"name":"First (High)","modelId":"first-high"}]},
+                    "configOptions":[
                     {"id":"model","currentValue":"first","options":[
                         {"value":"first","name":"First"},{"value":"second","name":"Second"},
                         {"value":"fixed-medium","name":"Fixed (Medium)"},{"value":"unavailable","name":"Unavailable"}]},
                     {"id":"thought_level","currentValue":"low","options":[{"value":"low"}]}]}),
+                Some("session/set_model") => {
+                    assert_eq!(msg["params"]["modelId"], "first-high");
+                    send(json!({"id":msg["id"],"error":{"code":-32603,"message":"unavailable"}}));
+                    continue;
+                }
                 Some("session/set_config_option") => {
                     let model = &msg["params"]["value"];
                     if model == "unavailable" {
@@ -703,6 +716,21 @@ mod tests {
             };
             send(json!({"jsonrpc":"2.0","id":msg["id"],"result":result}));
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_agy_preference_keeps_the_native_catalog() {
+        let catalog = fixture(Agent::Agy, "configured-agy-first", Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(catalog.native_model.as_deref(), Some("first"));
+        assert_eq!(catalog.native_effort.as_deref(), Some("low"));
+        // Explicitly selecting this family resets its effort in the fixture.
+        assert_eq!(catalog.configured_effort, None);
+        assert_eq!(
+            catalog.models[1].efforts.as_ref().unwrap(),
+            &["deep", "extra"]
+        );
     }
 
     #[tokio::test]

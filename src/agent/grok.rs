@@ -349,7 +349,7 @@ async fn pump(
                 let _ = rpc.respond_error(id, "not supported by axiopera").await;
             }
             // Only session/prompt is sent in order: its reply ends the turn.
-            Incoming::Reply(reply) => {
+            Incoming::Reply { result: reply, .. } => {
                 let (ok, error) = match reply {
                     Ok(r) => {
                         // The model that served this prompt.

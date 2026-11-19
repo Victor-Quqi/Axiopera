@@ -291,7 +291,7 @@ async fn pump(
                     }
                 });
             }
-            Incoming::Reply(_) => {}
+            Incoming::Reply { .. } => {}
         }
     }
     state.lock().unwrap().turn = None;

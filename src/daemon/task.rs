@@ -532,7 +532,10 @@ async fn drive_agent(
                 }
             } => match cmd {
                 Some(Cmd::Input(input)) => {
-                    if backend.busy() {
+                    if !deferred.is_empty() {
+                        // Keep later inputs behind an earlier one waiting for the next turn.
+                        deferred.push(input.queued());
+                    } else if backend.busy() {
                         match request!(tracking.steer(d, id, task.agent, backend, std::slice::from_ref(&input.text)))? {
                             Some(how) => {
                                 let _ = input.reply.send(how);
@@ -1561,6 +1564,78 @@ mod request_tests {
             saved.session_file,
             Fingerprint::of(&dir.join("session.jsonl"))
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_agy_messages_reach_the_following_turn() {
+        let f = fixture();
+        let dir = directory(&f);
+        let exe = compile_fixture(&dir, "agy", "refusing_agent");
+        prepare(&f, &exe, "none", 30);
+        f.d.try_update("test", |t| t.agent = Agent::Agy).unwrap();
+        let data = dir.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("settings.json"), r#"{"model":"Saved"}"#).unwrap();
+        let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        f.d.lock()
+            .tasks
+            .get_mut("test")
+            .unwrap()
+            .env
+            .as_mut()
+            .unwrap()
+            .push((home.into(), dir.to_string_lossy().into_owned()));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let d = f.d.clone();
+        let runner = tokio::spawn(async move { drive(&d, "test", &mut rx).await });
+        observed(&dir.join("started")).await;
+        mail(&f, &tx, "sibling note");
+        let receipt = input(&f, &tx, "parent update").await.unwrap();
+        assert_eq!(receipt, "queued for a new turn");
+        assert_eq!(
+            input(&f, &tx, "later update").await.unwrap(),
+            "queued for a new turn"
+        );
+        let saved = &f.d.store.load_all()[0];
+        assert_eq!(saved.pending_inputs, ["parent update", "later update"]);
+        assert_eq!(saved.pending_mail, ["sibling note"]);
+        std::fs::write(dir.join("continue"), "").unwrap();
+        assert!(matches!(runner.await.unwrap().unwrap(), Exit::Released));
+        assert_reaped(&dir).await;
+        let requests = std::fs::read_to_string(dir.join("requests")).unwrap();
+        let requests: Vec<serde_json::Value> = requests
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r["method"] == "session/set_model" && r["params"]["modelId"] == "saved")
+        );
+        let prompts: Vec<_> = requests
+            .iter()
+            .filter(|r| r["method"] == "session/prompt")
+            .map(|r| r["params"]["prompt"][0]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            prompts,
+            [
+                "initial",
+                "sibling note",
+                "parent update",
+                "sibling note\n\nparent update\n\nlater update"
+            ]
+        );
+        let task = &f.d.store.load_all()[0];
+        assert!(task.pending_inputs.is_empty() && task.pending_mail.is_empty());
+        let ends: Vec<_> =
+            f.d.store
+                .events("test")
+                .into_iter()
+                .filter(|e| e.kind == "turn_ended")
+                .map(|e| (e.data["ok"].as_bool(), e.data["unread"].as_u64()))
+                .collect();
+        assert_eq!(ends, [(Some(true), Some(2)), (Some(true), Some(0))]);
     }
 
     #[tokio::test]
