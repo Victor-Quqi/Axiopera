@@ -48,6 +48,70 @@ pub(super) fn fixture_with(more: &[Value]) -> Fixture {
     }
 }
 
+/// The fixture `source`, built in `dir` as the executable `name`.
+pub(super) fn compile_fixture(dir: &Path, name: &str, source: &str) -> PathBuf {
+    let exe = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/daemon/fixtures")
+        .join(format!("{source}.rs"));
+    let output = std::process::Command::new("rustc")
+        .arg("--edition=2021")
+        .arg(format!("--crate-name={source}"))
+        .arg(path)
+        .arg("-o")
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    exe
+}
+
+pub(super) async fn observed(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// The fixture process that wrote its ID to `dir` is gone.
+pub(super) async fn assert_reaped(dir: &Path) {
+    let pid: u32 = std::fs::read_to_string(dir.join("pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Threading::{OpenProcess, WaitForSingleObject},
+        };
+        // SYNCHRONIZE permits checking termination without inspecting the child.
+        let handle = OpenProcess(0x00100000, 0, pid);
+        if !handle.is_null() {
+            // TerminateJobObject returns before its processes have exited.
+            let status = WaitForSingleObject(handle, 2000);
+            CloseHandle(handle);
+            assert_eq!(status, 0, "fake peer is still running");
+        }
+    }
+    #[cfg(unix)]
+    // Dropping a backend during its handshake lets Tokio reap the killed child asynchronously.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while unsafe { libc::kill(pid as i32, 0) } == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fake peer was not reaped");
+}
+
 #[test]
 fn blocked_is_logged_without_waking_and_counted_once_per_turn() {
     let f = fixture();
@@ -632,6 +696,77 @@ async fn wait_lists_news_without_taking_it_and_inbox_takes_all() {
             .await
             .unwrap();
     assert_eq!(exit, ipc::exit::NOTHING_RUNNING);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wait_that_times_out_tells_where_the_running_tasks_stand() {
+    let f = fixture();
+    let (actor, _commands) = mpsc::unbounded_channel();
+    f.d.lock().tasks.get_mut("test").unwrap().actor = Some(actor);
+    let mut buf = Vec::new();
+    let exit =
+        f.d.wait("codex:host", &[], Some(1_000), &mut Out::new(&mut buf))
+            .await
+            .unwrap();
+    assert_eq!(exit, ipc::exit::NOTHING_NEW);
+    assert_eq!(
+        replies(&buf),
+        "nothing new; still running:\n  test (codex): starting"
+    );
+}
+
+#[tokio::test]
+async fn a_task_that_ends_while_inbox_answers_does_not_read_as_nothing_running() {
+    let binary = fixture();
+    let exe = compile_fixture(&binary.home, "codex", "silent_remote");
+    let f = fixture();
+    let (actor, _commands) = mpsc::unbounded_channel();
+    {
+        let mut st = f.d.lock();
+        st.tasks.get_mut("test").unwrap().actor = Some(actor);
+        let host = store::CodexHost {
+            exe,
+            codex_home: Some(f.home.clone()),
+            thread: "host".into(),
+            doorbell: true,
+        };
+        st.ledger.codex_hosts.insert("codex:host".into(), host);
+        st.ledger
+            .doorbells
+            .insert("codex:host".into(), "queued".into());
+    }
+    let d = f.d.clone();
+    let call = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        let exit = d
+            .inbox("codex:host", &[], &mut Out::new(&mut buf))
+            .await
+            .unwrap();
+        (exit, replies(&buf))
+    });
+    // Withdrawing the reminder holds the answer up, and the task ends meanwhile.
+    observed(&f.home.join("pid")).await;
+    f.d.update("test", |t| t.turns = 1);
+    f.d.store.save_turn("test", 1, "the report").unwrap();
+    f.d.emit("test", "turn_ended", json!({"turn": 1, "ok": true}));
+    f.d.lock().tasks.get_mut("test").unwrap().actor = None;
+    std::fs::write(f.home.join("continue"), "").unwrap();
+    let (exit, text) = call.await.unwrap();
+    assert_reaped(&f.home).await;
+    assert_eq!(exit, ipc::exit::NOTHING_NEW, "{text}");
+    assert_eq!(
+        text,
+        "nothing new; still running:\n  test (codex): starting"
+    );
+    // The reminder is out of the way: the next call only hands over.
+    f.d.lock().ledger.doorbells.clear();
+    let mut buf = Vec::new();
+    let exit =
+        f.d.inbox("codex:host", &[], &mut Out::new(&mut buf))
+            .await
+            .unwrap();
+    assert_eq!(exit, ipc::exit::OK);
+    assert!(replies(&buf).contains("the report"));
 }
 
 #[tokio::test]

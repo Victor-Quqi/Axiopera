@@ -1333,7 +1333,7 @@ mod release_tests {
 
 #[cfg(test)]
 mod request_tests {
-    use super::super::tests::{Fixture, fixture};
+    use super::super::tests::{Fixture, assert_reaped, compile_fixture, fixture, observed};
     use super::*;
     use std::path::{Path, PathBuf};
 
@@ -1390,29 +1390,7 @@ mod request_tests {
     }
 
     fn compile_peer(f: &Fixture) -> PathBuf {
-        compile(f, "codex", "timeout_agent")
-    }
-
-    /// The fixture `source`, built as the executable of the agent `name`.
-    fn compile(f: &Fixture, name: &str, source: &str) -> PathBuf {
-        let exe = directory(f).join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
-        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/daemon/fixtures")
-            .join(format!("{source}.rs"));
-        let output = std::process::Command::new("rustc")
-            .arg("--edition=2021")
-            .arg(format!("--crate-name={source}"))
-            .arg(path)
-            .arg("-o")
-            .arg(&exe)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        exe
+        compile_fixture(&directory(f), "codex", "timeout_agent")
     }
 
     fn prepare(f: &Fixture, exe: &Path, hang: &str, seconds: u64) {
@@ -1446,16 +1424,6 @@ mod request_tests {
         ]);
     }
 
-    async fn observed(path: &Path) {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !path.exists() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-    }
-
     fn input(
         f: &Fixture,
         tx: &mpsc::UnboundedSender<Cmd>,
@@ -1476,37 +1444,6 @@ mod request_tests {
         f.d.try_update("test", |t| t.pending_mail.push(text.into()))
             .unwrap();
         tx.send(Cmd::Mail(text.into())).unwrap();
-    }
-
-    async fn assert_reaped(dir: &Path) {
-        let pid: u32 = std::fs::read_to_string(dir.join("pid"))
-            .unwrap()
-            .parse()
-            .unwrap();
-        #[cfg(windows)]
-        unsafe {
-            use windows_sys::Win32::{
-                Foundation::CloseHandle,
-                System::Threading::{OpenProcess, WaitForSingleObject},
-            };
-            // SYNCHRONIZE permits checking termination without inspecting the child.
-            let handle = OpenProcess(0x00100000, 0, pid);
-            if !handle.is_null() {
-                // TerminateJobObject returns before its processes have exited.
-                let status = WaitForSingleObject(handle, 2000);
-                CloseHandle(handle);
-                assert_eq!(status, 0, "fake peer is still running");
-            }
-        }
-        #[cfg(unix)]
-        // Dropping a backend during its handshake lets Tokio reap the killed child asynchronously.
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while unsafe { libc::kill(pid as i32, 0) } == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("fake peer was not reaped");
     }
 
     #[tokio::test]
@@ -1629,7 +1566,7 @@ mod request_tests {
     #[tokio::test]
     async fn a_backend_that_falls_idle_without_an_event_is_released() {
         let binary = fixture();
-        let exe = compile(&binary, "claude", "background_agent");
+        let exe = compile_fixture(&directory(&binary), "claude", "background_agent");
         let f = fixture();
         let dir = directory(&f);
         prepare(&f, &exe, "none", 3600);

@@ -2015,10 +2015,12 @@ impl Daemon {
     ) -> Result<i32> {
         let only = self.find_all(caller, only)?;
         let deadline = timeout_ms.map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms));
+        let mut timed_out = false;
         loop {
             enum Check {
                 News(String, Value),
                 Idle,
+                Running(Vec<String>),
                 Wait(broadcast::Receiver<Event>),
             }
             let check = {
@@ -2028,6 +2030,8 @@ impl Daemon {
                     Check::News(self.news_text(&st, &news), serde_json::to_value(&news)?)
                 } else if !self.live(&st, caller, &only) {
                     Check::Idle
+                } else if timed_out {
+                    Check::Running(self.running(&st, caller, &only))
                 } else {
                     // Subscribe while holding the lock so no event slips between check and wait.
                     Check::Wait(self.events.subscribe())
@@ -2039,6 +2043,7 @@ impl Daemon {
                     return Ok(ipc::exit::OK);
                 }
                 Check::Idle => return self.nothing_running(caller, &only, out).await,
+                Check::Running(lines) => return self.still_running(&lines, out).await,
                 Check::Wait(rx) => rx,
             };
             let next = async {
@@ -2051,11 +2056,9 @@ impl Daemon {
                 }
             };
             match deadline {
-                Some(d) => {
-                    if tokio::time::timeout_at(d, next).await.is_err() {
-                        return self.nothing_new(caller, &only, out).await;
-                    }
-                }
+                // The check above answers a timeout too, under the one lock: a task that ends
+                // at this moment has news, and must not read as nothing running.
+                Some(d) => timed_out = tokio::time::timeout_at(d, next).await.is_err(),
                 None => next.await,
             }
         }
@@ -2073,12 +2076,12 @@ impl Daemon {
         let only = self.find_all(caller, only)?;
         let _delivering = self.delivery(caller).lock_owned().await;
         self.reconcile_before_take(caller).await?;
-        let (approvals, events, live) = {
+        let (approvals, events, running) = {
             let st = self.lock();
             (
                 self.waiting_approvals(&st, caller, &only),
                 self.unseen(&st, caller, &only),
-                self.live(&st, caller, &only),
+                self.running(&st, caller, &only),
             )
         };
         let batch = self.batch(&approvals, &events);
@@ -2088,10 +2091,12 @@ impl Daemon {
                 self.mark_seen(caller, &batch.seen, &[], &[])?;
             }
             self.retract_doorbell(caller).await;
-            return if live {
-                self.nothing_new(caller, &only, out).await
-            } else {
+            // Answered from what ran when the news was looked for: a task that has ended since
+            // has news, and must not read as nothing running.
+            return if running.is_empty() {
                 self.nothing_running(caller, &only, out).await
+            } else {
+                self.still_running(&running, out).await
             };
         }
         for (e, text) in &batch.items {
@@ -2129,48 +2134,37 @@ impl Daemon {
             .any(|id| st.tasks[id].has_work())
     }
 
-    /// Nothing new yet: where each running sub-task stands.
-    async fn nothing_new<W: AsyncWrite + Unpin>(
+    /// Where each of the caller's children (or those in `only`) that `live` counts stands, a
+    /// line each.
+    fn running(&self, st: &State, caller: &str, only: &[String]) -> Vec<String> {
+        let mut live: Vec<&Entry> = self
+            .children(st, caller, only)
+            .iter()
+            .map(|id| &st.tasks[id])
+            .filter(|e| e.has_work())
+            .collect();
+        live.sort_by_key(|e| e.task.created_ms);
+        live.iter()
+            .map(|e| {
+                let mut line = format!("  {}", render::task_label(&e.task));
+                let progress = self.progress(st, e, caller);
+                if !progress.is_empty() {
+                    line.push_str(&format!(": {progress}"));
+                }
+                line
+            })
+            .collect()
+    }
+
+    /// Nothing new yet: where each running sub-task stands, as `running` gave it.
+    async fn still_running<W: AsyncWrite + Unpin>(
         &self,
-        caller: &str,
-        only: &[String],
+        running: &[String],
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
-        let lines = {
-            let st = self.lock();
-            let mut live: Vec<&Entry> = self
-                .children(&st, caller, only)
-                .iter()
-                .map(|id| &st.tasks[id])
-                .filter(|e| e.has_work())
-                .collect();
-            live.sort_by_key(|e| e.task.created_ms);
-            live.iter()
-                .map(|e| {
-                    let mut line = format!("  {}", render::task_label(&e.task));
-                    let progress = self.progress(&st, e, caller);
-                    if !progress.is_empty() {
-                        line.push_str(&format!(": {progress}"));
-                    }
-                    line
-                })
-                .collect::<Vec<_>>()
-        };
-        if lines.is_empty() {
-            return self.nothing_running(caller, only, out).await;
-        }
-        out.text(
-            format!(
-                "nothing new; still running:
-{}",
-                lines.join(
-                    "
-"
-                )
-            ),
-            Value::Null,
-        )
-        .await?;
+        let lines = running.join("\n");
+        out.text(format!("nothing new; still running:\n{lines}"), Value::Null)
+            .await?;
         Ok(ipc::exit::NOTHING_NEW)
     }
 
