@@ -592,6 +592,52 @@ async fn question_receipts_match_the_task_answer_route() {
 }
 
 #[tokio::test]
+async fn concurrent_spawns_cannot_claim_the_same_name_for_one_caller() {
+    let mut f = fixture();
+    Arc::get_mut(&mut f.d).unwrap().opts.agents.claude.path =
+        Some(std::env::current_exe().unwrap());
+    f.d.lock().stopping = true;
+    let spawn = ipc::Spawn {
+        agent: Agent::Claude,
+        tier: ipc::Tier::Read,
+        task: "fixture only".into(),
+        cwd: f.home.clone(),
+        name: Some("review".into()),
+        model: None,
+        effort: None,
+        timeout_secs: None,
+    };
+    let named_spawn = async |caller: &str| {
+        f.d.spawn(
+            caller,
+            spawn.clone(),
+            vec![],
+            &mut Out::new(&mut Vec::new()),
+        )
+        .await
+    };
+
+    // Let both requests reach host registration before either can claim the name.
+    let caller = "codex:host";
+    let held = f.d.delivery(caller).lock_owned().await;
+    let (first, second, ()) = tokio::join!(biased;
+        named_spawn(caller), named_spawn(caller), async { drop(held) }
+    );
+    assert_eq!(first.unwrap(), ipc::exit::OK);
+    let error = second.unwrap_err();
+    let RefuseErr(code, message) = error.downcast_ref::<RefuseErr>().unwrap();
+    assert_eq!(*code, ErrorCode::Invalid);
+    assert_eq!(message, "you already have a task named review");
+
+    let other = "claude:other";
+    named_spawn(other).await.unwrap();
+    let id = f.d.find(caller, "review").unwrap();
+    assert_ne!(id, f.d.find(other, "review").unwrap());
+    let reloaded = Daemon::load(options(&f.home), None).unwrap();
+    assert_eq!(reloaded.find(caller, "review").unwrap(), id);
+}
+
+#[tokio::test]
 async fn grok_spawn_receipts_use_the_callers_monitor() {
     let mut f = fixture_with(&[json!({"id": "grok", "agent": "grok"})]);
     Arc::get_mut(&mut f.d).unwrap().opts.agents.claude.path =

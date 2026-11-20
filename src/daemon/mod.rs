@@ -1000,76 +1000,74 @@ impl Daemon {
                 );
             }
         }
-        if let Some(name) = &s.name {
-            let taken = self
-                .lock()
-                .tasks
-                .values()
-                .any(|e| e.task.parent == caller && e.task.name.as_ref() == Some(name));
-            if taken {
+        let check_name = |st: &State| {
+            if let Some(name) = &s.name
+                && st
+                    .tasks
+                    .values()
+                    .any(|e| e.task.parent == caller && e.task.name.as_ref() == Some(name))
+            {
                 return refuse(
                     ErrorCode::Invalid,
                     format!("you already have a task named {name}"),
                 );
             }
-        }
+            Ok(())
+        };
+        check_name(&self.lock())?;
         agent::resolve_exe(s.agent, self.opts.agents.get(s.agent).path.as_deref(), &env)
             .map_err(|e| anyhow!(RefuseErr(ErrorCode::Invalid, format!("{e:#}"))))?;
         let (reach, unreachable) = self.register_host(caller, &env).await;
 
-        let now = store::now_ms();
-        let id = store::new_id('t', |id| self.store.exists(id));
         let cwd = s.cwd.clone();
-        let task = Task {
-            id: id.clone(),
-            name: s.name.clone(),
-            parent: caller.to_string(),
-            agent: s.agent,
-            tier: s.tier,
-            cwd: cwd.clone(),
-            model: s
-                .model
-                .clone()
-                .or_else(|| self.opts.agents.get(s.agent).model.clone()),
-            effort: s.effort.clone(),
-            actual_model: None,
-            actual_effort: None,
-            timeout_secs: s.timeout_secs,
-            status: Status::Queued,
-            session: None,
-            session_file: None,
-            turns: 0,
-            delivered: 0,
-            changed_files: Vec::new(),
-            questions: Vec::new(),
-            pending_inputs: vec![s.task.clone()],
-            pending_mail: Vec::new(),
-            stalled: false,
-            detached: false,
-            created_ms: now,
-            updated_ms: now,
-        };
-        self.store.save_prompt(&id, &s.task)?;
-        self.store.save(&task)?;
-        {
+        let id = {
             let mut st = self.lock();
-            // Again under the lock that adds the task, so spawns at once cannot pass it together.
+            // Host registration can yield to another spawn or a change to the parent's tier.
+            check_name(&st)?;
             if let Some(why) = self.at_limit(&st, caller) {
-                drop(st);
-                let _ = self.store.remove(&id);
                 return refuse(ErrorCode::Invalid, why);
             }
-            // The parent may have changed tier while host registration was awaiting I/O.
             if let Some(parent) = identity::task_of(caller)
                 && st.tasks.get(parent).is_none_or(|p| s.tier > p.task.tier)
             {
-                drop(st);
-                let _ = self.store.remove(&id);
                 return refuse(
                     ErrorCode::Invalid,
                     "the requested tier exceeds the parent task's tier",
                 );
             }
+            let now = store::now_ms();
+            let id = store::new_id('t', |id| self.store.exists(id));
+            let task = Task {
+                id: id.clone(),
+                name: s.name.clone(),
+                parent: caller.to_string(),
+                agent: s.agent,
+                tier: s.tier,
+                cwd: cwd.clone(),
+                model: s
+                    .model
+                    .clone()
+                    .or_else(|| self.opts.agents.get(s.agent).model.clone()),
+                effort: s.effort.clone(),
+                actual_model: None,
+                actual_effort: None,
+                timeout_secs: s.timeout_secs,
+                status: Status::Queued,
+                session: None,
+                session_file: None,
+                turns: 0,
+                delivered: 0,
+                changed_files: Vec::new(),
+                questions: Vec::new(),
+                pending_inputs: vec![s.task.clone()],
+                pending_mail: Vec::new(),
+                stalled: false,
+                detached: false,
+                created_ms: now,
+                updated_ms: now,
+            };
+            self.store.save_prompt(&id, &s.task)?;
+            self.store.save(&task)?;
             let entry = Entry {
                 blocked: 0,
                 notices: Vec::new(),
@@ -1088,7 +1086,8 @@ impl Daemon {
                 approval_events: HashMap::new(),
             };
             st.tasks.insert(id.clone(), entry);
-        }
+            id
+        };
         self.try_emit(
             &id,
             "spawned",
