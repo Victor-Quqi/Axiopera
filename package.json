@@ -1,6 +1,6 @@
 {
   "name": "axiopera-pi",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "description": "Deliver Axiopera task notifications to Pi sessions",
   "keywords": ["pi-package"],
