@@ -115,7 +115,7 @@ daemon 用调用方经 IPC 传来的环境启动子 agent。环境只留在内�
 
 | 事件 | 内容 |
 |---|---|
-| turn_ended | 本轮状态、结果、未处理输入或确认缺口、拒绝次数、适配器的提示和轮末未回答的问题。收件和推送时只提示其中仍未回答的项 |
+| turn_ended | 本轮状态、结果、未处理输入或确认缺口、拒绝次数、适配器的提示和轮末未回答的问题。收件和推送时只提示其中仍未回答的项。Codex 内置子线程的轮次归属见[会话与消息](backends.md#会话与消息) |
 | question | 子 agent 的提问 |
 | approval_request | 只交给审批方的请求 |
 | stalled、failed、cancelled、interrupted、detached | 状态变化 |

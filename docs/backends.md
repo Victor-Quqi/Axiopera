@@ -109,6 +109,8 @@ Claude 的 user 回显可能合并多条消息，需要按 text block 匹配。�
 
 Codex 的 `userMessage` 可能在轮末落盘，后续模型响应才构成输入被消费的证据。daemon 将未确认输入带入下一轮。`turn/steer` 返回无活跃轮次时，先处理旧轮末事件再开启新轮。
 
+Codex 与内置子 agent 共用一条 app-server 连接。Axiopera 按新建或续接时取得的线程 ID 确认任务的发言、模型、用量、输入消费和轮次结束。子线程的工作计入进度，工具和改动文件仍记在任务下。文件审批按线程 ID 和条目 ID 查找改动，审批的答复和撤回按连接上的请求 ID 匹配。
+
 `get_settings` 是 Claude 未写入文档的控制请求，回复含全部生效设置，适配器只取模型和推理强度，协议跟踪中略去这条回复；不支持时只靠 `system/init` 得到模型。`model_fallback` 只从二进制中确认，尚未实测触发。`get_settings` 和 Grok 的 `model_changed` 给出完整设置，其中没有推理强度表示该模型不使用强度，记录随之清空。
 
 Codex 请求了强度时，每轮 `turn/start` 都带上它，记录取请求值；否则取线程回复的值，回复为空时 Codex 采用目录中该模型的 `defaultReasoningEffort`，适配器从 `model/list` 取同一个值。`model/rerouted` 只说明当轮被改用的模型，后续请求仍用线程模型，因此每轮 `turn/started` 时恢复记录。

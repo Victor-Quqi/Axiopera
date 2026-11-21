@@ -47,6 +47,7 @@
 | [会话与消息](backends.md#会话与消息)：并发续接 | `resume.py` |
 | [会话与消息](backends.md#会话与消息)：Grok 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `grok_native_identity.py`，Windows、Grok 1.0.67。原生 auto 宿主和 Axiopera work 宿主下，主会话均无法取走子会话的结果 |
 | [会话与消息](backends.md#会话与消息)：Codex 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `codex_native_identity.py`，Windows、Codex 0.164.0。原生 full 权限宿主（`danger-full-access`）和 Axiopera work 宿主下，主会话均无法取走子线程的结果 |
+| [会话与消息](backends.md#会话与消息)：Codex 内置子线程先结束时的结果和中途消息 | Windows、Codex 0.171.0，read 档实测。主线程用 `wait_agent` 等待子线程。子线程答完时任务仍在运行，收件箱无结果；此时 `send` 通过 `turn/steer` 进入原轮。该轮只交付一次，答复和用量均来自主线程。单元测试另覆盖子线程输入回显及跨线程同条目 ID 的文件审批。 |
 | [宿主通知](backends.md#宿主通知)：Claude 和 Grok 在本轮进行中能否收到后台命令的完成通知 | `background.py busy` |
 | [宿主通知](backends.md#宿主通知)：Codex 后台状态显示 | `status_watch_*` 测试覆盖后台状态与调用方隔离。Codex CLI 0.166.0 的 `thread/backgroundTerminals/list` 可列出 `/ps` 遗漏的任务；后台终端结束不会唤醒宿主。[启动事件去重](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/app-server/src/bespoke_event_handling.rs#L1075)、[界面登记](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/tui/src/chatwidget/command_lifecycle.rs#L35)、[async_watcher.rs](https://github.com/openai/codex/blob/83086188ae0614bd882818ff1aa23f3194962012/codex-rs/core/src/unified_exec/async_watcher.rs#L155-L243) |
 | [宿主通知](backends.md#宿主通知)：Claude 内置子 agent 和 agent team teammate 空闲时能否被唤醒 | Windows、Claude Code 2.1.312。后台 `wait` 完成可唤醒内置子 agent；in-process teammate 需要前台 `wait`，空闲时 Monitor 也无法唤醒它。[claude-code#91503](https://github.com/anthropics/claude-code/issues/91503) |

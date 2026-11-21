@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot};
 
@@ -15,6 +15,7 @@ use crate::{identity, paths};
 
 #[derive(Default)]
 struct State {
+    root_thread: Option<String>,
     turn: Option<String>,
     /// Turns already completed, so a late `turn/start` reply cannot resurrect one.
     done: HashSet<String>,
@@ -22,8 +23,8 @@ struct State {
     usage: Option<Value>,
     inputs: super::Inputs,
     recorded: Vec<u64>,
-    /// Changes of file edits not finished yet, by item ID, for their approval requests.
-    patches: HashMap<String, Value>,
+    /// Pending file edits share a connection, but item IDs belong to their thread.
+    patches: HashMap<(String, String), Value>,
     /// The auto_review reviewer could not review; said once.
     review_failed: bool,
     /// The thread's model. A reroute moves only the turn it happens in.
@@ -45,7 +46,10 @@ impl Codex {
     pub async fn start(spec: &StartSpec, exe: &Path, events: Events) -> Result<Codex> {
         let (proc, stdout) = Proc::spawn(exe, &["app-server".into()], spec)?;
         let (rpc, incoming) = Rpc::start(stdout, proc.stdin.clone());
-        let state: Arc<Mutex<State>> = Arc::default();
+        let state = Arc::new(Mutex::new(State {
+            root_thread: spec.resume.clone(),
+            ..State::default()
+        }));
         tokio::spawn(pump(incoming, rpc.clone(), state.clone(), events.clone()));
 
         rpc.call(
@@ -99,8 +103,10 @@ impl Codex {
         };
         let thread = reply["thread"]["id"]
             .as_str()
-            .unwrap_or_default()
+            .filter(|id| !id.is_empty())
+            .context("Codex did not return a thread ID")?
             .to_string();
+        state.lock().unwrap().root_thread = Some(thread.clone());
         let file = reply["thread"]["path"].as_str().map(PathBuf::from);
         let _ = events.send(AgentEvent::Session {
             id: thread.clone(),
@@ -244,10 +250,11 @@ async fn pump(
             }
             Incoming::Request { id, method, params } => {
                 let (summary, detail) = {
-                    let patches = &state.lock().unwrap().patches;
+                    let s = state.lock().unwrap();
+                    let changes = s.file_changes(&params);
                     (
-                        summary(&method, &params, patches),
-                        request_detail(&method, &params, patches),
+                        summary(&method, &params, changes),
+                        request_detail(&method, &params, changes),
                     )
                 };
                 if !FORWARDED.contains(&method.as_str()) {
@@ -324,21 +331,22 @@ async fn catalog_effort(rpc: &Rpc, model: &str) -> Option<String> {
 
 fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Events) {
     let item = &p["item"];
+    let mut s = state.lock().unwrap();
+    let root = s.root_thread.is_some() && p["threadId"].as_str() == s.root_thread.as_deref();
     // Finishing a turn can persist pending input without another model request. Only a
     // subsequent model response shows that the recorded input reached this turn's model.
-    if method == "item/started"
+    if root
+        && method == "item/started"
         && matches!(item["type"].as_str(), Some("agentMessage" | "reasoning"))
     {
-        for id in state.lock().unwrap().recorded.drain(..) {
+        for id in s.recorded.drain(..) {
             let _ = events.send(AgentEvent::InputRead(id));
         }
     }
     match method {
-        "turn/started" => {
-            let model = state.lock().unwrap().model.clone();
-            super::report_model(events, model.as_deref());
+        "turn/started" if root => {
+            super::report_model(events, s.model.as_deref());
             if let Some(id) = p["turn"]["id"].as_str() {
-                let mut s = state.lock().unwrap();
                 if !s.done.contains(id) {
                     s.turn = Some(id.to_string());
                 }
@@ -362,12 +370,8 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
             }
             Some("fileChange") => {
                 events.progress();
-                if let Some(id) = item["id"].as_str() {
-                    state
-                        .lock()
-                        .unwrap()
-                        .patches
-                        .insert(id.to_string(), item["changes"].clone());
+                if let Some(key) = patch_key(p, &item["id"]) {
+                    s.patches.insert(key, item["changes"].clone());
                 }
             }
             Some("mcpToolCall") => {
@@ -392,8 +396,7 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
             _ => {}
         },
         "item/completed" => match item["type"].as_str() {
-            Some("userMessage") => {
-                let mut s = state.lock().unwrap();
+            Some("userMessage") if root => {
                 let text = super::content_text(&item["content"]);
                 if let Some(i) = s.inputs.0.iter().position(|(_, sent)| *sent == text)
                     && let Some((Some(id), _)) = s.inputs.0.remove(i)
@@ -401,17 +404,18 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                     s.recorded.push(id);
                 }
             }
-            Some("agentMessage") => {
+            Some("agentMessage") if root => {
                 let text = item["text"].as_str().unwrap_or("").to_string();
                 if !text.trim().is_empty() {
                     let _ = events.send(AgentEvent::Said(text.clone()));
                 }
-                state.lock().unwrap().last_message = text;
+                s.last_message = text;
             }
+            Some("agentMessage") => events.progress(),
             Some("fileChange") => {
                 events.progress();
-                if let Some(id) = item["id"].as_str() {
-                    state.lock().unwrap().patches.remove(id);
+                if let Some(key) = patch_key(p, &item["id"]) {
+                    s.patches.remove(&key);
                 }
                 for c in item["changes"].as_array().into_iter().flatten() {
                     if let Some(path) = c["path"].as_str() {
@@ -425,12 +429,12 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
         // request ended before anyone decided.
         "serverRequest/resolved" => {
             let key = p["requestId"].to_string();
-            if let Some(gone) = state.lock().unwrap().asked.remove(&key) {
+            if let Some(gone) = s.asked.remove(&key) {
                 let _ = gone.send(());
             }
         }
-        "thread/tokenUsage/updated" => state.lock().unwrap().usage = p.get("tokenUsage").cloned(),
-        "model/rerouted" => super::report_model(events, p["toModel"].as_str()),
+        "thread/tokenUsage/updated" if root => s.usage = p.get("tokenUsage").cloned(),
+        "model/rerouted" if root => super::report_model(events, p["toModel"].as_str()),
         // The auto_review reviewer turned an escalation down; the agent only sees a failure.
         // The payload is marked unstable, so only the plain fields are read.
         "item/autoApprovalReview/completed" => {
@@ -444,7 +448,7 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                 )));
                 // Reported as denied, but the reviewer never judged the action.
                 if let Some(error) = rationale.strip_prefix("Automatic approval review failed: ")
-                    && !std::mem::replace(&mut state.lock().unwrap().review_failed, true)
+                    && !std::mem::replace(&mut s.review_failed, true)
                 {
                     let _ = events.send(AgentEvent::Notice(format!(
                         "Codex's automatic review fails, so it refuses whatever needs approval: {}",
@@ -453,10 +457,9 @@ fn on_notification(method: &str, p: &Value, state: &Mutex<State>, events: &Event
                 }
             }
         }
-        "turn/completed" => {
+        "turn/completed" if root => {
             let turn = &p["turn"];
             let ok = turn["status"] == "completed";
-            let mut s = state.lock().unwrap();
             if let Some(id) = turn["id"].as_str() {
                 s.done.insert(id.to_string());
             }
@@ -489,18 +492,29 @@ const FORWARDED: [&str; 3] = [
     "item/permissions/requestApproval",
 ];
 
-fn summary(method: &str, p: &Value, patches: &HashMap<String, Value>) -> String {
+fn patch_key(p: &Value, item_id: &Value) -> Option<(String, String)> {
+    Some((
+        p["threadId"].as_str()?.to_owned(),
+        item_id.as_str()?.to_owned(),
+    ))
+}
+
+impl State {
+    fn file_changes(&self, request: &Value) -> &[Value] {
+        patch_key(request, &request["itemId"])
+            .and_then(|key| self.patches.get(&key))
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+fn summary(method: &str, p: &Value, changes: &[Value]) -> String {
     let text = |k: &str| p[k].as_str().map(str::to_string);
     let (kind, what) = match method {
         "item/commandExecution/requestApproval" => ("shell", text("command").or(text("reason"))),
         "item/fileChange/requestApproval" => {
-            let paths: Vec<&str> = patches
-                .get(p["itemId"].as_str().unwrap_or_default())
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|c| c["path"].as_str())
-                .collect();
+            let paths: Vec<&str> = changes.iter().filter_map(|c| c["path"].as_str()).collect();
             let paths = (!paths.is_empty()).then(|| paths.join(", "));
             ("edit", paths.or(text("reason")))
         }
@@ -512,7 +526,7 @@ fn summary(method: &str, p: &Value, patches: &HashMap<String, Value>) -> String 
 }
 
 /// The whole request: a command with its directory and reason, or a file edit's diffs.
-fn request_detail(method: &str, p: &Value, patches: &HashMap<String, Value>) -> String {
+fn request_detail(method: &str, p: &Value, changes: &[Value]) -> String {
     let mut lines = Vec::new();
     let field = |k: &str| p[k].as_str().filter(|v| !v.is_empty());
     if let Some(command) = field("command") {
@@ -530,13 +544,7 @@ fn request_detail(method: &str, p: &Value, patches: &HashMap<String, Value>) -> 
     if method == "item/permissions/requestApproval" {
         lines.push(format!("permissions: {}", p["permissions"]));
     }
-    let item = p["itemId"].as_str().unwrap_or_default();
-    for change in patches
-        .get(item)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
+    for change in changes {
         let path = change["path"].as_str().unwrap_or("?");
         let diff = change["diff"].as_str().unwrap_or("");
         let count = |sign: char, header: &str| {
@@ -593,10 +601,17 @@ fn refusal(method: &str) -> Option<Value> {
 mod tests {
     use super::*;
 
+    fn root_state() -> Mutex<State> {
+        Mutex::new(State {
+            root_thread: Some("root".into()),
+            ..State::default()
+        })
+    }
+
     fn recorded(state: &Mutex<State>, events: &Events, text: &str) {
         on_notification(
             "item/completed",
-            &json!({"item": {
+            &json!({"threadId": "root", "item": {
                 "type": "userMessage", "content": [{"type": "text", "text": text}]
             }}),
             state,
@@ -633,7 +648,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_codex_resolves_is_withdrawn_unanswered() {
-        let state = Mutex::new(State::default());
+        let state = root_state();
         let (events, mut rx) = Events::channel();
         let (gone_tx, gone) = oneshot::channel();
         state
@@ -697,9 +712,10 @@ mod tests {
 
     #[test]
     fn a_rerouted_turn_reports_the_model_it_moved_to() {
-        let state = Mutex::new(State::default());
+        let state = root_state();
         let (events, mut rx) = Events::channel();
-        let rerouted = json!({"fromModel": "gpt-a", "toModel": "gpt-b", "reason": "x"});
+        let rerouted =
+            json!({"threadId": "root", "fromModel": "gpt-a", "toModel": "gpt-b", "reason": "x"});
         state.lock().unwrap().model = Some("gpt-a".into());
         on_notification("model/rerouted", &rerouted, &state, &events);
         assert!(matches!(rx.try_recv(),
@@ -707,7 +723,7 @@ mod tests {
         // The next turn runs on the thread's model again.
         on_notification(
             "turn/started",
-            &json!({"turn": {"id": "t2"}}),
+            &json!({"threadId": "root", "turn": {"id": "t2"}}),
             &state,
             &events,
         );
@@ -717,7 +733,7 @@ mod tests {
 
     #[test]
     fn user_item_needs_a_following_model_response() {
-        let state = Mutex::new(State::default());
+        let state = root_state();
         let (events, mut rx) = Events::channel();
         state.lock().unwrap().inputs.push(Some(1), "first");
         state.lock().unwrap().inputs.push(Some(2), "second");
@@ -726,7 +742,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
         on_notification(
             "item/started",
-            &json!({"item": {"type": "agentMessage"}}),
+            &json!({"threadId": "root", "item": {"type": "agentMessage"}}),
             &state,
             &events,
         );
@@ -736,19 +752,19 @@ mod tests {
 
     #[test]
     fn each_agent_message_is_said_and_the_last_is_the_result() {
-        let state = Mutex::new(State::default());
+        let state = root_state();
         let (events, mut rx) = Events::channel();
         for text in ["Looking at the tests.", "  ", "All pass."] {
             on_notification(
                 "item/completed",
-                &json!({"item": {"type": "agentMessage", "text": text}}),
+                &json!({"threadId": "root", "item": {"type": "agentMessage", "text": text}}),
                 &state,
                 &events,
             );
         }
         on_notification(
             "turn/completed",
-            &json!({"turn": {"id": "one", "status": "completed"}}),
+            &json!({"threadId": "root", "turn": {"id": "one", "status": "completed"}}),
             &state,
             &events,
         );
@@ -761,23 +777,120 @@ mod tests {
 
     #[test]
     fn recorded_at_turn_end_is_not_confirmed_by_the_next_turn() {
-        let state = Mutex::new(State::default());
+        let state = root_state();
         let (events, mut rx) = Events::channel();
         state.lock().unwrap().inputs.push(Some(1), "late");
         recorded(&state, &events, "late");
         on_notification(
             "turn/completed",
-            &json!({"turn": {"id": "one", "status": "completed"}}),
+            &json!({"threadId": "root", "turn": {"id": "one", "status": "completed"}}),
             &state,
             &events,
         );
         assert!(matches!(rx.try_recv(), Ok(AgentEvent::TurnEnded { .. })));
         on_notification(
             "item/started",
-            &json!({"item": {"type": "agentMessage"}}),
+            &json!({"threadId": "root", "item": {"type": "agentMessage"}}),
             &state,
             &events,
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_native_child_can_finish_while_the_root_turn_is_still_active() {
+        let state = root_state();
+        let (events, mut rx) = Events::channel();
+        let activity = events.activity();
+        let notify = |thread: &str, method, mut params: Value| {
+            params["threadId"] = json!(thread);
+            on_notification(method, &params, &state, &events);
+        };
+        let finished = |id| json!({"turn": {"id": id, "status": "completed"}});
+        let message = |text| json!({"item": {"type": "agentMessage", "text": text}});
+        notify("root", "turn/started", json!({"turn": {"id": "r1"}}));
+        notify(
+            "root",
+            "thread/tokenUsage/updated",
+            json!({"tokenUsage": {"total": 30}}),
+        );
+        state.lock().unwrap().inputs.push(Some(1), "first");
+        state.lock().unwrap().inputs.push(Some(2), "second");
+        recorded(&state, &events, "first");
+
+        notify("child", "turn/started", json!({"turn": {"id": "c1"}}));
+        assert_eq!(state.lock().unwrap().turn.as_deref(), Some("r1"));
+        notify("child", "model/rerouted", json!({"toModel": "child-model"}));
+        notify(
+            "child",
+            "item/completed",
+            json!({"item": {"type": "userMessage", "content": [{"type": "text", "text": "second"}]}}),
+        );
+        notify(
+            "child",
+            "item/started",
+            json!({"item": {"type": "reasoning"}}),
+        );
+        notify("child", "item/completed", message("child result"));
+        assert!(activity.borrow().is_some());
+        notify(
+            "child",
+            "thread/tokenUsage/updated",
+            json!({"tokenUsage": {"total": 9}}),
+        );
+        notify("child", "turn/completed", finished("c1"));
+        assert!(rx.try_recv().is_err());
+        {
+            let s = state.lock().unwrap();
+            assert_eq!(s.turn.as_deref(), Some("r1"));
+            assert!(s.last_message.is_empty());
+            assert_eq!(s.recorded, [1]);
+            assert_eq!(s.inputs.0.len(), 1);
+        }
+
+        recorded(&state, &events, "second");
+        notify(
+            "root",
+            "item/started",
+            json!({"item": {"type": "reasoning"}}),
+        );
+        notify("root", "item/completed", message("root result"));
+        notify("root", "turn/completed", finished("r1"));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::InputRead(1))));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::InputRead(2))));
+        assert!(matches!(rx.try_recv(), Ok(AgentEvent::Said(t)) if t == "root result"));
+        assert!(matches!(rx.try_recv(),
+            Ok(AgentEvent::TurnEnded { ok: true, result, usage: Some(u), .. })
+                if result == "root result" && u["total"] == 30));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn concurrent_file_approvals_keep_each_threads_diff() {
+        let state = root_state();
+        let (events, _rx) = Events::channel();
+        let edit = |thread, path| {
+            json!({"threadId": thread, "item": {"type": "fileChange", "id": "same",
+            "changes": [{"kind": {"type": "add"}, "path": path, "diff": format!("+{path}")}]}})
+        };
+        let parent = edit("root", "a.rs");
+        let child = edit("child", "b.rs");
+        for item in [&parent, &child] {
+            on_notification("item/started", item, &state, &events);
+        }
+        let check = |thread, path| {
+            let s = state.lock().unwrap();
+            let request = json!({"threadId": thread, "itemId": "same"});
+            let changes = s.file_changes(&request);
+            let method = "item/fileChange/requestApproval";
+            assert_eq!(summary(method, &request, changes), format!("edit: {path}"));
+            assert!(request_detail(method, &request, changes).ends_with(&format!("+{path}")));
+        };
+        check("child", "b.rs");
+        check("root", "a.rs");
+        on_notification("item/completed", &child, &state, &events);
+        check("root", "a.rs");
+        on_notification("item/completed", &parent, &state, &events);
+        assert!(state.lock().unwrap().patches.is_empty());
     }
 }
