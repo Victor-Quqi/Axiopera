@@ -1116,6 +1116,8 @@ impl Daemon {
             "Run `axiopera wait` as a background command. When it finishes, run `axiopera inbox`."
         } else if host.starts_with("pi:") && identity::task_of(caller).is_none() {
             "With the Pi TUI extension, run `axiopera inbox` when notified. Otherwise run `axiopera wait` in the foreground, then `axiopera inbox`."
+        } else if host.starts_with("opencode:") || task_agent == Some(Agent::Opencode) {
+            "Run `axiopera wait` with the shell tool's background option. When the shell reports completion, run `axiopera inbox`. With a foreground-only shell, wait in the foreground."
         } else {
             "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some."
         };
@@ -1613,6 +1615,7 @@ impl Daemon {
                 Agent::Grok => format!("grok -r {session}"),
                 Agent::Agy => format!("agy --conversation {session}"),
                 Agent::Pi => format!("pi --session {session}"),
+                Agent::Opencode => format!("opencode --session {session}"),
             };
             let mut task = entry.task.clone();
             task.detached = true;
@@ -2780,6 +2783,10 @@ fn check_tier(agent: Agent, tier: ipc::Tier) -> Result<()> {
         (Agent::Pi, ipc::Tier::Read | ipc::Tier::Work) => {
             refuse(ErrorCode::Invalid, "Pi supports --tier full only")
         }
+        (Agent::Opencode, ipc::Tier::Work) => refuse(
+            ErrorCode::Invalid,
+            "OpenCode supports --tier read and --tier full",
+        ),
         _ => Ok(()),
     }
 }

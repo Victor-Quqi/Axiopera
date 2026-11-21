@@ -113,6 +113,19 @@ pub(super) async fn assert_reaped(dir: &Path) {
 }
 
 #[test]
+fn pi_and_opencode_reject_unsupported_dispatch_tiers() {
+    use ipc::Tier::*;
+    for (agent, allowed) in [
+        (Agent::Pi, &[Full][..]),
+        (Agent::Opencode, &[Read, Full][..]),
+    ] {
+        for tier in [Read, Work, Full] {
+            assert_eq!(check_tier(agent, tier).is_ok(), allowed.contains(&tier));
+        }
+    }
+}
+
+#[test]
 fn blocked_is_logged_without_waking_and_counted_once_per_turn() {
     let f = fixture();
     f.d.emit("test", "blocked", json!({"detail": "denied"}));
@@ -391,6 +404,7 @@ async fn native_child_inboxes_are_separate_and_the_task_session_keeps_its_identi
         (Agent::Grok, "grok"),
         (Agent::Agy, "agy"),
         (Agent::Pi, "pi"),
+        (Agent::Opencode, "opencode"),
     ] {
         let native = format!("task:test/{host}:native");
         let root = format!("task:test/{host}:root");

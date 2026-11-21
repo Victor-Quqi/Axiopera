@@ -201,6 +201,10 @@ fn finish_exit(d: &Daemon, id: &str, exit: Exit) -> Result<()> {
         }
         if detached {
             task.detached = true;
+            task.status = Status::Interrupted;
+            task.stalled = false;
+            task.pending_inputs.clear();
+            task.pending_mail.clear();
         }
         task.updated_ms = crate::store::now_ms();
         let saved = if released {
@@ -209,8 +213,8 @@ fn finish_exit(d: &Daemon, id: &str, exit: Exit) -> Result<()> {
             d.store.save(&task)
         };
         entry.releasing = true;
-        entry.mail = entry.task.pending_mail.clone();
-        if !released && !resumed {
+        entry.mail = task.pending_mail.clone();
+        if detached || (!released && !resumed) {
             entry.pending.clear();
         }
         saved?;
@@ -383,7 +387,10 @@ async fn drive_agent(
     tokio::pin!(start);
     let started = loop {
         tokio::select! {
-            b = &mut start => break b?,
+            b = &mut start => match b {
+                Err(e) if e.is::<agent::SessionTakenOver>() => return Ok(Exit::Detached),
+                result => break result?,
+            },
             cmd = rx.recv() => match cmd {
                 Some(Cmd::Input(m)) => inputs.push(m.queued()),
                 Some(Cmd::Mail(m)) => keep_mail(d, id, m),
@@ -868,6 +875,23 @@ async fn cancel(backend: &mut Backend, cause: Cancellation) -> Exit {
 mod tests {
     use super::super::tests::fixture;
     use super::*;
+
+    #[test]
+    fn external_takeover_stops_the_actor_and_discards_unsent_input() {
+        let f = fixture();
+        f.d.update("test", |t| {
+            t.pending_inputs.push("continue".into());
+            t.pending_mail.push("note".into());
+            t.status = Status::Running;
+        });
+        finish_exit(&f.d, "test", Exit::Detached).unwrap();
+        let st = f.d.lock();
+        let entry = &st.tasks["test"];
+        assert!(entry.task.detached);
+        assert_eq!(entry.task.status, Status::Interrupted);
+        assert!(entry.task.pending_inputs.is_empty() && entry.task.pending_mail.is_empty());
+        assert!(entry.pending.is_empty() && entry.mail.is_empty());
+    }
 
     #[test]
     fn reported_models_replace_only_what_they_name() {

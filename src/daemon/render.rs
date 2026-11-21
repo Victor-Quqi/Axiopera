@@ -66,6 +66,7 @@ pub fn agent_name(a: Agent) -> &'static str {
         Agent::Grok => "grok",
         Agent::Agy => "agy",
         Agent::Pi => "pi",
+        Agent::Opencode => "opencode",
     }
 }
 
@@ -94,7 +95,7 @@ pub fn capability_notes(agent: Agent, tier: Tier) -> Vec<String> {
                 "MCP: only tools marked read-only without a destructive hint are allowed".into()
             }
             Agent::Grok => "MCP: unavailable".into(),
-            Agent::Agy => {
+            Agent::Agy | Agent::Opencode => {
                 "MCP: Axiopera workspace directory listing and communication only; no shell".into()
             }
             Agent::Pi => "Pi requires --tier full".into(),

@@ -32,6 +32,7 @@ pub enum Agent {
     Grok,
     Agy,
     Pi,
+    Opencode,
 }
 
 #[derive(

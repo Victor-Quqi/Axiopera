@@ -5,6 +5,8 @@ mod claude;
 mod codex;
 pub mod codex_remote;
 mod grok;
+mod opencode;
+pub use opencode::SessionTakenOver;
 pub mod models;
 mod pi;
 mod rpc;
@@ -267,7 +269,7 @@ fn content_text(content: &Value) -> String {
 
 /// Instructions every sub-agent gets on top of its own system prompt.
 fn protocol_text(spec: &StartSpec) -> String {
-    let ask = if matches!(spec.agent, Agent::Codex | Agent::Agy) {
+    let ask = if matches!(spec.agent, Agent::Codex | Agent::Agy | Agent::Opencode) {
         "call the `ask` tool of the axiopera MCP server"
     } else {
         "run `axiopera ask \"<question>\"`"
@@ -336,6 +338,7 @@ pub enum Backend {
     Grok(grok::Grok),
     Agy(agy::Agy),
     Pi(pi::Pi),
+    Opencode(opencode::OpenCode),
 }
 
 impl Backend {
@@ -347,6 +350,9 @@ impl Backend {
             Agent::Agy => Backend::Agy(agy::Agy::start(spec, exe, events).await?),
             Agent::Grok => Backend::Grok(grok::Grok::start(spec, exe, events).await?),
             Agent::Pi => Backend::Pi(pi::Pi::start(spec, exe, events).await?),
+            Agent::Opencode => {
+                Backend::Opencode(opencode::OpenCode::start(spec, exe, events).await?)
+            }
         })
     }
 
@@ -357,6 +363,7 @@ impl Backend {
             Backend::Agy(a) => a.turn(text).await,
             Backend::Grok(a) => a.turn(text).await,
             Backend::Pi(a) => a.turn(text).await,
+            Backend::Opencode(a) => a.turn(text).await,
         }
     }
 
@@ -367,6 +374,7 @@ impl Backend {
             Backend::Agy(a) => a.steer(text, id).await,
             Backend::Grok(a) => a.steer(text).await,
             Backend::Pi(a) => a.steer(text, id).await,
+            Backend::Opencode(a) => a.steer(text, id).await,
         }
     }
 
@@ -377,6 +385,7 @@ impl Backend {
             Backend::Agy(a) => a.interrupt().await,
             Backend::Grok(a) => a.interrupt().await,
             Backend::Pi(a) => a.interrupt().await,
+            Backend::Opencode(a) => a.interrupt().await,
         }
     }
 
@@ -388,6 +397,7 @@ impl Backend {
             Backend::Agy(a) => a.busy(),
             Backend::Grok(a) => a.busy(),
             Backend::Pi(a) => a.busy(),
+            Backend::Opencode(a) => a.busy(),
         }
     }
 
@@ -399,6 +409,7 @@ impl Backend {
             Backend::Agy(a) => a.in_turn(),
             Backend::Grok(a) => a.in_turn(),
             Backend::Pi(a) => a.in_turn(),
+            Backend::Opencode(a) => a.in_turn(),
         }
     }
 
@@ -409,6 +420,7 @@ impl Backend {
             Backend::Agy(a) => &mut a.proc,
             Backend::Grok(a) => &mut a.proc,
             Backend::Pi(a) => &mut a.proc,
+            Backend::Opencode(a) => &mut a.proc,
         }
     }
 
@@ -604,6 +616,7 @@ pub fn resolve_exe(
         Agent::Grok => "grok",
         Agent::Agy => "agy",
         Agent::Pi => "pi",
+        Agent::Opencode => "opencode",
     };
     if agent == Agent::Grok {
         let home = var("GROK_HOME")
@@ -652,6 +665,7 @@ fn npm_native(dir: &Path, agent: Agent) -> Option<PathBuf> {
             "@openai/codex/node_modules/@openai/codex-win32-{arch}/vendor/{triple}/bin/codex.exe"
         )),
         Agent::Pi => modules.join("@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
+        Agent::Opencode => return opencode::npm_executable(&modules, arch),
         Agent::Grok | Agent::Agy => return None,
     };
     exe.is_file().then_some(exe)

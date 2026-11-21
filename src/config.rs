@@ -25,6 +25,7 @@ pub struct Agents {
     pub grok: AgentConfig,
     pub agy: AgentConfig,
     pub pi: AgentConfig,
+    pub opencode: AgentConfig,
 }
 
 #[derive(Deserialize, Default, Clone)]
@@ -44,6 +45,7 @@ impl Agents {
             Agent::Grok => &self.grok,
             Agent::Agy => &self.agy,
             Agent::Pi => &self.pi,
+            Agent::Opencode => &self.opencode,
         }
     }
 }

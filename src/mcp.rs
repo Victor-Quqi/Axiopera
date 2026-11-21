@@ -55,17 +55,7 @@ pub async fn serve(
             "tools/list" => json!({"tools": tools(list_root.is_some())}),
             "tools/call" if codex_hooks => hook(&client, params, &mut reminded).await,
             "tools/call" => {
-                let session = params["_meta"]["antigravity.google/conversation_id"]
-                    .as_str()
-                    .and_then(|id| uuid::Uuid::parse_str(id).ok());
-                let sender = match (caller.as_deref(), session) {
-                    (Some(task), Some(session))
-                        if task.starts_with("task:") && !task.contains('/') =>
-                    {
-                        Some(format!("{task}/agy:{session}"))
-                    }
-                    _ => caller.clone(),
-                };
+                let sender = tool_caller(caller.as_deref(), &params["_meta"]);
                 call(&client, sender, params, list_root).await
             }
             other => {
@@ -190,6 +180,29 @@ fn directory_page(root: &Path, arguments: &Value) -> Result<Value> {
     Ok(json!({"entries": &names[start..end], "next_offset": (end < names.len()).then_some(end)}))
 }
 
+fn tool_caller(caller: Option<&str>, meta: &Value) -> Option<String> {
+    let caller = caller?;
+    if caller.starts_with("task:") && !caller.contains('/') {
+        if let Some(id) = meta["antigravity.google/conversation_id"]
+            .as_str()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+        {
+            return Some(format!("{caller}/agy:{id}"));
+        }
+        if let Some(id) = meta["ai.opencode/sessionID"].as_str()
+            && id.strip_prefix("ses_").is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+            })
+        {
+            return Some(format!("{caller}/opencode:{id}"));
+        }
+    }
+    Some(caller.to_owned())
+}
+
 async fn call(
     client: &Client,
     caller: Option<String>,
@@ -290,6 +303,27 @@ fn tool_result(text: String, is_error: bool) -> Value {
 #[cfg(test)]
 mod directory_tests {
     use super::*;
+
+    #[test]
+    fn opencode_mcp_routes_each_native_session_inside_its_task() {
+        let meta = json!({"ai.opencode/sessionID":"ses_child123"});
+        assert_eq!(
+            tool_caller(Some("task:abc"), &meta).as_deref(),
+            Some("task:abc/opencode:ses_child123")
+        );
+        for rejected in ["", "ses_", "ses_child/task:other"] {
+            let meta = json!({"ai.opencode/sessionID":rejected});
+            assert_eq!(
+                tool_caller(Some("task:abc"), &meta).as_deref(),
+                Some("task:abc")
+            );
+        }
+        assert_eq!(
+            tool_caller(Some("task:abc/pi:parent"), &meta).as_deref(),
+            Some("task:abc/pi:parent")
+        );
+        assert_eq!(tool_caller(None, &meta), None);
+    }
 
     #[test]
     fn workspace_listing_is_scoped_and_paged() {

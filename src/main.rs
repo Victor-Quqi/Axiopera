@@ -506,6 +506,7 @@ fn guide(host: Option<Agent>, caller: &str) -> String {
             "codex" => (Agent::Codex, "Codex"),
             "agy" => (Agent::Agy, "Antigravity CLI"),
             "pi" => (Agent::Pi, "Pi"),
+            "opencode" => (Agent::Opencode, "OpenCode"),
             _ => (Agent::Grok, "Grok"),
         };
         match host {
@@ -557,6 +558,7 @@ mod tests {
             ("grok", skill::Host::Grok),
             ("agy", skill::Host::Agy),
             ("pi", skill::Host::Pi),
+            ("opencode", skill::Host::Opencode),
             ("all", skill::Host::All),
         ] {
             for force in [false, true] {
