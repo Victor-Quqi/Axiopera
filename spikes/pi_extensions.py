@@ -58,7 +58,7 @@ class Fixture:
                               text=True, encoding="utf-8", errors="replace", timeout=180, check=True, **kwargs).stdout
 
     @contextlib.contextmanager
-    def model(self, respond):
+    def model(self, respond, models=None):
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_):
                 pass
@@ -83,14 +83,15 @@ class Fixture:
                 self.wfile.write(b"data: [DONE]\n\n")
 
         with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            url = f"http://127.0.0.1:{server.server_port}/v1"
             settings = {"providers": {"fixture": {"api": "openai-completions", "apiKey": "local-fixture",
-                        "baseUrl": f"http://127.0.0.1:{server.server_port}/v1",
-                        "models": [{"id": "probe", "input": ["text"], "reasoning": False,
+                        "baseUrl": url,
+                        "models": models or [{"id": "probe", "input": ["text"], "reasoning": False,
                                     "contextWindow": 100000, "maxTokens": 4000}]}}}
             (self.agent / "models.json").write_text(json.dumps(settings), encoding="utf-8")
             threading.Thread(target=server.serve_forever, daemon=True).start()
             try:
-                yield
+                yield url
             finally:
                 server.shutdown()
 
