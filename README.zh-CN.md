@@ -28,44 +28,44 @@ Axiopera 支持 Claude Code、Codex、Grok Build、Antigravity CLI、Pi 和 Open
 
 从 [Releases](https://github.com/Victor-Quqi/Axiopera/releases) 下载并解压，将 `axiopera` 或 `axiopera.exe` 放入 PATH。
 
-有 Rust 可运行 `cargo install axiopera --locked`。试用开发分支时，在该分支的仓库根目录运行 `cargo install --path . --locked`。
-
-Windows、Linux 已实测，macOS 待验证。[验证范围](docs/verification.md#已测版本)
+也可以运行 `cargo install axiopera --locked` 安装。
 
 **2. 安装 Skill（推荐）**
 
-按主 agent 执行对应命令，新开会话即可使用：
+```sh
+axiopera skill install all
+```
 
-| Agent | 命令 |
-|---|---|
-| Claude Code | `axiopera skill install claude` |
-| Codex | `axiopera skill install codex` |
-| Grok Build | `axiopera skill install grok` |
-| Antigravity CLI | `axiopera skill install agy` |
-| Pi | `axiopera skill install pi` |
-| OpenCode v2 | `axiopera skill install opencode` |
+装好后新开会话即可使用。只给某个 agent 安装时，把 `all` 换成 `claude`、`codex`、`grok`、`agy`（Antigravity CLI）、`pi` 或 `opencode`。
 
-为所有支持的 Harness 安装：`axiopera skill install all`。
-
-Skill 内置于程序，可离线安装。[安装位置、覆盖与卸载](docs/usage.md#skill-与-codex-插件)。
-
-用 `axiopera spawn pi` 派发任务时选 `--tier full`，用 `axiopera spawn opencode` 时选 `--tier read` 或 `--tier full`。
-
-Pi 需要自动提醒时，运行 `pi install git:github.com/Victor-Quqi/Axiopera`，在已打开的 TUI 会话中输入 `/reload`。试用开发分支时，将 `pi install` 的参数换为同一仓库的绝对路径。[更新与卸载](docs/usage.md#pi-扩展)
+**以下两种子任务提醒需要插件**
 
 <details>
-<summary>Codex 桌面端 / VS Code：中途提醒插件</summary>
+<summary>Codex 桌面端 / VS Code 的轮中提醒</summary>
 
-**只用 Codex TUI，安装 Skill 即可，中途消息由 Axiopera 直接推送。**
+这两个客户端默认在本轮结束后才提醒 Codex。装插件后，下一次工具调用返回时就能处理子任务的消息。普通 Codex 终端已支持轮中提醒。
 
-桌面端和 VS Code 默认等本轮结束才收到提醒。插件通过 hook，在下一次工具调用后送入提醒。
-
-插件已包含 Skill。通过 CLI 安装并信任 hook，再新开会话：
+插件自带 Skill。在终端运行以下命令，然后在 Codex 中信任插件的 hook，再新开会话。
 
 ```sh
 codex plugin marketplace add Victor-Quqi/Axiopera
 codex plugin add axiopera@axiopera
 ```
+
+[插件管理与卸载](docs/usage.md#skill-与-codex-插件)
+
+</details>
+
+<details>
+<summary>唤醒空闲的 Pi 终端</summary>
+
+即使派出的任务已经完成，空闲的 Pi 也会等你再次输入。装扩展后，结果或提问会自动唤醒 Pi。如果 Pi 还在工作，提醒会在工具返回后送达。
+
+```sh
+pi install git:github.com/Victor-Quqi/Axiopera
+```
+
+在已打开的 Pi 会话中输入 `/reload` 即可生效。[更新与卸载](docs/usage.md#pi-扩展)
 
 </details>
 
