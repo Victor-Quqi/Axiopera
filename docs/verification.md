@@ -11,13 +11,14 @@
 | Windows 11 | [个人命令禁令、AGY 派发与宿主收件](#antigravity-cli-1511) | Antigravity CLI 1.5.7、1.5.11 |
 | Windows 11 | 任务派发、原会话冷续接、宿主 TUI 收件、原生子任务 | Pi 1.6.0、OpenCode 2.3.2 |
 | Linux，WSL2 Ubuntu 24.04 | 三家原生 Linux CLI 的端到端流程、sandbox 回连、进程组取消和 Codex 宿主推送 | Claude Code 2.1.296、Codex 0.162.1、Grok 1.0.52 |
+| Linux，WSL2 Ubuntu 24.04.4 | Pi full、OpenCode read/full 的工具、轮中追加与续接，两个原生 TUI 的忙闲收件 | Pi 1.6.0、OpenCode 2.3.2 |
 | macOS | 有平台实现，真实 agent、sandbox 检测及回连尚未实测 | 未验证 |
 
 最低支持版本尚未确定。
 
 ## 依据
 
-Pi 1.6.0 自带 subagent 示例、`pi-subagents` 0.89.2 和 `@tintinweb/pi-subagents` 0.26.2 的子进程各有自己的 Pi 会话 ID。两个社区插件在父轮结束后继续处理后台子任务，Axiopera 保留进程，记录插件唤醒的后续轮次。隔离 Git 源和真实 Pi TUI 另覆盖扩展安装、更新、卸载、忙闲收件和重复加载去重。可重跑 `python spikes/pi_extensions.py <pi.exe> host` 和 `python spikes/pi_extensions.py <pi.exe> subagents`。
+Windows 上，Pi 1.6.0 自带 subagent 示例、`pi-subagents` 0.89.2 和 `@tintinweb/pi-subagents` 0.26.2 的子进程各有自己的 Pi 会话 ID。两个社区插件在父轮结束后继续处理后台子任务，Axiopera 保留进程，记录插件唤醒的后续轮次。Windows 与 Linux 的真实 Pi TUI 均覆盖扩展安装、更新、卸载、忙闲收件和重复加载去重。可重跑 `python spikes/pi_extensions.py <pi> host` 和 `python spikes/pi_extensions.py <pi> subagents`。
 
 Pi full 和 OpenCode read/full 使用 `gpt-6.1-terra` 验证文件读取、full 写入、同会话恢复随机文件内容，以及输出原生接管命令。OpenCode 两档另在两轮之间完整停止并重启 Axiopera daemon。`python spikes/opencode_managed.py <opencode.exe>` 用可控的本地模型验证托管任务。额外实测包括 OpenCode read 的七个工具、full 审批与拒绝、轮中追加、取消、原生子任务唤醒和接管。
 
