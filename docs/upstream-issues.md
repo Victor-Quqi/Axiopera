@@ -4,9 +4,11 @@
 
 ## Pi 和 OpenCode v2
 
-Pi 扩展升级后，用 `pi_extensions.py` 核对社区 subagent 工具的返回字段与后台通知。父轮 `agent_settled` 时子任务可能仍在运行，探针等待真实子任务完成并检查第二轮结果。
+Pi 或社区 subagent 插件升级后，用 [Pi 探针](../spikes/pi_extensions.py)的 `subagents` 模式核对后台任务 ID、完成通知和父进程的释放时机。父轮 `agent_settled` 后子任务可能仍在运行，完成通知开启的下一轮应计入同一任务。`host` 模式核对通知扩展在空闲和忙碌时的投递，以及卸载后的前台等待。
 
 OpenCode 2.3.2 的私有 `serve --stdio` 返回会话日志序号时，默认可能没有历史事件正文。升级时核对实时订阅握手、断流后的处理，以及同会话和其他会话分别被外部续写时的接管判断。
+
+OpenCode 原生后台 shell 的完成通知携带命令输出。[宿主探针](../spikes/opencode_host.py)检查模型能否从通知读到 `wait` 给出的 `inbox` 命令，并取回结果。若新版本仅通知完成状态，需同步调整派发和续接回执。
 
 ## Antigravity CLI
 

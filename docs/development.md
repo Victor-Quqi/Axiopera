@@ -6,10 +6,10 @@
 |---|---|
 | `src/main.rs`、`src/guide.md` | CLI 参数、agent 使用说明 |
 | `src/client.rs`、`src/ipc.rs` | 客户端和 IPC 报文 |
-| `src/daemon/mod.rs`、`task.rs` | 请求处理、任务调度和轮次驱动 |
-| `src/daemon/push.rs`、`render.rs` | 宿主推送和输出格式 |
+| `src/daemon/mod.rs`、`task.rs` | 请求处理、任务调度、轮次驱动和宿主收件回执 |
+| `src/daemon/push.rs`、`delivery.rs`、`render.rs` | Codex 推送、收件内容和输出格式 |
 | `src/agent/` | 原生 CLI 协议适配 |
-| `src/mcp.rs` | 子 agent 的 ask、tell、answers 工具，Codex 插件的 hook |
+| `src/mcp.rs` | 子 agent 的通信工具、read 档工作区目录工具和 Codex 插件 hook |
 | `src/plugin.rs` | Codex 插件卸载后的清理 |
 | `src/skill.rs` | 内置 skill 的安装 |
 | `plugins/axiopera/`、`.agents/plugins/` | skill、Codex 插件和 marketplace |
@@ -44,7 +44,7 @@ cargo package --locked --target-dir target/package-verify
 各文档按用途维护，同一事实只在一处陈述，其他位置链接过去：
 
 - `README.md` 与 `README.zh-CN.md`：用户介绍、安装和快速上手，两种语言同步维护。
-- `src/guide.md`：`axiopera guide` 的输出，面向主 agent，只保留完成协作所需的操作说明。以宿主名开头的行（如 `@pi `）只属于该宿主，以 `@user` 开头的行只在调用方被识别为 `user` 时输出。修改命令时同步。
+- `src/guide.md`：`axiopera guide` 的输出，面向主 agent，只保留完成协作所需的操作说明。以宿主名开头的行（如 `@grok `）只属于该宿主，以 `@user` 开头的行只在调用方被识别为 `user` 时输出。修改命令时同步。
 - `docs/usage.md`：用户配置、任务操作和维护。
 - `docs/backends.md`：权限映射和协议差异。修改适配器前先查，修改后端行为时同步。
 - `docs/upstream-issues.md`：按宿主记录升级时要复测的上游问题，以及通过后可以撤除的限制或兼容代码。

@@ -20,11 +20,13 @@
 
 Windows 上，Pi 1.6.0 自带 subagent 示例、`pi-subagents` 0.89.2 和 `@tintinweb/pi-subagents` 0.26.2 的子进程各有自己的 Pi 会话 ID。两个社区插件在父轮结束后继续处理后台子任务，Axiopera 保留进程，记录插件唤醒的后续轮次。`pi-subagents` 的 delegate 按回执在前台等待并取回自己派发的结果。父 TUI 随后派发任务，扩展仍会提醒，父 TUI 只取回自己的结果。Linux 上的 Pi 官方 subagent 示例也验证了子会话的前台等待回执。社区插件探针为 `python spikes/pi_extensions.py <pi> subagents`。
 
-`python spikes/pi_extensions.py <pi> host` 使用本地模型夹具和真实 Pi TUI。Windows 和 Linux 均覆盖安装、更新、卸载、冷启动首次派发、`send` 和 `reply` 回执、忙闲收件、重载去重，以及卸载后前台等待并取回结果。无关对话没有收到收件指令，也没有启动 daemon。
+`python spikes/pi_extensions.py <pi> host` 在 Windows 和 Linux 的真实 Pi TUI 中覆盖安装、更新、卸载、冷启动首次派发、`send` 和 `reply` 回执、忙闲收件、重载去重，以及卸载后前台等待并取回结果。Windows 上，扩展在线时模型从提醒中读到收件命令。卸载并重载后，模型从前台 `wait` 的输出读到该命令，再单独调用 `inbox`。无关对话没有收到收件指令，也没有启动 daemon。
 
-Pi full 和 OpenCode read/full 使用 `gpt-6.1-terra` 验证文件读取、full 写入、同会话恢复随机文件内容，以及输出原生接管命令。OpenCode 两档另在两轮之间完整停止并重启 Axiopera daemon。`python spikes/opencode_managed.py <opencode.exe>` 用可控的本地模型验证托管任务。额外实测包括 OpenCode read 的七个工具、full 审批与拒绝、轮中追加、取消、原生子任务唤醒和接管。
+Windows 上，Pi full 和 OpenCode read/full 使用 `gpt-6.1-terra` 验证文件读取、full 写入、同会话恢复随机文件内容，以及输出原生接管命令。OpenCode 两档均验证了 Axiopera daemon 重启后的续接。另已实测 OpenCode 的取消、原生子任务唤醒和接管。
 
-`python spikes/opencode_host.py <opencode.exe>` 用真实交互 TUI 验证后台 `wait` 唤醒空闲宿主、忙时当前前台命令继续执行，以及随后 `inbox` 取回结果。Windows 上，OpenCode 2.3.2 发给模型的 shell 完成通知包含 `wait` 输出的收件命令。`node spikes/pi_watch.mjs <axiopera.exe>` 验证监听重连、重放去重、宿主强退回收、daemon 空闲退出后重新发现，以及同一 Pi 会话切换 Axiopera 数据目录后收到首条提醒。
+`python spikes/pi_rpc.py <pi>` 验证模型目录、权限档位、文件写入、轮中追加、取消和原会话续接。`python spikes/opencode_managed.py <opencode>` 验证 read 的七个工具、full 的单次审批与拒绝、轮中追加和续接。
+
+`python spikes/opencode_host.py <opencode>` 在真实 TUI 中验证后台 `wait` 唤醒空闲宿主、忙时当前前台命令继续执行，以及随后 `inbox` 取回结果。Windows 上，OpenCode 2.3.2 的 `spawn`、`send`、`reply` 回执说明何时等待，模型随后从 shell 完成通知中读到收件命令。`node spikes/pi_watch.mjs` 验证 Pi 监听重连、重放去重、宿主强退回收、daemon 空闲退出后重新发现，以及同一 Pi 会话切换 Axiopera 数据目录后收到首条提醒。
 
 下表脚本名均指 `spikes/` 下的探针。
 
@@ -34,9 +36,9 @@ Pi full 和 OpenCode read/full 使用 `gpt-6.1-terra` 验证文件读取、full 
 | [模型查询](backends.md#模型查询)：三家原生目录查询及推理强度字段；Codex 无效强度错误附模型列表；不带 `--model` 的任务按派发默认值运行，带 `--model`、`--effort` 的任务按请求运行，`status` 和每轮结果首行显示实际模型 | Windows，`models.py` 验证原生目录；`models.py codex --errors` 验证非法强度错误；`models.py --tasks` 验证派发默认值及显式覆盖。目录覆盖 Claude 2.1.309、Codex 0.164.0、Grok 1.0.67，派发覆盖 Claude 2.1.316、Codex 0.166.0、Grok 1.0.67。Claude 2.1.312 的 JSON 目录含 `resolvedModel`。Grok 的会话默认模型受服务端 campaign 影响。[campaigns.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/util/config/campaigns.rs#L14-L56)、[session_setup.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/mvp_agent/session_setup.rs#L516-L535)、[resolution.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/remote_config/resolution.rs#L135-L232)、[manager/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/remote_config/manager/mod.rs#L1225-L1375) |
 | [会话与消息](backends.md#会话与消息)：实际模型与推理强度的来源 | Windows。Claude 2.1.316 的 `get_settings.applied` 随显式模型、强度变化，可在首轮前读取；`model_fallback` 字段依据二进制。Codex 0.166.0 的 `thread/start` 与 `config/read` 一致，`model/rerouted` 的作用域和强度回退依据 schema 与源码。Grok 1.0.67 用 `model_changed` 报告配置变化，`session/prompt` 的 `_meta.modelId` 与会话文件一致。[session/mod.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/mod.rs#L4348-L4375)、[step_settings.rs](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/session/step_settings.rs#L76-L87) |
 | [会话与消息](backends.md#会话与消息)：Grok ACP 会话忽略 `-m`、`--reasoning-effort`，`session/set_config_option` 生效，无效值返回 `-32602` | Windows、Grok 1.0.67 的 prompt 回复、`model_changed` 和会话文件。环境变量 `GROK_DEFAULT_MODEL` 也不覆盖新会话模型。该版本原生目录只有 `grok-build-plan`，跨 harness 重建 agent 的行为依据源码，read 档拒绝路径由单元测试覆盖。[model_switch.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/handlers/model_switch.rs#L60-L175)、[mvp_agent/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/agent/mvp_agent/mod.rs#L935-L948) |
-| [已测版本](#已测版本)中的端到端流程：主 agent 仅凭 `guide --host` 完成派发、收结果、追问和取消 | `host_e2e.py` |
+| Claude Code、Codex 和 Grok 宿主从 `guide --host` 开始完成派发、收结果、追问和取消 | `host_e2e.py` |
 | [宿主通知](backends.md#宿主通知)：`grok -p` 等 persistent monitor 结束才退出，`--no-wait-for-background` 让它在本轮结束时退出 | `host_e2e.py grok` |
-| [权限](backends.md#权限)：read 档 MCP 工具按注解过滤 | `read_mcp.py` |
+| [权限](backends.md#权限)：Claude read 档按注解过滤 MCP 工具，Grok ACP 提供的工具信息和禁用粒度 | `read_mcp.py` |
 | [权限](backends.md#权限)：Grok 权限模式和工具裁剪 | `grok_perms.py`、`grok_profile.py` |
 | [权限](backends.md#权限)：回连差异表中 Codex Windows 两行 | `ipc_sandbox.py`，elevated 加 `-c windows.sandbox="elevated"`；手动实验：在 elevated sandbox 中运行 `axiopera daemon status` |
 | [权限](backends.md#权限)：回连差异表中 Linux 三行 | 手动实验：在三家原生 Linux sandbox 内调用 `axiopera` |
@@ -45,16 +47,16 @@ Pi full 和 OpenCode read/full 使用 `gpt-6.1-terra` 验证文件读取、full 
 | [权限](backends.md#权限)：Claude auto 分类器的模型选择和失败处理 | 文档 [permission-modes](https://code.claude.com/docs/en/permission-modes#default-classifier-model)、[errors](https://code.claude.com/docs/en/errors#auto-mode-cannot-determine-the-safety-of-an-action)；Claude Code 2.1.302 二进制中的日志字符串 |
 | [权限](backends.md#权限)：Grok auto 分类器使用会话模型，失败或超时转为审批，无法解析时拒绝 | 源码 [sampler_turn.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/sampler_turn.rs#L830-L873)、[manager/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-workspace/src/permission/manager/mod.rs#L1063-L1078)、[auto_mode/mod.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-workspace/src/permission/auto_mode/mod.rs#L1480-L1499) |
 | [审批](backends.md#审批)：不使用持久化批准选项 | `codex_escalate.py`：Codex 的 amendment 会写入用户规则，`acceptForSession` 只缓存完全相同的命令 |
-| [审批](backends.md#审批)：后端自行拒绝时的返回形式 | `native_block.py` |
+| [审批](backends.md#审批)：Claude、Codex 和 Grok 自行拒绝时的返回形式 | `native_block.py` |
 | [审批](backends.md#审批)：Codex 撤回请求 | Windows、Codex 0.167.0。命令审批收到 `decline` 后，`serverRequest/resolved.requestId` 与原 JSON-RPC 请求 ID 一致。网络请求在裁决前结束时的撤回行为依据上游源码。[bespoke_event_handling.rs](https://github.com/openai/codex/blob/rust-v0.167.0/codex-rs/app-server/src/bespoke_event_handling.rs#L836-L846)、[outgoing_message.rs](https://github.com/openai/codex/blob/rust-v0.167.0/codex-rs/app-server/src/outgoing_message.rs#L232-L241) |
 | [会话与消息](backends.md#会话与消息)：Claude read 档需另加 `--permission-prompt-tool stdio` | `read_mcp.py` |
 | [会话与消息](backends.md#会话与消息)：中途消息和消费确认 | `steer.py`、`message_receipts.py`；源码 [Codex tasks/mod.rs](https://github.com/openai/codex/blob/ce0323f2f2d3b25e82806cd555237da3db4e1897/codex-rs/core/src/tasks/mod.rs)、[Grok interjection.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/interjection.rs) |
 | [任务与工作目录](usage.md#任务与工作目录)：`send --tier` 保留会话并切换权限 | `tier_resume.py`，Windows、Claude Code 2.1.312、Codex 0.165.0、Grok 1.0.67。从 read 切至 full 再切回 read，会话 ID 一致，只有 full 档能写文件。档位持久化、父子档位约束和运行中切档由单元测试覆盖 |
 | [会话与消息](backends.md#会话与消息)：Grok 空闲时的消息，以及一次 prompt 内的多段答复 | `grok_idle_interject.py`、`grok_response_boundary.py` |
 | [会话与消息](backends.md#会话与消息)：Grok 工具名、参数摘要及后续更新 | 上游工具事件与 MCP 输入结构。适配器、daemon 和 `top` 单元测试覆盖参数提取、MCP 展开、更新去重和调用计数。[tool_calls.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-shell/src/session/acp_session_impl/tool_calls.rs)、[use_tool/input.rs](https://github.com/xai-org/grok-build/blob/2bdd1d6a6369de0e8c68132ea4539e9abd9e14a8/crates/codegen/xai-grok-tools/src/implementations/use_tool/input.rs) |
-| [会话与消息](backends.md#会话与消息)：后台命令结束后自行开启一轮 | `background.py` |
+| [会话与消息](backends.md#会话与消息)：Claude 和 Grok 在后台命令结束后自行开启一轮 | `background.py` |
 | [结果与接管](usage.md#结果与接管)：审批请求先于更早的结果交出，交出前不能批准；过长的提问和留言只给首尾，全文写入文件；agent 自行开启的一轮从开始就计入进度 | `delivery.py` |
-| [会话与消息](backends.md#会话与消息)：并发续接 | `resume.py` |
+| [会话与消息](backends.md#会话与消息)：Claude、Codex 和 Grok 的并发续接 | `resume.py` |
 | [会话与消息](backends.md#会话与消息)：Grok 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `grok_native_identity.py`，Windows、Grok 1.0.67。原生 auto 宿主和 Axiopera work 宿主下，主会话均无法取走子会话的结果 |
 | [会话与消息](backends.md#会话与消息)：Codex 原生子 agent 在直接及 Axiopera 混合嵌套中的收件隔离 | `codex_native_identity.py`，Windows、Codex 0.164.0。原生 full 权限宿主（`danger-full-access`）和 Axiopera work 宿主下，主会话均无法取走子线程的结果 |
 | [会话与消息](backends.md#会话与消息)：Codex 内置子线程先结束时的结果和中途消息 | Windows、Codex 0.171.0，read 档实测。主线程用 `wait_agent` 等待子线程。子线程答完时任务仍在运行，收件箱无结果；此时 `send` 通过 `turn/steer` 进入原轮。该轮只交付一次，答复和用量均来自主线程。单元测试另覆盖子线程输入回显及跨线程同条目 ID 的文件审批。 |
@@ -99,9 +101,9 @@ Windows 11 上的原生 CLI 与 Axiopera 任务验证结果如下。
 
 ## 探针
 
-探针调用真实 CLI，会消耗 token，只在需要验证真实行为时手动运行。各脚本顶部说明参数。
+Python 探针使用 Python 3.12 或更高版本。Pi 和 OpenCode 的 Python 探针以待测 CLI 路径为首个参数，在临时目录中使用本机模型服务，无需模型凭据。`pi_extensions.py` 的 `host` 模式使用 Git，`subagents` 模式会从 npm 下载两个固定版本的插件。`pi_watch.mjs` 只需 Node.js 24 或更高版本和编译好的 Axiopera。
 
-需要 Python 3.12 或更高版本，并安装、登录待测 CLI。探针从 PATH 定位程序；Windows 的 Claude/Codex npm 入口会解析为原生 exe。自定义安装可以通过 `AXIOPERA_PROBE_CLAUDE`、`AXIOPERA_PROBE_CODEX`、`AXIOPERA_PROBE_GROK` 指定可执行文件路径。
+Claude、Codex 和 Grok 探针默认查找本机 CLI，调用在线模型的用例需要已登录的 CLI 或有效模型凭据，并消耗对应额度。可用 `AXIOPERA_PROBE_CLAUDE`、`AXIOPERA_PROBE_CODEX`、`AXIOPERA_PROBE_GROK` 指定可执行文件路径。各脚本顶部列出参数。
 
 调用 Axiopera 的探针使用 `target/debug/axiopera`，Windows 使用对应 `.exe`，先运行 `cargo build --locked`。交互终端探针在 Windows 上需要 `python -m pip install pywinpty`。`daemon_job.py`、`ipc_sandbox.py` 和 `pipe_squat.py` 仅用于 Windows，先构建辅助程序：
 

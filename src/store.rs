@@ -452,8 +452,7 @@ pub struct CodexHost {
     /// The caller's `CODEX_HOME`, which locates its daemon and data.
     pub codex_home: Option<PathBuf>,
     pub thread: String,
-    /// Outside the shared daemon: reminded through Codex's queue to run `wait`, rather than
-    /// sent the events.
+    /// Use the Codex queue to remind this session to collect updates with `inbox`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub doorbell: bool,
 }

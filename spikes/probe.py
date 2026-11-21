@@ -1,7 +1,7 @@
 """Shared helpers for the protocol probes.
 
-Probes talk to the real agent CLIs, so they cost tokens. They never print
-environment variables or config files; transcripts are summarized, not dumped.
+Probes using live model providers consume tokens. Keep credentials and full
+transcripts out of probe output.
 """
 
 import json
