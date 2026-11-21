@@ -390,6 +390,7 @@ async fn native_child_inboxes_are_separate_and_the_task_session_keeps_its_identi
         (Agent::Codex, "codex"),
         (Agent::Grok, "grok"),
         (Agent::Agy, "agy"),
+        (Agent::Pi, "pi"),
     ] {
         let native = format!("task:test/{host}:native");
         let root = format!("task:test/{host}:root");

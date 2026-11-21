@@ -211,6 +211,7 @@ pub async fn query(
     timeout: Duration,
 ) -> Result<Catalog> {
     let args: Vec<String> = match agent {
+        Agent::Pi => return super::pi::query(exe, cwd, env, timeout).await,
         Agent::Codex => vec!["app-server"],
         Agent::Agy => vec!["acp"],
         Agent::Grok => vec!["agent", "--no-leader", "stdio"],
@@ -273,6 +274,7 @@ async fn discover(
 ) -> Result<Catalog> {
     let mut catalog = Catalog::default();
     match agent {
+        Agent::Pi => bail!("this backend has a dedicated model query"),
         Agent::Claude => {
             proc.stdin.send(&json!({"type":"control_request","request_id":"models","request":{"subtype":"initialize","hooks":{}}})).await?;
             let response = claude_response(proc, lines, "models")
@@ -552,6 +554,7 @@ fn parse_models(agent: Agent, value: &Value) -> Result<Vec<Model>> {
                 Agent::Claude => ("value", "displayName", row.get("supportedEffortLevels")),
                 Agent::Codex => ("model", "displayName", row.get("supportedReasoningEfforts")),
                 Agent::Agy => ("value", "name", None),
+                Agent::Pi => bail!("this backend has a dedicated model parser"),
                 Agent::Grok => ("modelId", "name", row["_meta"].get("reasoningEfforts")),
             };
             let id = string(row, id_key)

@@ -6,17 +6,18 @@ use anyhow::{Result, bail};
 pub const TASK_VAR: &str = "AXIOPERA_TASK_ID";
 
 /// Session variables hosts inject into their shell commands, and the caller prefix for each.
-pub const HOST_VARS: [(&str, &str); 4] = [
+pub const HOST_VARS: [(&str, &str); 5] = [
     ("CLAUDE_CODE_SESSION_ID", "claude"),
     ("CODEX_THREAD_ID", "codex"),
     ("GROK_SESSION_ID", "grok"),
     ("ANTIGRAVITY_CONVERSATION_ID", "agy"),
+    ("PI_SESSION_ID", "pi"),
 ];
 
 /// Host identity variables a sub-agent must not inherit from its caller, including the
 /// credentials of a Claude Code session's inbox, and the client name the Codex app and IDE
 /// extension give their sessions.
-pub const STRIP_VARS: [&str; 13] = [
+pub const STRIP_VARS: [&str; 15] = [
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_PID",
@@ -30,6 +31,8 @@ pub const STRIP_VARS: [&str; 13] = [
     "ANTIGRAVITY_AGENTAPI_EXE",
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_CODE_MESSAGING_TOKEN",
+    "PI_SESSION_ID",
+    "PI_SESSION_FILE",
 ];
 
 /// Caller key: `task:<id>/<host>:<session>`, `task:<id>`, `<host>:<session>`, or `user`.
@@ -173,6 +176,7 @@ mod tests {
             ("CODEX_THREAD_ID", "codex"),
             ("GROK_SESSION_ID", "grok"),
             ("ANTIGRAVITY_CONVERSATION_ID", "agy"),
+            ("PI_SESSION_ID", "pi"),
         ] {
             let parent = detect(env(&[(TASK_VAR, "t1"), (var, "parent")]), no_ancestors);
             let child = detect(env(&[(TASK_VAR, "t1"), (var, "child")]), no_ancestors);

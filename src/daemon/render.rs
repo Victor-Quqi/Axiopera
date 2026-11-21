@@ -65,6 +65,7 @@ pub fn agent_name(a: Agent) -> &'static str {
         Agent::Codex => "codex",
         Agent::Grok => "grok",
         Agent::Agy => "agy",
+        Agent::Pi => "pi",
     }
 }
 
@@ -96,6 +97,7 @@ pub fn capability_notes(agent: Agent, tier: Tier) -> Vec<String> {
             Agent::Agy => {
                 "MCP: Axiopera workspace directory listing and communication only; no shell".into()
             }
+            Agent::Pi => "Pi requires --tier full".into(),
         });
         notes.push(match agent {
             Agent::Grok => "shell commands other than plain axiopera commands are refused".into(),

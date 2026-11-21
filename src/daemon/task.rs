@@ -363,6 +363,7 @@ async fn drive_agent(
         effort: effort.map(str::to_owned),
         env: agent_env(&env, id, task.agent, &d.opts.home),
         resume: task.session.clone(),
+        resume_file: task.session_file.as_ref().map(|fp| fp.path.clone()),
         trace: std::env::var_os("AXIOPERA_TRACE_PROTOCOL")
             .filter(|v| v == "1")
             .map(|_| d.opts.home.join("tasks").join(id).join("protocol.log")),
@@ -435,7 +436,7 @@ async fn drive_agent(
                 turn_open = true;
                 continue;
             }
-            if !backend.busy() {
+            if !backend.busy() && erx.is_empty() {
                 match release_or_continue(d, id, rx, &mut waiting) {
                     Next::Turn(input) => {
                         request!(start_turn(d, id, backend, &input))?;
@@ -475,6 +476,7 @@ async fn drive_agent(
                     AgentEvent::Notice(text) => d.try_emit(id, "notice", json!({"text": text}))?,
                     AgentEvent::Model { model, effort } => record_model(d, id, model, effort)?,
                     AgentEvent::TurnStarted => {
+                        turn_open = true;
                         // Unless it is the turn we have just started.
                         let turn = d
                             .lock()
@@ -1825,6 +1827,7 @@ mod request_tests {
             effort: None,
             env,
             resume: None,
+            resume_file: None,
             trace: None,
         };
         let (events, _events) = agent::Events::channel();

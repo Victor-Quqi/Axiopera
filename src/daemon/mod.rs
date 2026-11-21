@@ -892,13 +892,7 @@ impl Daemon {
             && let Some((host, session)) = native.split_once(':')
             && let Some(entry) = self.lock().tasks.get(id)
             && entry.task.session.as_deref() == Some(session)
-            && matches!(
-                (entry.task.agent, host),
-                (Agent::Claude, "claude")
-                    | (Agent::Codex, "codex")
-                    | (Agent::Grok, "grok")
-                    | (Agent::Agy, "agy")
-            )
+            && render::agent_name(entry.task.agent) == host
         {
             return format!("task:{id}");
         }
@@ -978,6 +972,7 @@ impl Daemon {
                 format!("{} is not a directory", s.cwd.display()),
             );
         }
+        check_tier(s.agent, s.tier)?;
         if let Some(why) = self.at_limit(&self.lock(), caller) {
             return refuse(ErrorCode::Invalid, why);
         }
@@ -1277,6 +1272,7 @@ impl Daemon {
                 );
             }
             if let Some(tier) = tier.filter(|tier| *tier != entry.task.tier) {
+                check_tier(entry.task.agent, tier)?;
                 if identity::task_of(caller).is_some() && entry.task.parent != caller {
                     return refuse(ErrorCode::Invalid, format!("{id} is not your sub-task"));
                 }
@@ -1605,6 +1601,7 @@ impl Daemon {
                 Agent::Codex => format!("codex resume {session}"),
                 Agent::Grok => format!("grok -r {session}"),
                 Agent::Agy => format!("agy --conversation {session}"),
+                Agent::Pi => format!("pi --session {session}"),
             };
             let mut task = entry.task.clone();
             task.detached = true;
@@ -2756,6 +2753,15 @@ impl Daemon {
 
     pub fn stall_after(&self) -> Duration {
         self.opts.stall
+    }
+}
+
+fn check_tier(agent: Agent, tier: ipc::Tier) -> Result<()> {
+    match (agent, tier) {
+        (Agent::Pi, ipc::Tier::Read | ipc::Tier::Work) => {
+            refuse(ErrorCode::Invalid, "Pi supports --tier full only")
+        }
+        _ => Ok(()),
     }
 }
 

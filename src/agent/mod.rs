@@ -1,4 +1,4 @@
-//! Agent adapters: one native process per running turn, driven over its stdio protocol.
+//! Native agent processes and the protocols used to drive their sessions.
 
 mod agy;
 mod claude;
@@ -6,6 +6,7 @@ mod codex;
 pub mod codex_remote;
 mod grok;
 pub mod models;
+mod pi;
 mod rpc;
 
 use std::collections::{HashMap, VecDeque};
@@ -205,6 +206,8 @@ pub struct StartSpec {
     pub env: Vec<(String, String)>,
     /// Native session to resume.
     pub resume: Option<String>,
+    /// The native history file recorded when the task released its session.
+    pub resume_file: Option<PathBuf>,
     pub trace: Option<PathBuf>,
 }
 
@@ -332,6 +335,7 @@ pub enum Backend {
     Codex(codex::Codex),
     Grok(grok::Grok),
     Agy(agy::Agy),
+    Pi(pi::Pi),
 }
 
 impl Backend {
@@ -342,6 +346,7 @@ impl Backend {
             Agent::Codex => Backend::Codex(codex::Codex::start(spec, exe, events).await?),
             Agent::Agy => Backend::Agy(agy::Agy::start(spec, exe, events).await?),
             Agent::Grok => Backend::Grok(grok::Grok::start(spec, exe, events).await?),
+            Agent::Pi => Backend::Pi(pi::Pi::start(spec, exe, events).await?),
         })
     }
 
@@ -351,6 +356,7 @@ impl Backend {
             Backend::Codex(a) => a.turn(text).await,
             Backend::Agy(a) => a.turn(text).await,
             Backend::Grok(a) => a.turn(text).await,
+            Backend::Pi(a) => a.turn(text).await,
         }
     }
 
@@ -360,6 +366,7 @@ impl Backend {
             Backend::Codex(a) => a.steer(text, id).await,
             Backend::Agy(a) => a.steer(text, id).await,
             Backend::Grok(a) => a.steer(text).await,
+            Backend::Pi(a) => a.steer(text, id).await,
         }
     }
 
@@ -369,6 +376,7 @@ impl Backend {
             Backend::Codex(a) => a.interrupt().await,
             Backend::Agy(a) => a.interrupt().await,
             Backend::Grok(a) => a.interrupt().await,
+            Backend::Pi(a) => a.interrupt().await,
         }
     }
 
@@ -379,6 +387,7 @@ impl Backend {
             Backend::Codex(a) => a.busy(),
             Backend::Agy(a) => a.busy(),
             Backend::Grok(a) => a.busy(),
+            Backend::Pi(a) => a.busy(),
         }
     }
 
@@ -389,6 +398,7 @@ impl Backend {
             Backend::Codex(a) => a.busy(),
             Backend::Agy(a) => a.in_turn(),
             Backend::Grok(a) => a.in_turn(),
+            Backend::Pi(a) => a.in_turn(),
         }
     }
 
@@ -398,6 +408,7 @@ impl Backend {
             Backend::Codex(a) => &mut a.proc,
             Backend::Agy(a) => &mut a.proc,
             Backend::Grok(a) => &mut a.proc,
+            Backend::Pi(a) => &mut a.proc,
         }
     }
 
@@ -592,6 +603,7 @@ pub fn resolve_exe(
         Agent::Codex => "codex",
         Agent::Grok => "grok",
         Agent::Agy => "agy",
+        Agent::Pi => "pi",
     };
     if agent == Agent::Grok {
         let home = var("GROK_HOME")
@@ -624,7 +636,11 @@ pub fn resolve_exe(
 }
 
 fn npm_native(dir: &Path, agent: Agent) -> Option<PathBuf> {
-    let modules = dir.join("node_modules");
+    let modules = if dir.file_name().is_some_and(|name| name == ".bin") {
+        dir.parent()?.to_path_buf()
+    } else {
+        dir.join("node_modules")
+    };
     let (arch, triple) = if cfg!(target_arch = "aarch64") {
         ("arm64", "aarch64-pc-windows-msvc")
     } else {
@@ -635,6 +651,7 @@ fn npm_native(dir: &Path, agent: Agent) -> Option<PathBuf> {
         Agent::Codex => modules.join(format!(
             "@openai/codex/node_modules/@openai/codex-win32-{arch}/vendor/{triple}/bin/codex.exe"
         )),
+        Agent::Pi => modules.join("@earendil-works/pi-coding-agent/dist/bundle/cli.js"),
         Agent::Grok | Agent::Agy => return None,
     };
     exe.is_file().then_some(exe)

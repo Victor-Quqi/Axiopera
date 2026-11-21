@@ -14,6 +14,7 @@ pub enum Host {
     Codex,
     Grok,
     Agy,
+    Pi,
     All,
 }
 
@@ -28,7 +29,14 @@ fn install_into(home: &Path, host: Host, force: bool, json: bool) -> i32 {
         Host::Codex => &[Agent::Codex],
         Host::Grok => &[Agent::Grok],
         Host::Agy => &[Agent::Agy],
-        Host::All => &[Agent::Claude, Agent::Codex, Agent::Grok, Agent::Agy],
+        Host::Pi => &[Agent::Pi],
+        Host::All => &[
+            Agent::Claude,
+            Agent::Codex,
+            Agent::Grok,
+            Agent::Agy,
+            Agent::Pi,
+        ],
     };
     let mut results = Vec::new();
     let mut code = crate::ipc::exit::OK;
@@ -79,6 +87,7 @@ fn install_at(home: &Path, host: Agent, force: bool) -> Result<(PathBuf, bool)> 
         Agent::Codex => ".agents",
         Agent::Grok => ".grok",
         Agent::Agy => ".gemini/config",
+        Agent::Pi => ".pi/agent",
     };
     let dir = home.join(root).join("skills").join("axiopera");
     let path = dir.join("SKILL.md");
@@ -131,6 +140,7 @@ mod tests {
             (Agent::Codex, ".agents"),
             (Agent::Grok, ".grok"),
             (Agent::Agy, ".gemini/config"),
+            (Agent::Pi, ".pi/agent"),
         ] {
             let expected = home.0.join(root).join("skills/axiopera/SKILL.md");
             let (path, changed) = install_at(&home.0, host, false).unwrap();
