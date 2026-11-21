@@ -279,11 +279,15 @@ async fn select_model(api: &Api, current: &Value, spec: &StartSpec) -> Result<Op
         .clone()
         .or_else(|| model_id(&native))
         .context("no default OpenCode model")?;
+    let catalog = api.get("/api/model").await?;
+    Ok(Some(model_ref(&catalog, &id, spec.effort.as_deref())?))
+}
+
+fn model_ref(catalog: &Value, id: &str, effort: Option<&str>) -> Result<Value> {
     let (provider, model) = id
         .split_once('/')
         .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
         .context("invalid model ID: expected OpenCode provider/model")?;
-    let catalog = api.get("/api/model").await?;
     let info = catalog
         .as_array()
         .and_then(|a| {
@@ -293,16 +297,16 @@ async fn select_model(api: &Api, current: &Value, spec: &StartSpec) -> Result<Op
         .with_context(|| format!("unknown model {id} in OpenCode"))?;
     ensure!(info["enabled"] != false, "OpenCode model is disabled");
     let mut selected = json!({"id":model,"providerID":provider});
-    if let Some(variant) = &spec.effort {
+    if let Some(variant) = effort {
         ensure!(
             info["variants"]
                 .as_array()
-                .is_some_and(|v| v.iter().any(|x| x["id"] == variant.as_str())),
+                .is_some_and(|v| v.iter().any(|x| x["id"] == variant)),
             "unknown variant {variant} for model {id}"
         );
         selected["variant"] = json!(variant);
     }
-    Ok(Some(selected))
+    Ok(selected)
 }
 
 fn valid_id(id: &str) -> Result<&str> {
@@ -978,6 +982,31 @@ pub(super) async fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_errors_identify_the_rejected_selection() {
+        let catalog = json!([{"providerID":"team","id":"nested/name","variants":[{"id":"high"}]}]);
+        assert_eq!(
+            model_ref(&catalog, "bad", None).unwrap_err().to_string(),
+            "invalid model ID: expected OpenCode provider/model"
+        );
+        assert_eq!(
+            model_ref(&catalog, "team/other", None)
+                .unwrap_err()
+                .to_string(),
+            "unknown model team/other in OpenCode"
+        );
+        assert_eq!(
+            model_ref(&catalog, "team/nested/name", Some("low"))
+                .unwrap_err()
+                .to_string(),
+            "unknown variant low for model team/nested/name"
+        );
+        assert_eq!(
+            model_ref(&catalog, "team/nested/name", Some("high")).unwrap(),
+            json!({"providerID":"team","id":"nested/name","variant":"high"})
+        );
+    }
 
     #[test]
     fn read_rules_preserve_order_and_restrict_inherited_wildcards() {
