@@ -9,6 +9,7 @@
 | Windows 11 | 跨宿主派发、消息、续接与取消 | Claude Code 2.1.296、Codex 0.162.1、Grok 1.0.52 |
 | Windows 11 | read 档 MCP、Codex elevated sandbox、消费确认、宿主通知和插件 | Claude Code 2.1.302 至 2.1.312、VS Code 扩展 2.1.301；Codex 0.163.0、0.164.0，共享 daemon 0.160.0，桌面端内置 0.162.0-alpha.17.2、0.163.0-alpha.10.2；Grok 1.0.62、1.0.67 |
 | Windows 11 | [个人命令禁令、AGY 派发与宿主收件](#antigravity-cli-1511) | Antigravity CLI 1.5.7、1.5.11 |
+| Windows 11 | 任务派发、原会话冷续接、宿主 TUI 收件、原生子任务 | Pi 1.6.0、OpenCode 2.3.2 |
 | Linux，WSL2 Ubuntu 24.04 | 三家原生 Linux CLI 的端到端流程、sandbox 回连、进程组取消和 Codex 宿主推送 | Claude Code 2.1.296、Codex 0.162.1、Grok 1.0.52 |
 | macOS | 有平台实现，真实 agent、sandbox 检测及回连尚未实测 | 未验证 |
 
@@ -16,7 +17,13 @@
 
 ## 依据
 
-脚本名指 `spikes/` 下的探针。
+Pi 1.6.0 自带 subagent 示例、`pi-subagents` 0.89.2 和 `@tintinweb/pi-subagents` 0.26.2 的子进程各有自己的 Pi 会话 ID。两个社区插件在父轮结束后继续处理后台子任务，Axiopera 保留进程，记录插件唤醒的后续轮次。隔离 Git 源和真实 Pi TUI 另覆盖扩展安装、更新、卸载、忙闲收件和重复加载去重。可重跑 `python spikes/pi_extensions.py <pi.exe> host` 和 `python spikes/pi_extensions.py <pi.exe> subagents`。
+
+Pi full 和 OpenCode read/full 使用 `gpt-6.1-terra` 验证文件读取、full 写入、同会话恢复随机文件内容，以及输出原生接管命令。OpenCode 两档另在两轮之间完整停止并重启 Axiopera daemon。`python spikes/opencode_managed.py <opencode.exe>` 用可控的本地模型验证托管任务。额外实测包括 OpenCode read 的七个工具、full 审批与拒绝、轮中追加、取消、原生子任务唤醒和接管。
+
+`python spikes/opencode_host.py <opencode.exe>` 用真实交互 TUI 验证后台 `wait` 唤醒空闲宿主、忙时当前前台命令继续执行，以及随后 `inbox` 取回结果。`node spikes/pi_watch.mjs <axiopera.exe>` 验证监听重连、重放去重、宿主强退回收，以及 daemon 空闲退出后重新发现。
+
+下表脚本名均指 `spikes/` 下的探针。
 
 | 结论 | 依据 |
 |---|---|

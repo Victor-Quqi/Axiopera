@@ -8,6 +8,8 @@
 
 主 agent 负责检查子 agent 的改动、提交和合并分支。子 agent 的权限由 `--tier` 指定，默认 `work`。各档位在不同 backend 上的具体行为见[权限](backends.md#权限)。
 
+Pi 必须显式指定 `--tier full`，OpenCode v2 必须指定 `--tier read` 或 `--tier full`。省略时命令会提示支持的档位。
+
 空闲后用 `axiopera send <task> --tier full "继续执行"` 在原会话中改档续接。AGY 进出 read 档需要新建任务。子 agent 只能修改自己直接派发的任务；降低父任务档位前，先降低超出新档位的子任务档位。
 
 任务 ID 全局唯一，`--name` 指定的别名在同一个调用方下唯一。主 agent 为第 0 层，最多派发到第 2 层，只统计 Axiopera 任务。宿主内置子 agent 归属于所在的 Axiopera 任务，它再派发的任务继续受该任务树的深度和权限限制。子任务的档位不能高于父任务。内置子 agent 的收件隔离见[后端文档](backends.md#会话与消息)。
@@ -24,7 +26,7 @@
 
 回复长度有上限。等你裁决的审批请求总是先给，其余消息按先后取，一次回复放不下的整条留到下一次 `inbox`，回复末尾注明还剩几条。单条结果超长时只保留末尾，并注明显示的字符数、总字符数和完整文件路径；过长的提问、留言和审批请求给开头和结尾，并注明全文路径。`status` 查看任务状态和所用模型、推理强度，运行中的任务附带进度：第几轮、本轮已用时间、工具调用次数，以及最近一次调用和距今时间；一轮结束后进程仍在等后台工作时，注明上一轮结束了多久；没有新消息时，`inbox` 和 `wait` 超时也列出这些进度。`inbox` 和推送交付的每轮结果、`log` 中的轮次结束行同样注明该轮结束时的模型和推理强度，`top` 在任务详情的标题中显示，窗口放不下任务状态时先省去。会话启动、子 agent 报告之前，显示的是请求值（`--model`、`--effort` 或配置），未指定则不显示。`log` 查看事件摘要，每个事件一行，包括子 agent 每段话的开头，换行显示为 `↵`，命令等自由文本截到 200 个字符并注明省略了多少。加上 `--json` 可以读取完整任务字段和事件字段，包括改动文件列表及后端上报的用量。
 
-`detach <task>` 将任务交给人接管，并打印工作目录和原生 resume 命令。接管前要等任务执行及后台工作结束，或先 `cancel`。Axiopera 发现原生会话文件被其他进程修改时，也会将任务标为 detached。
+`detach <task>` 将任务交给人接管，并打印工作目录和原生 resume 命令。接管前要等任务执行及后台工作结束，或先 `cancel`。续接前，Axiopera 核对原生会话文件，OpenCode 则核对该会话的日志和消息。发现外部续写时，Axiopera 将任务标为 detached。
 
 `cancel` 停止任务及其子任务当前的执行，保留会话和未交付输入。`cancelled`、`failed` 和 `interrupted` 任务都可以用 `send` 继续，回答未解决的问题也会续接任务。继续父任务不会自动启动已取消的子任务，需要分别续接。脱管的任务通过原生 CLI 接管。
 
@@ -40,11 +42,11 @@
 
 `top` 只读取数据目录，不连接 daemon：不会启动 daemon，不取走消息，不标记结果已交付，也不写请求日志。daemon 异常退出后，任务停留在退出前的状态，下次启动时才改为 interrupted。
 
-其他命令中，`status --all` 和 `log` 同样不改变交付状态。`result` 会把该轮标为已交付，主 agent 之后只拿到文件路径。`inbox` 取走调用方的消息：在 Claude Code、Codex、Grok、AGY 的命令工具或它们启动的 shell 中，调用方是该会话；在独立终端中是 `user`，即你本人。识别不到会话的 agent 要用 `--caller` 指明会话，见[指定调用方](#指定调用方)。
+其他命令中，`status --all` 和 `log` 同样不改变交付状态。`result` 会把该轮标为已交付，主 agent 之后只拿到文件路径。`inbox` 取走调用方的消息：在 Claude Code、Codex、Grok、AGY、Pi、OpenCode v2 的命令工具或它们启动的 shell 中，调用方是该会话；在独立终端中是 `user`，即你本人。识别不到会话的 agent 要用 `--caller` 指明会话，见[指定调用方](#指定调用方)。
 
 ## 指定调用方
 
-调用方身份决定任务名称的作用范围、`status` 列出的任务和 `inbox` 取走的消息。Axiopera 从 Claude Code、Codex、Grok、AGY 注入命令环境的会话变量识别调用方，经 ssh、`docker exec`、WSL 等调用另一处的 Axiopera 时，这些变量通常传不过去，agent 会被当成终端前的你（`user`）：与终端共用收件箱，审批时也像你一样不必先读全文。这时用全局选项 `--caller <名称>:<会话 ID>` 指明会话，每条命令带同一个值，变量在宿主一侧展开：
+调用方身份决定任务名称的作用范围、`status` 列出的任务和 `inbox` 取走的消息。Axiopera 从 Claude Code、Codex、Grok、AGY、Pi、OpenCode v2 注入命令环境的会话变量识别调用方，经 ssh、`docker exec`、WSL 等调用另一处的 Axiopera 时，这些变量通常传不过去，agent 会被当成终端前的你（`user`）：与终端共用收件箱，审批时也像你一样不必先读全文。这时用全局选项 `--caller <名称>:<会话 ID>` 指明会话，每条命令带同一个值，变量在宿主一侧展开：
 
 ```sh
 ssh 主机 axiopera --caller "claude:$CLAUDE_CODE_SESSION_ID" spawn codex --cwd /srv/app - < task.md
@@ -52,7 +54,7 @@ ssh 主机 axiopera --caller "claude:$CLAUDE_CODE_SESSION_ID" wait    # 后台�
 ssh 主机 axiopera --caller "claude:$CLAUDE_CODE_SESSION_ID" inbox
 ```
 
-四家的会话 ID 分别在 `CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`GROK_SESSION_ID`、`ANTIGRAVITY_CONVERSATION_ID` 中。`--caller claude:<ID>` 与在命令前设置 `CLAUDE_CODE_SESSION_ID=<ID>` 是同一个调用方，此前这样派发的任务可以接着操作。其他 agent 同样要用自己的名称和会话 ID 指明会话，没有会话 ID 时生成一个随机值并一直沿用。取值规则及子 agent 中的限制见[身份与 IPC](design.md#身份与-ipc)。
+六个宿主的会话 ID 分别在 `CLAUDE_CODE_SESSION_ID`、`CODEX_THREAD_ID`、`GROK_SESSION_ID`、`ANTIGRAVITY_CONVERSATION_ID`、`PI_SESSION_ID`、`OPENCODE_SESSION_ID` 中。`--caller claude:<ID>` 与在命令前设置 `CLAUDE_CODE_SESSION_ID=<ID>` 是同一个调用方，此前这样派发的任务可以接着操作。其他 agent 同样要用自己的名称和会话 ID 指明会话，没有会话 ID 时生成一个随机值并一直沿用。取值规则及子 agent 中的限制见[身份与 IPC](design.md#身份与-ipc)。
 
 Axiopera 不负责连接、认证和文件同步。`--cwd`、`-f` 和结果中的路径都按运行 Axiopera 的一侧解释。Windows 的 Git Bash 会把传给 `wsl.exe` 等原生程序、以 `/` 开头的参数改写成 Windows 路径，这时设置 `MSYS_NO_PATHCONV=1`。子 agent 使用该侧调用命令的环境，非交互 ssh 的 PATH 可能找不到 agent CLI，这时在[配置](#配置)中指定 `path`。ssh 断开后 daemon 和任务继续运行，前提是系统不在登出时结束用户进程，例如 systemd-logind 未启用 `KillUserProcesses`。跨机器时各宿主怎样收到结果，见[宿主通知](backends.md#宿主通知)。
 
@@ -80,7 +82,7 @@ model = "haiku"
 # path = "/absolute/path/to/claude"
 ```
 
-同样支持 `[agents.codex]`、`[agents.grok]`、`[agents.agy]`。`--model` 覆盖默认模型。`path` 必须指向真实可执行文件；Windows 上应使用 `.exe`。省略时按[后端的路径查找规则](backends.md#可执行文件与配置继承)定位。
+其余配置表为 `[agents.codex]`、`[agents.grok]`、`[agents.agy]`、`[agents.pi]` 和 `[agents.opencode]`。`--model` 覆盖默认模型。`path` 可指向原生可执行文件。省略时按[后端的路径查找规则](backends.md#可执行文件与配置继承)定位。
 
 AGY 新任务默认沿用终端 `/model` 保存的模型和强度。`--model` 或 `[agents.agy].model` 选中同一模型时保留终端强度，选中其他模型时使用该模型自己的默认强度。`--effort` 始终优先。续接已有任务沿用任务自身的选择。
 
@@ -102,10 +104,12 @@ skill 让 agent 在派发任务前先运行 `axiopera guide --host <宿主>`，�
 | Codex | `codex` | `~/.agents/skills/axiopera/` |
 | Grok | `grok` | `~/.grok/skills/axiopera/` |
 | Antigravity CLI | `agy` | `~/.gemini/config/skills/axiopera/` |
+| Pi | `pi` | `~/.pi/agent/skills/axiopera/` |
+| OpenCode v2 | `opencode` | `~/.config/opencode/skills/axiopera/` |
 
 `~` 取 Windows 的 `USERPROFILE`，其他平台取 `HOME`。命令使用表中的固定位置；自定义 skill 目录可手动复制文件。Grok 默认也读取 Claude Code 和 Codex 的上述位置，已有一份时可直接使用。
 
-`axiopera skill install all` 依次安装到全部三个目录，逐项输出结果；某一项失败后继续处理其余项，最终返回非零退出码。
+`axiopera skill install all` 依次安装到表中各目录，逐项输出结果；某一项失败后继续处理其余项，最终返回非零退出码。
 
 重复安装时，内容相同则跳过；内容不同则提示加 `--force` 确认覆盖，也适用于 `all`。命令只写 `SKILL.md`，输出文件路径。`--json` 在单宿主时输出对象，`all` 时输出数组；每项包含 `host`，成功时带 `path` 和 `changed`，失败时带 `error`。删除安装目录即卸载。
 
@@ -127,6 +131,20 @@ Codex 卸载插件后会留下以下内容，运行 `axiopera plugin cleanup` �
 - 空目录 `plugins/cache/axiopera`。
 
 数据目录取 `CODEX_HOME`，未设置时为 `~/.codex`。插件仍装着时，清理命令不做任何处理。配置通过 Codex 自己的配置接口修改。
+
+## Pi 扩展
+
+Pi TUI 可安装扩展，在当前会话收到 Axiopera 子任务的提醒。安装、更新、卸载各用一条 Pi 原生命令，已打开的会话输入 `/reload` 立即生效。
+
+| 操作 | 命令 |
+|---|---|
+| 安装 | `pi install git:github.com/Victor-Quqi/Axiopera` |
+| 更新 | `pi update git:github.com/Victor-Quqi/Axiopera` |
+| 卸载 | `pi remove git:github.com/Victor-Quqi/Axiopera` |
+
+空闲时提醒开启一轮，忙时随当前轮送达。扩展通过 PATH 中的 `axiopera` 监听同一数据目录里的 daemon。daemon 空闲退出后，下次启动时扩展会重新连接。Pi 收到提醒后运行 `axiopera inbox` 取正文。裸 Pi 或远程调用可在前台运行 `axiopera wait` 后收件。
+
+用尚未合并的源码试用扩展，可将命令中的 Git 源换为本地仓库的绝对路径，例如 `pi install /path/to/Axiopera`。本地目录的修改在 `/reload` 后生效。
 
 ## daemon 与清理
 

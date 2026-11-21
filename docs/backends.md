@@ -14,6 +14,11 @@
 
 新建和续接会话都显式设置权限模式，用户规则由各后端执行。同档位的能力存在差异，`spawn` 回执会报告影响任务的限制。
 
+| 后端 | read | work | full |
+|---|---|---|---|
+| Pi | 不支持 | 不支持 | Pi RPC，沿用本机工具和扩展 |
+| OpenCode v2 | 原生 read、glob、grep 和 Axiopera MCP 通信、目录工具 | 不支持 | 原生主 agent，使用其权限和项目规则，单次审批转给调用方 |
+
 AGY 1.5.11 的 ACP 默认权限模式会为用户在 `permissions.deny` 中明确禁止的命令请求审批。Axiopera 转发这类请求时，应选择拒绝。AGY 续接时保留建会话时的工具列表，进出 read 档都要新建任务。
 
 read 档允许 Claude 和 Codex 使用标注 `readOnlyHint:true` 且没有 `destructiveHint:true` 的 MCP 工具。Claude 适配器在每次调用时查询 `mcp_status`，按完整工具名检查注解；查询失败或 10 秒未返回就拒绝。Codex 使用原生注解判断。Grok 隐藏 `search_tool`、`use_tool`，因为 `agentProfile.disallowedTools` 无法逐个禁用 MCP 工具，ACP 状态也不提供注解。
@@ -53,6 +58,7 @@ read 档按上述只读规则裁决，其他需要批准的请求直接拒绝。
 | Codex | `item/commandExecution/requestApproval`、`item/fileChange/requestApproval`、`item/permissions/requestApproval` | accept、decline 或仅本轮的 permissions |
 | Grok | `session/request_permission` | allow-once 或 reject-once |
 | AGY | `session/request_permission`，按会话和工具调用区分 | allow-once 或 reject-once，原生子 agent 的审批注明子会话 ID |
+| OpenCode v2 | 当前会话及后台原生子任务中等待裁决的 permission 请求 | full 转发一次性批准或拒绝，read 中需要审批的调用直接拒绝 |
 
 Claude 其他 control request 返回 unsupported。Codex 的 MCP elicitation 返回 decline，`requestUserInput` 返回空 answers。Grok 其他请求直接拒绝。上述情况均记为 `blocked`，由轮末汇总。
 
@@ -66,7 +72,7 @@ AGY 在任务进程内创建或恢复 ACP 会话，注册任务专用 stdio MCP�
 
 ## 可执行文件与配置继承
 
-显式 `agents.<name>.path` 优先。Grok 其次查找 `GROK_HOME/bin`，省略 home 时使用 `~/.grok/bin`；其他情况查调用方 PATH。Windows 在 PATH 下寻找 `.exe`，遇到 Claude 或 Codex 的 npm `.cmd` 入口时，按包布局定位原生 `.exe`。Unix 使用 PATH 中的命令。
+显式 `agents.<name>.path` 优先。Grok 其次查找 `GROK_HOME/bin`，省略 home 时使用 `~/.grok/bin`；其他情况查调用方 PATH。Windows 在 PATH 下寻找 `.exe`，遇到 Claude、Codex 和 OpenCode 的 npm `.cmd` 入口时，按包布局定位原生 `.exe`。Pi 的 npm 入口使用调用方 PATH 中的 Node 运行包内脚本。Unix 使用 PATH 中的命令。
 
 子 agent 使用原生 CLI 的登录、模型、MCP 和规则配置。Axiopera 不写入用户的 agent 配置，只通过单次参数及线程配置覆盖需要的选项：
 
@@ -75,6 +81,8 @@ AGY 在任务进程内创建或恢复 ACP 会话，注册任务专用 stdio MCP�
 - Codex 在线程中设置 reviewer、sandbox 和 MCP；读取配置时只取所需的 MCP 服务器名。
 
 ## 模型查询
+
+Pi 通过 `get_available_models` 和 `get_state` 读取模型、支持的思考档位与当前默认值。OpenCode v2 查询私有服务的模型目录和默认模型，推理强度使用模型列出的 variant 名称。两者的模型 ID 都使用 `provider/model`。
 
 AGY 1.5.11 的 `agy acp` 新会话和交互终端可能使用不同的默认模型与强度。新任务只取终端设置 `~/.gemini/antigravity-cli/settings.json` 的 `model` 字段，在当前 ACP 返回的 `availableModels` 中匹配标签或 ID，通过 `session/set_model` 选中包含强度的组合。终端偏好缺失、匹配不到唯一选项或被 ACP 拒绝时，派发和查询均沿用 ACP 默认值，显式指定的模型和强度仍按请求设置。`axiopera models agy` 先记录默认值，再在同一个临时会话中逐个选择模型，读取各自的 `thought_level` 菜单。查询结束后关闭会话，全程不发送提示词。AGY 跨进程续接时可能恢复成 ACP 的默认值，适配器会重新应用任务记录中上次实际使用的模型和强度。
 
@@ -87,6 +95,10 @@ Claude 的 `resolvedModel` 保留为 `resolved_model`，缺失时只显示原 ID
 Claude 查询使用 `--no-session-persistence`，通过单次参数关闭 hook 和 MCP 启动。Codex、Grok 查询不创建线程或会话。进程退出、查询结束或超时后回收进程树。目录来源和账号调用权限由各后端管理，Axiopera 不额外推断。
 
 ## 会话与消息
+
+Pi 用 RPC 的 `prompt` 开轮，运行中追加消息用 `streamingBehavior:"steer"`。取消时清空待投队列并中断执行。原生会话 ID 和 JSONL 路径取自 `get_state`。Pi 自带的 subagent 示例与两种社区插件都为子进程设置独立的 `PI_SESSION_ID`。托管 Pi 会保留仍有后台子任务的进程，记录插件唤醒后的新一轮及其结果。实测的插件和版本见[验证依据](verification.md)。
+
+OpenCode v2 每项任务使用带随机密码的本机私有服务。首次提示前订阅 `/api/event`，随后按会话 ID 处理事件。轮中消息以独立 ID 入队，后端将其投递并开启模型步骤时确认已读。原生 shell 的 `OPENCODE_SESSION_ID` 和 MCP 调用的 `ai.opencode/sessionID` 用于区分主会话与原生子会话。后台子任务或 shell 仍在运行时保留服务。
 
 | 接口 | Claude | Codex | Grok | AGY |
 |---|---|---|---| --- |
@@ -135,6 +147,9 @@ Codex、Grok 和 AGY 内置子 agent 的终端命令分别带有独立的 `CODEX
 | Codex TUI | 自动开启一轮 | 送入当前轮 | 推送 |
 | Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 默认等本轮结束；启用[插件](usage.md#skill-与-codex-插件) hook 后，下一次工具调用后提醒 | 门铃，插件 hook |
 | 其他 Codex 会话 | 不唤醒 | 不送达 | 轮询 `wait`，再 `inbox` |
+| Pi TUI，已安装扩展 | 自动开启一轮 | 下一次工具返回后送达 | [Pi 扩展](usage.md#pi-扩展)提醒后运行 `inbox` |
+| 裸 Pi | 等下一次输入 | 前台等待可直接收件 | 前台运行 `wait`，再 `inbox` |
+| OpenCode v2 TUI | 后台 shell 完成时自动开启一轮 | shell 完成消息进入会话 | 通过原生 shell 的 `background:true` 运行 `wait`，收到完成消息后运行 `inbox`；只有前台 shell 时，前台等待 |
 
 Windows 上 AGY 的命令沙箱会阻止 `wait` 和 `inbox` 连接本机 daemon。若命令提示需要提升权限，应通过 AGY 的单次审批在沙箱外运行该命令。宿主取子任务结果依赖正在等待的 `wait`；父级用 `axiopera send` 给托管 AGY 任务追加要求则直接走 ACP。
 

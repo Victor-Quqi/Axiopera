@@ -4,7 +4,7 @@
 
 **更轻量、更高效、更易用，低侵入性的 agent 协作工具**
 
-Axiopera 为 Claude Code、Codex、Grok Build 和 Antigravity CLI 提供跨工具协作。
+Axiopera 支持 Claude Code、Codex、Grok Build、Antigravity CLI、Pi 和 OpenCode v2 互相派发任务。
 
 你可以在 Claude Code 中说：
 
@@ -16,8 +16,8 @@ Axiopera 为 Claude Code、Codex、Grok Build 和 Antigravity CLI 提供跨工�
 - 沿用现有 agent 登录状态和额度。
 - 默认不改 agent 配置。
 - 平时约一行 Skill 简介，操作说明按需加载。
-- 四家子 agent 都支持 Steer，运行中追加要求、调整方向。
-- 四家主 agent 都能边工作边[接收子任务消息](docs/backends.md#宿主通知)，及时跟进。
+- 子 agent 运行中可以追加要求、调整方向。
+- 在主 agent 会话中[接收子任务消息](docs/backends.md#宿主通知)。
 - 另开终端运行 `axiopera top`，实时查看全部子任务，不影响主 agent。
 
 ## 安装
@@ -42,10 +42,14 @@ Windows、Linux 已实测，macOS 待验证。[验证范围](docs/verification.m
 | Codex | `axiopera skill install codex` |
 | Grok Build | `axiopera skill install grok` |
 | Antigravity CLI | `axiopera skill install agy` |
+| Pi | `axiopera skill install pi` |
+| OpenCode v2 | `axiopera skill install opencode` |
 
 为所有支持的 Harness 安装：`axiopera skill install all`。
 
 Skill 内置于程序，可离线安装。[安装位置、覆盖与卸载](docs/usage.md#skill-与-codex-插件)。
+
+用 `axiopera spawn pi --tier full "…"` 派发 Pi。OpenCode v2 可选 `--tier read` 或 `--tier full`。Pi TUI 需要自动收件时，运行 `pi install git:github.com/Victor-Quqi/Axiopera`，在已打开的会话中输入 `/reload`。[更新与卸载](docs/usage.md#pi-扩展)
 
 <details>
 <summary>Codex 桌面端 / VS Code：中途提醒插件</summary>

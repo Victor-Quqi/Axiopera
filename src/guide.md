@@ -1,4 +1,4 @@
-axiopera: run other coding agents (claude, codex, grok, agy) as your sub-agents.
+axiopera: run other coding agents (claude, codex, grok, agy, pi, opencode) as your sub-agents.
 
 Use axiopera for a different agent or model, or for work that must continue after your
 session ends.
@@ -7,14 +7,16 @@ session ends.
 @user when your session variable does not reach axiopera (over ssh, in a container) or axiopera
 @user does not recognize your agent, add `--caller <agent>:<session ID>` to every command, e.g.
 @user `ssh host axiopera --caller "claude:$CLAUDE_CODE_SESSION_ID" inbox`. Claude Code, Codex and
-@user Grok keep the ID in CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID and GROK_SESSION_ID. AGY uses ANTIGRAVITY_CONVERSATION_ID. An agent
-@user without one generates a random ID once and keeps using it.
+@user Grok keep the ID in CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID and GROK_SESSION_ID. AGY uses
+@user ANTIGRAVITY_CONVERSATION_ID, Pi uses PI_SESSION_ID and OpenCode v2 uses OPENCODE_SESSION_ID.
+@user An agent without a session ID generates a random ID once and keeps using it.
 
 Dispatch
   axiopera spawn codex "Fix the failing test in tests/parser.rs."
   axiopera spawn claude --tier read --name review -f task.md
+  Pi requires --tier full. OpenCode v2 requires --tier read or --tier full.
   Tiers: read (read-only; requests needing approval are refused;
-              MCP: read-only tools only, none on Grok, Axiopera directory listing and communication tools on AGY; Grok shell: plain axiopera commands only),
+              MCP: read-only tools only, none on Grok, Axiopera directory listing and communication tools on AGY and OpenCode; Grok shell: plain axiopera commands only),
          work (default: the agent's own auto mode), full (the agent's full-access mode).
   Options: --model, --effort, --name (use it instead of the ID), --cwd, --timeout 30m.
   Tasks share your working directory unless --cwd selects another; axiopera creates no copy.
@@ -39,6 +41,11 @@ Get results
 @grok For each line it prints, run `axiopera inbox`.
 @agy Run `axiopera wait` as a background command. When it finishes, run `axiopera inbox`.
 @agy Start another wait while sub-tasks are running. Shell access to the daemon may need approval.
+@pi In a Pi TUI with the Axiopera extension, run `axiopera inbox` when notified.
+@pi Otherwise run `axiopera wait` in the foreground, then `axiopera inbox`.
+@opencode Run `axiopera wait` with the shell tool's background option. When the shell reports
+@opencode completion, run `axiopera inbox` and start another wait while sub-tasks are running.
+@opencode With only a foreground shell, wait in the foreground and then run inbox.
   Exit codes: 0 success, 1 command error, 3 nothing new yet (or wait timed out),
   4 nothing new and nothing running.
 
@@ -60,7 +67,7 @@ Answer questions
 Use `send <task> -f msg.md` or `reply <question> -f answer.md`; use `-` to read stdin.
 
 Sub-agents can talk to each other: give them each other's task IDs and tell them to run
-`axiopera tell <task> "..."` (Codex and AGY sub-agents have it as the `tell` tool). You get a copy of
+`axiopera tell <task> "..."` (Codex, AGY and OpenCode sub-agents have it as an MCP tool). You get a copy of
 every note.
 
 Inspect and stop

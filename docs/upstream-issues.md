@@ -2,6 +2,12 @@
 
 升级宿主 CLI 时，先在隔离会话中核对对应条目。兼容限制解除时，同步更新[后端文档](backends.md)和[验证依据](verification.md)。
 
+## Pi 和 OpenCode v2
+
+Pi 扩展升级后，用 `pi_extensions.py` 核对社区 subagent 工具的返回字段与后台通知。父轮 `agent_settled` 时子任务可能仍在运行，探针等待真实子任务完成并检查第二轮结果。
+
+OpenCode 2.3.2 的私有 `serve --stdio` 返回会话日志序号时，默认可能没有历史事件正文。升级时核对实时订阅握手、断流后的处理，以及同会话和其他会话分别被外部续写时的接管判断。
+
 ## Antigravity CLI
 
 以下行为在 Windows 11、AGY 1.5.11 上核对。

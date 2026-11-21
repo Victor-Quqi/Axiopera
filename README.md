@@ -4,7 +4,7 @@
 
 **Lighter, more efficient, easier agent collaboration with minimal setup changes.**
 
-Axiopera connects Claude Code, Codex, Grok Build, and Antigravity CLI.
+Axiopera connects Claude Code, Codex, Grok Build, Antigravity CLI, Pi, and OpenCode v2.
 
 In Claude Code, ask:
 
@@ -16,8 +16,8 @@ Advantages:
 - Uses your existing agent sign-ins and usage allowances.
 - Leaves agent configuration unchanged by default.
 - About one line for skill discovery; instructions load on demand.
-- All four sub-agents support Steer: add instructions and change direction while they run.
-- All four lead agents can [receive sub-task messages](docs/backends.md#宿主通知) while working and follow up.
+- Add instructions while a sub-agent is working.
+- [Receive sub-task messages](docs/backends.md#宿主通知) in your lead agent's session.
 - Run `axiopera top` in another terminal to watch every sub-task live without affecting the lead agent.
 
 ## Install
@@ -42,10 +42,14 @@ Run the command for your host agent, then start a new session:
 | Codex | `axiopera skill install codex` |
 | Grok Build | `axiopera skill install grok` |
 | Antigravity CLI | `axiopera skill install agy` |
+| Pi | `axiopera skill install pi` |
+| OpenCode v2 | `axiopera skill install opencode` |
 
 For all supported harnesses: `axiopera skill install all`.
 
 The skill is bundled with the executable and installs offline. [Locations, replacement, and removal](docs/usage.md#skill-与-codex-插件).
+
+Dispatch Pi with `axiopera spawn pi --tier full "…"`. OpenCode v2 accepts `--tier read` and `--tier full`. For automatic notifications in the Pi TUI, run `pi install git:github.com/Victor-Quqi/Axiopera` and enter `/reload` in open sessions. [Update and removal](docs/usage.md#pi-扩展)
 
 <details>
 <summary>Codex desktop / VS Code: plugin for mid-turn notifications</summary>
