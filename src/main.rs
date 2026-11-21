@@ -49,13 +49,14 @@ enum Command {
         #[arg(long)]
         cwd: Option<PathBuf>,
     },
-    /// Start a sub-agent on a task. Returns at once with its task ID.
+    /// Start a sub-agent and return its task ID and delivery instructions.
     Spawn {
         agent: Agent,
         /// Use `-f FILE`, or `-` to read it from stdin.
         task: Vec<String>,
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
+        /// Use full for Pi. OpenCode v2 accepts read or full.
         #[arg(long, value_enum, default_value = "work")]
         tier: Tier,
         /// Model name, passed to the agent as is.
@@ -85,7 +86,7 @@ enum Command {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
     },
-    /// Block until your sub-tasks have news, then list it. Takes nothing; use inbox for that.
+    /// List new messages without collecting them. Wait while sub-tasks run.
     Wait {
         /// Only these tasks (default: all of yours).
         tasks: Vec<String>,
@@ -184,13 +185,13 @@ enum Command {
         #[arg(long, value_enum)]
         host: Option<Agent>,
     },
-    /// Serve ask, tell and answers as MCP tools; axiopera sets this up for Codex and AGY sub-agents.
+    /// Serve ask, tell and answers as MCP tools for Codex, AGY and OpenCode sub-agents.
     #[command(hide = true)]
     Mcp {
         /// Serve the Codex plugin's hooks instead.
         #[arg(long)]
         codex_hooks: bool,
-        /// Expose read-only directory listings within this AGY task workspace.
+        /// Enable read-only directory listings under the task's workspace root.
         #[arg(long, conflicts_with = "codex_hooks")]
         list_root: Option<PathBuf>,
     },

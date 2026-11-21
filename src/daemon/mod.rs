@@ -1303,7 +1303,7 @@ impl Daemon {
                 "Run `axiopera wait` as a background command. When it finishes, run `axiopera inbox`."
             }
             _ => {
-                "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some."
+                "Collect results and questions with `axiopera inbox`. Use `axiopera wait` for new messages while your tasks run."
             }
         }
     }

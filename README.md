@@ -28,7 +28,7 @@ Install and sign in to the agent CLIs you want to use.
 
 Download and extract your platform's archive from [Releases](https://github.com/Victor-Quqi/Axiopera/releases). Put `axiopera` or `axiopera.exe` on your PATH.
 
-With Rust: `cargo install axiopera --locked`.
+With Rust, run `cargo install axiopera --locked`. To use a development branch, run `cargo install --path . --locked` in its checkout.
 
 Windows and Linux tested; macOS awaits validation. [Test coverage](docs/verification.md#已测版本)
 
@@ -49,7 +49,9 @@ For all supported harnesses: `axiopera skill install all`.
 
 The skill is bundled with the executable and installs offline. [Locations, replacement, and removal](docs/usage.md#skill-与-codex-插件).
 
-Dispatch Pi with `axiopera spawn pi --tier full "…"`. OpenCode v2 accepts `--tier read` and `--tier full`. For automatic notifications in the Pi TUI, run `pi install git:github.com/Victor-Quqi/Axiopera` and enter `/reload` in open sessions. [Update and removal](docs/usage.md#pi-扩展)
+Use `--tier full` with `axiopera spawn pi`, and `--tier read` or `--tier full` with `axiopera spawn opencode`.
+
+For automatic notifications in Pi, run `pi install git:github.com/Victor-Quqi/Axiopera` and enter `/reload` in open TUI sessions. For a development branch, give `pi install` the absolute path to that checkout. [Updates and removal](docs/usage.md#pi-扩展)
 
 <details>
 <summary>Codex desktop / VS Code: plugin for mid-turn notifications</summary>

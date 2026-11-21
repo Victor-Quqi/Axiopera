@@ -28,7 +28,7 @@ Axiopera 支持 Claude Code、Codex、Grok Build、Antigravity CLI、Pi 和 Open
 
 从 [Releases](https://github.com/Victor-Quqi/Axiopera/releases) 下载并解压，将 `axiopera` 或 `axiopera.exe` 放入 PATH。
 
-有 Rust：`cargo install axiopera --locked`。
+有 Rust 可运行 `cargo install axiopera --locked`。试用开发分支时，在该分支的仓库根目录运行 `cargo install --path . --locked`。
 
 Windows、Linux 已实测，macOS 待验证。[验证范围](docs/verification.md#已测版本)
 
@@ -49,7 +49,9 @@ Windows、Linux 已实测，macOS 待验证。[验证范围](docs/verification.m
 
 Skill 内置于程序，可离线安装。[安装位置、覆盖与卸载](docs/usage.md#skill-与-codex-插件)。
 
-用 `axiopera spawn pi --tier full "…"` 派发 Pi。OpenCode v2 可选 `--tier read` 或 `--tier full`。Pi TUI 需要自动收件时，运行 `pi install git:github.com/Victor-Quqi/Axiopera`，在已打开的会话中输入 `/reload`。[更新与卸载](docs/usage.md#pi-扩展)
+用 `axiopera spawn pi` 派发任务时选 `--tier full`，用 `axiopera spawn opencode` 时选 `--tier read` 或 `--tier full`。
+
+Pi 需要自动提醒时，运行 `pi install git:github.com/Victor-Quqi/Axiopera`，在已打开的 TUI 会话中输入 `/reload`。试用开发分支时，将 `pi install` 的参数换为同一仓库的绝对路径。[更新与卸载](docs/usage.md#pi-扩展)
 
 <details>
 <summary>Codex 桌面端 / VS Code：中途提醒插件</summary>

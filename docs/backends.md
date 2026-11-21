@@ -6,18 +6,16 @@
 
 `read/work/full` 使用各后端的原生权限模式和工具开关。Axiopera 转发原生审批，批准或拒绝只对该请求生效。
 
-| 档位 | Claude Code | Codex | Grok Build | Antigravity CLI |
-|---|---|---|---| --- |
-| read | `default`，移除 Edit、Write、NotebookEdit、Agent；通过 stdio 接审批 | `read-only`，`never`，reviewer 为 `user` | ask 模式，移除写入、子 agent、工作流、定时任务、媒体生成和 MCP 入口 | 任务专用 agent，使用原生 `read_file` 读文件，通过 Axiopera 的 `list_directory` 浏览工作区目录，另可调用 ask、tell、answers |
-| work | `auto` | `workspace-write`，`on-request`，reviewer 为 `auto_review` | `autoMode:true`、`yoloMode:false` | 原生 `--sandbox` 和 `auto` 模式 |
-| full | `bypassPermissions` | `danger-full-access`，`on-request`，reviewer 为 `user` | `yoloMode:true` | 原生 `--dangerously-skip-permissions` |
-
-新建和续接会话都显式设置权限模式，用户规则由各后端执行。同档位的能力存在差异，`spawn` 回执会报告影响任务的限制。
-
 | 后端 | read | work | full |
 |---|---|---|---|
+| Claude Code | `default`，移除 Edit、Write、NotebookEdit、Agent，通过 stdio 接审批 | `auto` | `bypassPermissions` |
+| Codex | `read-only`，`never`，reviewer 为 `user` | `workspace-write`，`on-request`，reviewer 为 `auto_review` | `danger-full-access`，`on-request`，reviewer 为 `user` |
+| Grok Build | ask 模式，移除写入、子 agent、工作流、定时任务、媒体生成和 MCP 入口 | `autoMode:true`、`yoloMode:false` | `yoloMode:true` |
+| Antigravity CLI | 任务专用 agent，使用原生 `read_file` 和 Axiopera 的 `list_directory`、`ask`、`tell`、`answers` | 原生 `--sandbox` 和 `auto` 模式 | 原生 `--dangerously-skip-permissions` |
 | Pi | 不支持 | 不支持 | Pi RPC，沿用本机工具和扩展 |
 | OpenCode v2 | 原生 read、glob、grep 和 Axiopera MCP 通信、目录工具 | 不支持 | 原生主 agent，使用其权限和项目规则，单次审批转给调用方 |
+
+OpenCode 从 full 降为 read 前须等原生后台任务结束。适配器给已有原生子会话关闭工具权限，并对主会话应用 read 规则。
 
 AGY 1.5.11 的 ACP 默认权限模式会为用户在 `permissions.deny` 中明确禁止的命令请求审批。Axiopera 转发这类请求时，应选择拒绝。AGY 续接时保留建会话时的工具列表，进出 read 档都要新建任务。
 
@@ -62,6 +60,8 @@ read 档按上述只读规则裁决，其他需要批准的请求直接拒绝。
 
 Claude 其他 control request 返回 unsupported。Codex 的 MCP elicitation 返回 decline，`requestUserInput` 返回空 answers。Grok 其他请求直接拒绝。上述情况均记为 `blocked`，由轮末汇总。
 
+托管 Pi 扩展的选择、确认、输入和编辑对话框，以及 OpenCode 的交互表单，均由适配器取消并记为 `blocked`。向父会话提问时，Pi 子任务运行 `axiopera ask`，OpenCode 子任务可调用 MCP 的 `ask` 工具。
+
 Codex decline 不能带拒绝理由，适配器另用 steer 送入理由。Grok 通过 `_meta.followup_message` 传理由。各家要求持久化规则的批准选项均不使用。
 
 Codex 不再等待某个请求的应答时发出 `serverRequest/resolved`，应答之后也会发出；0.167 起，网络审批对应的请求在裁决前结束时同样发出。转发的请求尚无裁决时，适配器撤回它：不应答，也不送入拒绝理由。
@@ -96,7 +96,7 @@ Claude 查询使用 `--no-session-persistence`，通过单次参数关闭 hook �
 
 ## 会话与消息
 
-Pi 用 RPC 的 `prompt` 开轮，运行中追加消息用 `streamingBehavior:"steer"`。取消时清空待投队列并中断执行。原生会话 ID 和 JSONL 路径取自 `get_state`。Pi 自带的 subagent 示例与两种社区插件都为子进程设置独立的 `PI_SESSION_ID`。托管 Pi 会保留仍有后台子任务的进程，记录插件唤醒后的新一轮及其结果。实测的插件和版本见[验证依据](verification.md)。
+Pi 用 RPC 的 `prompt` 开轮，运行中追加消息用 `streamingBehavior:"steer"`。取消时清空待投队列并中断执行。原生会话 ID 和 JSONL 路径取自 `get_state`。托管 Pi 根据两款[已验证的 subagent 插件](verification.md#依据)返回的任务 ID 和完成消息跟踪后台工作，保留进程并记录插件唤醒后的下一轮。
 
 OpenCode v2 每项任务使用带随机密码的本机私有服务。首次提示前订阅 `/api/event`，随后按会话 ID 处理事件。轮中消息以独立 ID 入队，后端将其投递并开启模型步骤时确认已读。原生 shell 的 `OPENCODE_SESSION_ID` 和 MCP 调用的 `ai.opencode/sessionID` 用于区分主会话与原生子会话。后台子任务或 shell 仍在运行时保留服务。
 
@@ -133,9 +133,9 @@ Grok 的 `_x.ai/session/interjection` 只确认入队。轮末输出注明消费
 
 Grok 工具开始事件提供工具名和原始参数，后续更新可补齐规范化参数。适配器从中提取命令、搜索词、URL 或文件路径；`use_tool` 展开实际 MCP 工具名及其参数摘要。更新按调用 ID 合并到 `top` 的原记录，输出和状态更新不覆盖参数摘要。
 
-并发续接同一会话时，Claude 和 Grok 可以出现各自写入、互相看不到新轮次的情况，Codex 则拒绝第二个 writer。因此 Axiopera 在空闲时释放进程，并在续接前核对会话文件。
+并发续接同一会话时，Claude 和 Grok 可以出现各自写入、互相看不到新轮次的情况，Codex 则拒绝第二个 writer。Axiopera 在空闲时释放进程，续接前检查[原生会话是否已被接管](design.md#进程与任务)。
 
-Codex、Grok 和 AGY 内置子 agent 的终端命令分别带有独立的 `CODEX_THREAD_ID`、`GROK_SESSION_ID` 和 `ANTIGRAVITY_CONVERSATION_ID`，Axiopera 按各自线程或会话隔离收件箱；由 Axiopera 启动的宿主再开内置子 agent 时同样隔离，并保留外层任务的归属和限制。Claude 主 agent 与内置子 agent 共享原生会话身份；内置子 agent 使用 Axiopera 时，所有参与者都应使用带任务 ID 的 `wait`、`inbox`，避免取走彼此的消息。
+Codex、Grok、AGY 和 OpenCode 的原生子会话，以及 Pi 自带 subagent 示例和两款已验证社区插件的子进程，都有独立会话 ID。Axiopera 按会话隔离收件箱。由托管任务派生的原生子会话仍受外层任务的权限和深度限制。Claude 主 agent 与内置子 agent 共享原生会话身份，所有参与者都应使用带任务 ID 的 `wait`、`inbox`，避免取走彼此的消息。
 
 ## 宿主通知
 
@@ -148,8 +148,9 @@ Codex、Grok 和 AGY 内置子 agent 的终端命令分别带有独立的 `CODEX
 | Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 默认等本轮结束；启用[插件](usage.md#skill-与-codex-插件) hook 后，下一次工具调用后提醒 | 门铃，插件 hook |
 | 其他 Codex 会话 | 不唤醒 | 不送达 | 轮询 `wait`，再 `inbox` |
 | Pi TUI，扩展已连上当前 daemon | 自动开启一轮 | 下一次工具返回后送达 | [Pi 扩展](usage.md#pi-扩展)提醒后运行 `inbox` |
-| 裸 Pi | 等下一次输入 | 前台等待可直接收件 | 前台运行 `wait`，再 `inbox` |
-| OpenCode v2 TUI | 后台 shell 完成时自动开启一轮 | shell 完成消息进入会话 | 原生 shell 用 `background: true` 运行一条 `axiopera wait`，完成通知内会提示 `inbox`。仅支持前台的 shell 在需要子任务消息才能继续时运行 `wait` |
+| Pi TUI，未连接通知扩展 | 等下一次输入 | 前台 `wait` 可等到更新 | 需要子任务消息才能继续时运行 `wait`，有消息时按输出提示运行 `inbox` |
+| OpenCode v2 TUI，shell 支持 `background: true` | 后台 `wait` 完成时自动开启一轮 | shell 完成消息进入会话 | 多项任务共用一条后台 `axiopera wait`，完成通知内会提示 `inbox` |
+| OpenCode v2 TUI，仅有前台 shell | 等下一次输入 | 前台 `wait` 可等到更新 | 需要子任务消息才能继续时运行 `wait`，有消息时按输出提示运行 `inbox` |
 
 Windows 上 AGY 的命令沙箱会阻止 `wait` 和 `inbox` 连接本机 daemon。若命令提示需要提升权限，应通过 AGY 的单次审批在沙箱外运行该命令。宿主取子任务结果依赖正在等待的 `wait`；父级用 `axiopera send` 给托管 AGY 任务追加要求则直接走 ACP。
 

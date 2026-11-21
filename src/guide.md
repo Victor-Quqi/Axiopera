@@ -17,7 +17,7 @@ Dispatch
   Use --tier full with `spawn pi`, and --tier read or --tier full with `spawn opencode`.
   Tiers: read (read-only; requests needing approval are refused;
               MCP: read-only tools only, none on Grok, Axiopera directory listing and communication tools on AGY and OpenCode; Grok shell: plain axiopera commands only),
-         work (default: the agent's own auto mode), full (the agent's full-access mode).
+         work (default: the agent's own auto mode), full (the broadest access the backend offers).
   Options: --model, --effort, --name (use it instead of the ID), --cwd, --timeout 30m.
   Tasks share your working directory unless --cwd selects another; axiopera creates no copy.
   Give parallel writers separate git worktrees via --cwd.
@@ -28,7 +28,7 @@ Dispatch
 Get results
   axiopera inbox           collects results, questions, approval requests and problems from
                            your sub-tasks. Each is handed over once. Never blocks.
-  axiopera wait            blocks until there is something new, lists it, and takes nothing.
+  axiopera wait            lists new messages without collecting them. Waits while sub-tasks run.
 @claude Run `axiopera wait` as a background command (teammates of team-lead: foreground). When it
 @claude exits, run `axiopera inbox`, and start `axiopera wait` again while sub-tasks still run.
 @claude Native subagents and teammates share their parent's inbox,

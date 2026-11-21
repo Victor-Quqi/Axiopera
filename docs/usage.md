@@ -1,6 +1,6 @@
 # 使用与配置
 
-派发、收结果和对话的示例见 [agent 使用说明](../src/guide.md)。所有命令支持全局选项 `--json`；各命令的参数见 `axiopera <命令> --help`。
+在主 agent 中运行 `axiopera guide --host <宿主>` 查看派发、收件和续接示例。任务命令可用 `--json` 输出结构化结果，参数见 `axiopera <命令> --help`。
 
 ## 任务与工作目录
 
@@ -20,7 +20,7 @@
 
 ## 结果与接管
 
-`wait` 阻塞到有新消息，列出后退出，不取走任何内容；`inbox` 取走已有消息，没有新消息时直接返回。`watch` 每有新消息就输出一行摘要，一直运行到被停止，同样不取走；子 agent 的 `watch` 在子任务都结束、消息都取走 1 分钟后自行退出。每轮结果经 `inbox`、`result` 或宿主推送交付后，再次 `result` 只返回文件路径。需要重新查看正文时用 `result <task> --turn N --force`。
+`wait` 在子任务运行时等待新消息，有消息就列出摘要并提示用 `inbox` 取正文。没有新消息也没有运行中的子任务时，`wait` 直接退出。`inbox` 取走已有消息，没有新消息时直接返回。`watch` 持续输出新消息摘要，子 agent 的 `watch` 在其子任务都结束、消息都取走 1 分钟后自行退出。每轮结果经 `inbox`、`result` 或宿主推送交付后，再次 `result` 只返回文件路径。需要重新查看正文时用 `result <task> --turn N --force`。
 
 `watch --status` 跟踪调用方正在执行和排队的任务，每 2 秒检查一次，输出有变化的状态和进度，包括监听期间新增的任务及已跟踪任务的结束状态。没有执行或排队的任务时以退出码 0 结束，未收取的消息不影响退出。停止监听不会取消任务。Codex 的后台显示见[宿主通知](backends.md#宿主通知)。
 
@@ -94,7 +94,7 @@ daemon 启动时读取配置。修改后运行 `axiopera daemon stop`，下一�
 
 ## Skill 与 Codex 插件
 
-skill 让 agent 在派发任务前先运行 `axiopera guide --host <宿主>`，效果与在项目说明中写明这一点相同。`--host` 只输出该宿主取结果的方式，不带时输出全部宿主的。
+skill 让 agent 在会话中首次使用 Axiopera 时运行 `axiopera guide --host <宿主>`。guide 保留通用操作，`--host` 筛选宿主专属说明。Pi 和 OpenCode 在派发或续接任务后从回执得知怎样收到更新。
 
 运行 `axiopera skill install <宿主>`，将程序内置的 [`SKILL.md`](../plugins/axiopera/skills/axiopera/SKILL.md) 离线写入下表目录，新开会话即可使用：
 
@@ -142,13 +142,13 @@ Pi TUI 可安装扩展，在当前会话收到 Axiopera 子任务的提醒。安
 | 更新 | `pi update git:github.com/Victor-Quqi/Axiopera` |
 | 卸载 | `pi remove git:github.com/Victor-Quqi/Axiopera` |
 
-派发或续接任务后，回执会给出当前 Pi 会话的收件方式。扩展已连上同一数据目录的 daemon 时，Pi 可以继续工作或结束当前轮。有更新时，提醒会送入当前轮或开启新一轮，Pi 再运行 `axiopera inbox`。裸 Pi、远程调用或监听未连通时，Pi 可先做独立工作，等到需要子任务的消息才能继续，再在前台运行 `axiopera wait`，随后用 `axiopera inbox` 收件。
+扩展连上当前会话使用的 daemon 后，Pi 可以继续工作或结束当前轮。有更新时，提醒送入当前轮或开启新一轮，并提示用 `axiopera inbox` 取正文。裸 Pi 或监听未连通时，等到需要子任务的消息才能继续，再按回执在前台运行 `axiopera wait`。
 
-用尚未合并的源码试用扩展，可将命令中的 Git 源换为本地仓库的绝对路径，例如 `pi install /path/to/Axiopera`。本地目录的修改在 `/reload` 后生效。
+从源码使用 Pi 集成时，在仓库根目录运行 `cargo install --path . --locked` 安装同一版本的 Axiopera，再用 `pi install /path/to/Axiopera` 加载该仓库里的扩展。扩展源码修改后，在 Pi 中输入 `/reload` 即可生效。
 
 ## daemon 与清理
 
-CLI 按需启动 daemon。没有运行中的 agent 和客户端连接时，daemon 空闲 10 分钟后退出。主会话退出不会取消已派发的任务。
+CLI 按需启动 daemon。没有运行中的 agent 和活跃客户端时，daemon 空闲 10 分钟后退出。Pi 扩展的被动监听允许 daemon 空闲退出，下次启动时自动重连。主会话退出不会取消已派发的任务。
 
 `axiopera daemon status` 查看 daemon，`daemon stop` 在没有运行任务时停止它。`daemon stop --force` 会中断正在运行的任务，之后可用 `send` 续接。升级二进制前先停止 daemon。
 
