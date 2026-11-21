@@ -14,7 +14,7 @@ session ends.
 Dispatch
   axiopera spawn codex "Fix the failing test in tests/parser.rs."
   axiopera spawn claude --tier read --name review -f task.md
-  Pi requires --tier full. OpenCode v2 requires --tier read or --tier full.
+  Use --tier full with `spawn pi`, and --tier read or --tier full with `spawn opencode`.
   Tiers: read (read-only; requests needing approval are refused;
               MCP: read-only tools only, none on Grok, Axiopera directory listing and communication tools on AGY and OpenCode; Grok shell: plain axiopera commands only),
          work (default: the agent's own auto mode), full (the agent's full-access mode).
@@ -41,10 +41,6 @@ Get results
 @grok For each line it prints, run `axiopera inbox`.
 @agy Run `axiopera wait` as a background command. When it finishes, run `axiopera inbox`.
 @agy Start another wait while sub-tasks are running. Shell access to the daemon may need approval.
-@pi The spawn, send and reply receipts tell you how this session receives updates.
-@opencode Run `axiopera wait` with the shell tool's background option. When the shell reports
-@opencode completion, run `axiopera inbox` and start another wait while sub-tasks are running.
-@opencode With only a foreground shell, wait in the foreground and then run inbox.
   Exit codes: 0 success, 1 command error, 3 nothing new yet (or wait timed out),
   4 nothing new and nothing running.
 

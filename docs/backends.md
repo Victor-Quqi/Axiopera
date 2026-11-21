@@ -149,7 +149,7 @@ Codex、Grok 和 AGY 内置子 agent 的终端命令分别带有独立的 `CODEX
 | 其他 Codex 会话 | 不唤醒 | 不送达 | 轮询 `wait`，再 `inbox` |
 | Pi TUI，扩展已连上当前 daemon | 自动开启一轮 | 下一次工具返回后送达 | [Pi 扩展](usage.md#pi-扩展)提醒后运行 `inbox` |
 | 裸 Pi | 等下一次输入 | 前台等待可直接收件 | 前台运行 `wait`，再 `inbox` |
-| OpenCode v2 TUI | 后台 shell 完成时自动开启一轮 | shell 完成消息进入会话 | 通过原生 shell 的 `background:true` 运行 `wait`，收到完成消息后运行 `inbox`；只有前台 shell 时，前台等待 |
+| OpenCode v2 TUI | 后台 shell 完成时自动开启一轮 | shell 完成消息进入会话 | 原生 shell 用 `background: true` 运行一条 `axiopera wait`，完成通知内会提示 `inbox`。仅支持前台的 shell 在需要子任务消息才能继续时运行 `wait` |
 
 Windows 上 AGY 的命令沙箱会阻止 `wait` 和 `inbox` 连接本机 daemon。若命令提示需要提升权限，应通过 AGY 的单次审批在沙箱外运行该命令。宿主取子任务结果依赖正在等待的 `wait`；父级用 `axiopera send` 给托管 AGY 任务追加要求则直接走 ACP。
 

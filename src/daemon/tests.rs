@@ -1295,14 +1295,21 @@ async fn pi_notification_receipts_follow_the_live_extension_connection() {
 }
 
 #[tokio::test]
-async fn pi_send_receipt_names_the_inbox_that_owns_the_task() {
-    let f = fixture_with(&[json!({"id": "pi", "agent": "pi"})]);
+async fn send_receipts_use_the_callers_host_and_the_tasks_inbox() {
+    let f = fixture_with(&[
+        json!({"id": "pi", "agent": "pi"}),
+        json!({"id": "oc", "agent": "opencode"}),
+    ]);
     f.d.lock().stopping = true;
     for (caller, parent) in [
         ("task:pi", "task:pi"),
         ("task:pi/pi:child", "task:pi/pi:child"),
         ("pi:other", "pi:owner"),
         ("pi:other", "task:pi"),
+        ("opencode:host", "opencode:host"),
+        ("task:oc", "task:oc"),
+        ("task:pi/opencode:child", "task:pi/opencode:child"),
+        ("opencode:other", "pi:owner"),
     ] {
         f.d.update("test", |task| task.parent = parent.into());
         let mut buf = Vec::new();
@@ -1321,7 +1328,13 @@ async fn pi_send_receipt_names_the_inbox_that_owns_the_task() {
         };
         if caller == parent {
             assert_eq!(data["reach"], "wait");
-            assert!(text.contains("in the foreground"));
+            let opencode = matches!(
+                caller,
+                "opencode:host" | "task:oc" | "task:pi/opencode:child"
+            );
+            assert_eq!(text.contains("background: true"), opencode);
+            assert!(text.to_ascii_lowercase().contains("when you need"));
+            assert!(!text.contains("axiopera inbox"));
         } else {
             assert_eq!(data["parent"], parent);
             assert!(text.contains(parent));

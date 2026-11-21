@@ -1155,36 +1155,28 @@ impl Daemon {
                 notes.push(format!("approval requests go to {approver}"));
             }
         }
-        let host = self.caller_host(caller);
-        let take = if host == Some("grok") {
-            "Take results and questions with `axiopera inbox` when your watch monitor reports news."
-        } else if host == Some("agy") {
-            "Run `axiopera wait` as a background command. When it finishes, run `axiopera inbox`."
-        } else if host == Some("opencode") {
-            "Run `axiopera wait` with the shell tool's background option. When the shell reports completion, run `axiopera inbox`. With a foreground-only shell, wait in the foreground."
-        } else {
-            "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some."
-        };
         let state = if self.lock().tasks[&id].actor.is_some() {
             "running"
         } else {
             "queued"
         };
         let mut data = json!({"task": id, "agent": s.agent, "tier": s.tier, "notes": notes, "reach": reach, "status": state});
-        let next = match (reach, unreachable) {
-            (Reach::Push, _) => {
+        let next = match reach {
+            Reach::Push => {
                 "Results and questions arrive as messages: do not wait or poll; end your turn if nothing else is left.".to_string()
             }
-            (Reach::Doorbell, _) => {
+            Reach::Doorbell => {
                 "After your turn ends, a message tells you when results or questions are ready for `axiopera inbox`: do not poll; end your turn if nothing else is left.".to_string()
             }
-            (Reach::Wait, Some(why)) => {
-                format!("Axiopera cannot send this Codex session messages: {why}. {take}")
+            Reach::Wait => {
+                let take = self
+                    .delivery_instructions(self.caller_host(caller), caller, out.pi_notify.as_deref(), &mut data)
+                    .await;
+                match unreachable {
+                    Some(why) => format!("Axiopera cannot send this Codex session messages: {why}. {take}"),
+                    None => take.into(),
+                }
             }
-            (Reach::Wait, None) if host == Some("pi") => {
-                self.pi_receipt(caller, caller, out.pi_notify.as_deref(), &mut data).await
-            }
-            (Reach::Wait, None) => take.to_string(),
         };
         let mut text = format!("{id}: {state}. {next}");
         for note in &notes {
@@ -1282,25 +1274,37 @@ impl Daemon {
         }
     }
 
-    async fn pi_receipt(
+    async fn delivery_instructions(
         &self,
+        host: Option<&str>,
         caller: &str,
-        parent: &str,
-        token: Option<&str>,
+        pi_notify: Option<&str>,
         data: &mut Value,
-    ) -> String {
-        if parent != caller {
-            data["parent"] = json!(parent);
-            return format!("Updates go to {parent}.");
-        }
-        if let Some(token) = token
-            && self.pi_notifications_ready(caller, token).await
-        {
-            data["reach"] = json!("notify");
-            "Pi will notify this session even after your turn ends. Run `axiopera inbox` when notified.".into()
-        } else {
-            data["reach"] = json!("wait");
-            "When you need a task update to continue, run `axiopera wait` in the foreground, then `axiopera inbox`.".into()
+    ) -> &'static str {
+        data["reach"] = json!(Reach::Wait);
+        match host {
+            Some("pi") => {
+                if let Some(token) = pi_notify
+                    && self.pi_notifications_ready(caller, token).await
+                {
+                    data["reach"] = json!("notify");
+                    "Pi will notify this session even after your turn ends."
+                } else {
+                    "When you need a task update to continue, run `axiopera wait` in the foreground."
+                }
+            }
+            Some("opencode") => {
+                "If your shell supports it, keep one `axiopera wait` running with `background: true` while tasks are active. Otherwise, run it when you need a task update to continue."
+            }
+            Some("grok") => {
+                "Take results and questions with `axiopera inbox` when your watch monitor reports news."
+            }
+            Some("agy") => {
+                "Run `axiopera wait` as a background command. When it finishes, run `axiopera inbox`."
+            }
+            _ => {
+                "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some."
+            }
         }
     }
 
@@ -1312,7 +1316,8 @@ impl Daemon {
         mut data: Value,
         out: &mut Out<'_, W>,
     ) -> Result<i32> {
-        let parent = if self.caller_host(caller) == Some("pi") {
+        let host = self.caller_host(caller);
+        let parent = if matches!(host, Some("pi" | "opencode")) {
             self.lock()
                 .tasks
                 .get(id)
@@ -1321,10 +1326,16 @@ impl Daemon {
             None
         };
         if let Some(parent) = parent {
-            let note = self
-                .pi_receipt(caller, &parent, out.pi_notify.as_deref(), &mut data)
-                .await;
-            text.push_str(&format!(". {note}"));
+            text.push_str(". ");
+            if parent == caller {
+                text.push_str(
+                    self.delivery_instructions(host, caller, out.pi_notify.as_deref(), &mut data)
+                        .await,
+                );
+            } else {
+                text.push_str(&format!("Updates go to {parent}."));
+                data["parent"] = json!(parent);
+            }
         }
         out.text(text, data).await?;
         Ok(ipc::exit::OK)

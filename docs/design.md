@@ -154,7 +154,7 @@ spawned、turn_started、steered、input_read、tool、tool_updated、said、fil
    - 不改变无关会话的行为。需要在所有会话中运行的部分，在没有相关任务时立即返回，不启动 daemon，不访问网络。hook 的开销见[使用文档](usage.md#skill-与-codex-插件)。
    - 默认卸载不留痕。后端机制必然留下的痕迹逐项记录位置和含义，并由清理命令移除。
 
-`spawn` 回执告诉宿主适用哪种取结果方式。各宿主的能力见[后端文档](backends.md#宿主通知)。
+`spawn` 回执告诉宿主怎样收到子任务的更新。Pi 和 OpenCode 在 `send` 和 `reply` 后也返回收件方式。操作其他会话的任务时，回执指明由哪个会话收件。各宿主的能力见[后端文档](backends.md#宿主通知)。
 
 Pi 扩展在独立 TUI 中观察 daemon 的启动记录，再以当前会话运行 `watch --if-running`。每次加载扩展或切换会话时生成一个标记，随 Pi 工具调用和监听连接传给 daemon。`spawn`、`send`、`reply` 的回执按当前调用方和在线监听的标记确定收件方式。首次派发先启动子任务，再等监听登记。监听断开后登记随即失效。
 

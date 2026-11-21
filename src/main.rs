@@ -693,6 +693,11 @@ mod tests {
         assert!(grok.contains("`axiopera watch --caller grok:s1`"));
         assert!(!grok.contains("background command"));
         assert!(all.contains("`axiopera watch --caller grok:<session>`"));
+        for (agent, caller) in [(Agent::Pi, "pi:s1"), (Agent::Opencode, "opencode:s1")] {
+            let text = guide(Some(agent), caller);
+            assert!(text.contains("axiopera wait") && text.contains("axiopera inbox"));
+            assert!(!text.contains("foreground") && !text.contains("background"));
+        }
         // Monitor commands need the full caller because they omit the native session variable.
         let sub_agent = guide(Some(Agent::Grok), "task:t1");
         assert!(sub_agent.contains("`axiopera watch --caller task:t1`"));

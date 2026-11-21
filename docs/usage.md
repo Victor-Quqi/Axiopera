@@ -8,7 +8,7 @@
 
 主 agent 负责检查子 agent 的改动、提交和合并分支。子 agent 的权限由 `--tier` 指定，默认 `work`。各档位在不同 backend 上的具体行为见[权限](backends.md#权限)。
 
-Pi 必须显式指定 `--tier full`，OpenCode v2 必须指定 `--tier read` 或 `--tier full`。省略时命令会提示支持的档位。
+派发给 Pi 的任务用 `--tier full`，派发给 OpenCode v2 的任务用 `--tier read` 或 `--tier full`。省略时命令会提示支持的档位。
 
 空闲后用 `axiopera send <task> --tier full "继续执行"` 在原会话中改档续接。AGY 进出 read 档需要新建任务。子 agent 只能修改自己直接派发的任务；降低父任务档位前，先降低超出新档位的子任务档位。
 
