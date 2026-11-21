@@ -909,11 +909,15 @@ fn project(s: &mut State, events: &Events, event: &Value) {
 }
 
 pub(super) fn npm_executable(modules: &Path, arch: &str) -> Option<PathBuf> {
-    let mut suffixes = ["", "-baseline"];
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if arch == "x64" && !std::arch::is_x86_feature_detected!("avx2") {
-        suffixes.swap(0, 1);
-    }
+    let baseline_only = arch == "x64" && !std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    let baseline_only = false;
+    let suffixes: &[&str] = if baseline_only {
+        &["-baseline"]
+    } else {
+        &["", "-baseline"]
+    };
     for root in [
         modules.to_path_buf(),
         modules.join("@opencode/cli/node_modules"),
