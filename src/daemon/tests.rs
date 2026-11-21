@@ -1247,6 +1247,90 @@ fn reminders_list_news_but_not_for_hosts_that_get_it_pushed() {
     assert!(f.d.reminder("codex:host").is_none());
 }
 
+#[tokio::test(start_paused = true)]
+async fn pi_notification_receipts_follow_the_live_extension_connection() {
+    let f = fixture();
+    let caller = "pi:host";
+    let token = format!("{caller}/{}", uuid::Uuid::new_v4());
+    let watch = |passive| {
+        let d = f.d.clone();
+        let env = Envelope {
+            protocol: ipc::PROTOCOL,
+            version: env!("CARGO_PKG_VERSION").into(),
+            caller: caller.into(),
+            cwd: f.home.clone(),
+            env: None,
+            request: Request::Watch {
+                status: false,
+                passive,
+                pi_watch: Some(token.clone()),
+            },
+        };
+        tokio::spawn(async move { d.dispatch(env, &mut Out::new(&mut Vec::new())).await })
+    };
+
+    let start = tokio::time::Instant::now();
+    assert!(!f.d.pi_notifications_ready("pi:child", &token).await);
+    assert!(!f.d.pi_notifications_ready(caller, "pi:host/").await);
+    assert_eq!(tokio::time::Instant::now(), start);
+
+    let ordinary = watch(false);
+    let (ready, first) = tokio::join!(f.d.pi_notifications_ready(caller, &token), async {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        watch(true)
+    });
+    assert!(ready);
+    let second = watch(true);
+    tokio::task::yield_now().await;
+    first.abort();
+    assert!(first.await.unwrap_err().is_cancelled());
+    assert!(f.d.pi_notifications_ready(caller, &token).await);
+
+    second.abort();
+    assert!(second.await.unwrap_err().is_cancelled());
+    assert!(!f.d.pi_notifications_ready(caller, &token).await);
+    ordinary.abort();
+    assert!(ordinary.await.unwrap_err().is_cancelled());
+    assert!(f.d.pi_watches.borrow().is_empty());
+}
+
+#[tokio::test]
+async fn pi_send_receipt_names_the_inbox_that_owns_the_task() {
+    let f = fixture_with(&[json!({"id": "pi", "agent": "pi"})]);
+    f.d.lock().stopping = true;
+    for (caller, parent) in [
+        ("task:pi", "task:pi"),
+        ("task:pi/pi:child", "task:pi/pi:child"),
+        ("pi:other", "pi:owner"),
+        ("pi:other", "task:pi"),
+    ] {
+        f.d.update("test", |task| task.parent = parent.into());
+        let mut buf = Vec::new();
+        f.d.send(
+            caller,
+            "test",
+            "continue".into(),
+            None,
+            None,
+            &mut Out::new(&mut buf),
+        )
+        .await
+        .unwrap();
+        let Reply::Out { text, data } = serde_json::from_slice(&buf).unwrap() else {
+            panic!("missing send receipt");
+        };
+        if caller == parent {
+            assert_eq!(data["reach"], "wait");
+            assert!(text.contains("in the foreground"));
+        } else {
+            assert_eq!(data["parent"], parent);
+            assert!(text.contains(parent));
+            assert!(data.get("reach").is_none());
+            assert!(!text.contains("axiopera wait") && !text.contains("axiopera inbox"));
+        }
+    }
+}
+
 #[tokio::test]
 async fn watch_merges_news_that_comes_together() {
     let f = fixture();

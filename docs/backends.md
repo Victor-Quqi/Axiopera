@@ -147,7 +147,7 @@ Codex、Grok 和 AGY 内置子 agent 的终端命令分别带有独立的 `CODEX
 | Codex TUI | 自动开启一轮 | 送入当前轮 | 推送 |
 | Codex 桌面端、VS Code 扩展 | 约 10 秒内开启一轮 | 默认等本轮结束；启用[插件](usage.md#skill-与-codex-插件) hook 后，下一次工具调用后提醒 | 门铃，插件 hook |
 | 其他 Codex 会话 | 不唤醒 | 不送达 | 轮询 `wait`，再 `inbox` |
-| Pi TUI，已安装扩展 | 自动开启一轮 | 下一次工具返回后送达 | [Pi 扩展](usage.md#pi-扩展)提醒后运行 `inbox` |
+| Pi TUI，扩展已连上当前 daemon | 自动开启一轮 | 下一次工具返回后送达 | [Pi 扩展](usage.md#pi-扩展)提醒后运行 `inbox` |
 | 裸 Pi | 等下一次输入 | 前台等待可直接收件 | 前台运行 `wait`，再 `inbox` |
 | OpenCode v2 TUI | 后台 shell 完成时自动开启一轮 | shell 完成消息进入会话 | 通过原生 shell 的 `background:true` 运行 `wait`，收到完成消息后运行 `inbox`；只有前台 shell 时，前台等待 |
 

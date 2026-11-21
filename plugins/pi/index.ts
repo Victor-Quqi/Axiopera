@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync, unwatchFile, watchFile } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -12,9 +13,14 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		stop?.();
+		// A child Pi can inherit its parent's marker. Only the current TUI can issue one.
+		delete process.env.AXIOPERA_PI_NOTIFY;
+		delete process.env.AXIOPERA_PI_WATCH;
 		if (ctx.mode !== "tui" || process.env.AXIOPERA_TASK_ID) return;
 
 		const caller = `pi:${ctx.sessionManager.getSessionId()}`;
+		const token = `${caller}/${randomUUID()}`;
+		process.env.AXIOPERA_PI_NOTIFY = token;
 		const home = resolve(ctx.cwd, process.env.AXIOPERA_HOME || join(homedir(), ".axiopera"));
 		const info = join(home, "daemon", "info.json");
 		let lastSeq = 0;
@@ -30,7 +36,7 @@ export default function (pi: ExtensionAPI) {
 		let closed = false;
 		let watching: ReturnType<typeof spawn> | undefined;
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		let delay = 500;
+		let delay = 200;
 		function retry() {
 			if (closed || timer) return;
 			timer = setTimeout(() => { timer = undefined; connect(); }, delay);
@@ -51,6 +57,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const child = spawn("axiopera", ["--json", "--caller", caller, "watch", "--if-running", "--until-stdin-closes"], {
 				cwd: ctx.cwd,
+				env: { ...process.env, AXIOPERA_PI_WATCH: token },
 				stdio: ["pipe", "pipe", "ignore"],
 				windowsHide: true,
 			});
@@ -65,7 +72,7 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				if (!Array.isArray(data)) return;
-				delay = 500;
+				delay = 200;
 				let seq = lastSeq;
 				for (const event of data) {
 					if (Number.isSafeInteger(event?.seq)) seq = Math.max(seq, event.seq);
@@ -89,15 +96,17 @@ export default function (pi: ExtensionAPI) {
 		function changed() {
 			clearTimeout(timer);
 			timer = undefined;
-			delay = 500;
+			delay = 200;
 			connect();
 		}
-		watchFile(info, { persistent: false, interval: 2000 }, changed);
+		// A cold spawn waits up to three seconds for this subscription to connect.
+		watchFile(info, { persistent: false, interval: 250 }, changed);
 		stop = () => {
 			closed = true;
 			clearTimeout(timer);
 			unwatchFile(info, changed);
 			watching?.kill();
+			if (process.env.AXIOPERA_PI_NOTIFY === token) delete process.env.AXIOPERA_PI_NOTIFY;
 			stop = undefined;
 		};
 		connect();

@@ -5,6 +5,9 @@ use anyhow::{Result, bail};
 /// Set by the daemon in every sub-agent's environment.
 pub const TASK_VAR: &str = "AXIOPERA_TASK_ID";
 
+pub const PI_NOTIFY_VAR: &str = "AXIOPERA_PI_NOTIFY";
+pub const PI_WATCH_VAR: &str = "AXIOPERA_PI_WATCH";
+
 /// Session variables hosts inject into their shell commands, and the caller prefix for each.
 pub const HOST_VARS: [(&str, &str); 6] = [
     ("CLAUDE_CODE_SESSION_ID", "claude"),
@@ -18,7 +21,7 @@ pub const HOST_VARS: [(&str, &str); 6] = [
 /// Host identity variables a sub-agent must not inherit from its caller, including the
 /// credentials of a Claude Code session's inbox, and the client name the Codex app and IDE
 /// extension give their sessions.
-pub const STRIP_VARS: [&str; 16] = [
+pub const STRIP_VARS: [&str; 18] = [
     "CLAUDECODE",
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_PID",
@@ -34,6 +37,8 @@ pub const STRIP_VARS: [&str; 16] = [
     "CLAUDE_CODE_MESSAGING_TOKEN",
     "PI_SESSION_ID",
     "PI_SESSION_FILE",
+    PI_NOTIFY_VAR,
+    PI_WATCH_VAR,
     "OPENCODE_SESSION_ID",
 ];
 

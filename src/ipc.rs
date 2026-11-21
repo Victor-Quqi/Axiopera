@@ -92,6 +92,8 @@ pub enum Request {
         status: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         passive: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pi_watch: Option<String>,
     },
     Status {
         task: Option<String>,

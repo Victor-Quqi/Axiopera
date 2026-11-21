@@ -432,6 +432,11 @@ async fn run(cli: Cli) -> Result<i32> {
                 Request::Watch {
                     status,
                     passive: if_running,
+                    pi_watch: if cli.json && if_running && until_stdin_closes && !status {
+                        std::env::var(identity::PI_WATCH_VAR).ok()
+                    } else {
+                        None
+                    },
                 },
                 !if_running,
             );

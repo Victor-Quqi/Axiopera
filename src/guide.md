@@ -41,8 +41,7 @@ Get results
 @grok For each line it prints, run `axiopera inbox`.
 @agy Run `axiopera wait` as a background command. When it finishes, run `axiopera inbox`.
 @agy Start another wait while sub-tasks are running. Shell access to the daemon may need approval.
-@pi In a Pi TUI with the Axiopera extension, run `axiopera inbox` when notified.
-@pi Otherwise run `axiopera wait` in the foreground, then `axiopera inbox`.
+@pi The spawn, send and reply receipts tell you how this session receives updates.
 @opencode Run `axiopera wait` with the shell tool's background option. When the shell reports
 @opencode completion, run `axiopera inbox` and start another wait while sub-tasks are running.
 @opencode With only a foreground shell, wait in the foreground and then run inbox.

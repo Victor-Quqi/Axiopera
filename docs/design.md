@@ -156,7 +156,9 @@ spawned、turn_started、steered、input_read、tool、tool_updated、said、fil
 
 `spawn` 回执告诉宿主适用哪种取结果方式。各宿主的能力见[后端文档](backends.md#宿主通知)。
 
-Pi 扩展在独立 TUI 会话中观察 daemon 的启动记录，再用该会话 ID 运行 `watch --if-running`。收到新的事件序号时通过 Pi 的 `sendMessage` 投递收件提醒。序号和会话 ID 随提醒保存在 Pi 会话分支中，重新加载扩展时据此去重。切换会话或卸载会关闭监听。托管 Pi 任务的消息直接通过 RPC 送达。
+Pi 扩展在独立 TUI 中观察 daemon 的启动记录，再以当前会话运行 `watch --if-running`。每次加载扩展或切换会话时生成一个标记，随 Pi 工具调用和监听连接传给 daemon。`spawn`、`send`、`reply` 的回执按当前调用方和在线监听的标记确定收件方式。首次派发先启动子任务，再等监听登记。监听断开后登记随即失效。
+
+扩展收到新的事件序号时通过 Pi 的 `sendMessage` 投递提醒。序号和会话 ID 随提醒保存在 Pi 会话分支中，重新加载扩展时据此去重。托管 Pi 任务的消息直接通过 RPC 送达。
 
 ## Codex 推送与门铃
 

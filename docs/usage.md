@@ -142,7 +142,7 @@ Pi TUI 可安装扩展，在当前会话收到 Axiopera 子任务的提醒。安
 | 更新 | `pi update git:github.com/Victor-Quqi/Axiopera` |
 | 卸载 | `pi remove git:github.com/Victor-Quqi/Axiopera` |
 
-空闲时提醒开启一轮，忙时随当前轮送达。扩展通过 PATH 中的 `axiopera` 监听同一数据目录里的 daemon。daemon 空闲退出后，下次启动时扩展会重新连接。Pi 收到提醒后运行 `axiopera inbox` 取正文。裸 Pi 或远程调用可在前台运行 `axiopera wait` 后收件。
+派发或续接任务后，回执会给出当前 Pi 会话的收件方式。扩展已连上同一数据目录的 daemon 时，Pi 可以继续工作或结束当前轮。有更新时，提醒会送入当前轮或开启新一轮，Pi 再运行 `axiopera inbox`。裸 Pi、远程调用或监听未连通时，Pi 可先做独立工作，等到需要子任务的消息才能继续，再在前台运行 `axiopera wait`，随后用 `axiopera inbox` 收件。
 
 用尚未合并的源码试用扩展，可将命令中的 Git 源换为本地仓库的绝对路径，例如 `pi install /path/to/Axiopera`。本地目录的修改在 `/reload` 后生效。
 

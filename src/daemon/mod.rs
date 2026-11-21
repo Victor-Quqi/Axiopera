@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{Notify, broadcast, mpsc, oneshot};
+use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 
 use crate::agent;
 use crate::config;
@@ -61,12 +61,38 @@ pub struct Daemon {
     store: Store,
     state: Mutex<State>,
     events: broadcast::Sender<Event>,
+    pi_watches: watch::Sender<HashMap<String, usize>>,
     shutdown: Notify,
     conns: AtomicUsize,
     log: Mutex<Option<File>>,
     /// Held while appending to or trimming `daemon/requests.jsonl`.
     requests: Mutex<()>,
     previews: Mutex<delivery::Previews>,
+}
+
+fn pi_watch_matches(caller: &str, token: &str) -> bool {
+    caller.strip_prefix("pi:").is_some_and(|id| !id.is_empty())
+        && token
+            .rsplit_once('/')
+            .is_some_and(|(owner, nonce)| owner == caller && uuid::Uuid::try_parse(nonce).is_ok())
+}
+
+/// The server drops this guard when its client disconnects, including mid-write.
+struct PiWatch<'a> {
+    d: &'a Daemon,
+    token: &'a str,
+}
+
+impl Drop for PiWatch<'_> {
+    fn drop(&mut self) {
+        self.d.pi_watches.send_modify(|live| {
+            let count = live.get_mut(self.token).unwrap();
+            *count -= 1;
+            if *count == 0 {
+                live.remove(self.token);
+            }
+        });
+    }
 }
 
 struct State {
@@ -138,13 +164,19 @@ impl Entry {
 /// One request's reply stream.
 pub struct Out<'a, W> {
     w: &'a mut W,
+    /// Identifies the Pi window receiving this receipt, including for sandboxed send/reply.
+    pi_notify: Option<String>,
     /// Bytes of text written so far, for the request log.
     bytes: usize,
 }
 
 impl<'a, W: AsyncWrite + Unpin> Out<'a, W> {
     fn new(w: &'a mut W) -> Self {
-        Out { w, bytes: 0 }
+        Out {
+            w,
+            pi_notify: None,
+            bytes: 0,
+        }
     }
 
     pub async fn text(&mut self, text: impl Into<String>, data: Value) -> std::io::Result<()> {
@@ -349,6 +381,7 @@ impl Daemon {
                 host_checked: HashMap::new(),
             }),
             events,
+            pi_watches: watch::Sender::new(HashMap::new()),
             shutdown: Notify::new(),
             conns: AtomicUsize::new(0),
             log: Mutex::new(log),
@@ -650,6 +683,7 @@ impl Daemon {
             .await?;
             return Ok(());
         }
+        out.pi_notify = env.env.as_mut().and_then(take_pi_notify);
         // Agents started with it would run outside the sandbox, on a PATH the sandbox chose.
         if peer.restricted() {
             env.env = None;
@@ -839,7 +873,22 @@ impl Daemon {
                 Ok(ipc::exit::OK)
             }
             Request::Watch { status: true, .. } => self.watch_status(&caller, out).await,
-            Request::Watch { status: false, .. } => self.watch(&caller, out).await,
+            Request::Watch {
+                status: false,
+                passive,
+                pi_watch,
+            } => {
+                let _registration = pi_watch
+                    .as_deref()
+                    .filter(|token| passive && pi_watch_matches(&caller, token))
+                    .map(|token| {
+                        self.pi_watches.send_modify(|live| {
+                            *live.entry(token.to_owned()).or_default() += 1;
+                        });
+                        PiWatch { d: self, token }
+                    });
+                self.watch(&caller, out).await
+            }
             Request::Status { task, all } => self.status(&caller, task.as_deref(), all, out).await,
             Request::Log { task, tail } => self.log_cmd(&caller, &task, tail, out).await,
             Request::Result { task, turn, force } => {
@@ -1106,21 +1155,22 @@ impl Daemon {
                 notes.push(format!("approval requests go to {approver}"));
             }
         }
-        let host = identity::task_session(caller).map_or(caller, |(_, native)| native);
-        let task_agent = host
-            .strip_prefix("task:")
-            .and_then(|id| self.lock().tasks.get(id).map(|entry| entry.task.agent));
-        let take = if host.starts_with("grok:") || task_agent == Some(Agent::Grok) {
+        let host = self.caller_host(caller);
+        let take = if host == Some("grok") {
             "Take results and questions with `axiopera inbox` when your watch monitor reports news."
-        } else if host.starts_with("agy:") || task_agent == Some(Agent::Agy) {
+        } else if host == Some("agy") {
             "Run `axiopera wait` as a background command. When it finishes, run `axiopera inbox`."
-        } else if host.starts_with("pi:") && identity::task_of(caller).is_none() {
-            "With the Pi TUI extension, run `axiopera inbox` when notified. Otherwise run `axiopera wait` in the foreground, then `axiopera inbox`."
-        } else if host.starts_with("opencode:") || task_agent == Some(Agent::Opencode) {
+        } else if host == Some("opencode") {
             "Run `axiopera wait` with the shell tool's background option. When the shell reports completion, run `axiopera inbox`. With a foreground-only shell, wait in the foreground."
         } else {
             "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some."
         };
+        let state = if self.lock().tasks[&id].actor.is_some() {
+            "running"
+        } else {
+            "queued"
+        };
+        let mut data = json!({"task": id, "agent": s.agent, "tier": s.tier, "notes": notes, "reach": reach, "status": state});
         let next = match (reach, unreachable) {
             (Reach::Push, _) => {
                 "Results and questions arrive as messages: do not wait or poll; end your turn if nothing else is left.".to_string()
@@ -1131,22 +1181,16 @@ impl Daemon {
             (Reach::Wait, Some(why)) => {
                 format!("Axiopera cannot send this Codex session messages: {why}. {take}")
             }
+            (Reach::Wait, None) if host == Some("pi") => {
+                self.pi_receipt(caller, caller, out.pi_notify.as_deref(), &mut data).await
+            }
             (Reach::Wait, None) => take.to_string(),
-        };
-        let state = if self.lock().tasks[&id].actor.is_some() {
-            "running"
-        } else {
-            "queued"
         };
         let mut text = format!("{id}: {state}. {next}");
         for note in &notes {
             text.push_str(&format!("\n{note}"));
         }
-        out.text(
-            text,
-            json!({"task": id, "agent": s.agent, "tier": s.tier, "notes": notes, "reach": reach, "status": state}),
-        )
-        .await?;
+        out.text(text, data).await?;
         Ok(ipc::exit::OK)
     }
 
@@ -1225,6 +1269,67 @@ impl Daemon {
         })
     }
 
+    fn caller_host<'a>(&self, caller: &'a str) -> Option<&'a str> {
+        let native = identity::task_session(caller).map_or(caller, |(_, native)| native);
+        let (host, id) = native.split_once(':')?;
+        if host == "task" {
+            self.lock()
+                .tasks
+                .get(id)
+                .map(|entry| render::agent_name(entry.task.agent))
+        } else {
+            Some(host)
+        }
+    }
+
+    async fn pi_receipt(
+        &self,
+        caller: &str,
+        parent: &str,
+        token: Option<&str>,
+        data: &mut Value,
+    ) -> String {
+        if parent != caller {
+            data["parent"] = json!(parent);
+            return format!("Updates go to {parent}.");
+        }
+        if let Some(token) = token
+            && self.pi_notifications_ready(caller, token).await
+        {
+            data["reach"] = json!("notify");
+            "Pi will notify this session. You can end your turn and run `axiopera inbox` when notified.".into()
+        } else {
+            data["reach"] = json!("wait");
+            "When you need a task update to continue, run `axiopera wait` in the foreground, then `axiopera inbox`.".into()
+        }
+    }
+
+    async fn input_receipt<W: AsyncWrite + Unpin>(
+        &self,
+        caller: &str,
+        id: &str,
+        mut text: String,
+        mut data: Value,
+        out: &mut Out<'_, W>,
+    ) -> Result<i32> {
+        let parent = if self.caller_host(caller) == Some("pi") {
+            self.lock()
+                .tasks
+                .get(id)
+                .map(|entry| entry.task.parent.clone())
+        } else {
+            None
+        };
+        if let Some(parent) = parent {
+            let note = self
+                .pi_receipt(caller, &parent, out.pi_notify.as_deref(), &mut data)
+                .await;
+            text.push_str(&format!(". {note}"));
+        }
+        out.text(text, data).await?;
+        Ok(ipc::exit::OK)
+    }
+
     async fn send<W: AsyncWrite + Unpin>(
         self: &Arc<Self>,
         caller: &str,
@@ -1242,8 +1347,7 @@ impl Daemon {
             text.push_str(&format!("; tier {}", render::tier_name(tier)));
             data["tier"] = json!(tier);
         }
-        out.text(text, data).await?;
-        Ok(ipc::exit::OK)
+        self.input_receipt(caller, &id, text, data, out).await
     }
 
     /// Hand a message to a task: into its running turn, or as the input of a new one.
@@ -1474,12 +1578,14 @@ impl Daemon {
             .input_with_answer(caller, &task, message, None, env, Some((qid, &answer)))
             .await?;
         self.try_emit(&task, "answered", json!({"id": qid}))?;
-        out.text(
+        self.input_receipt(
+            caller,
+            &task,
             format!("{qid}: {how}"),
             json!({"id": qid, "task": task, "result": how}),
+            out,
         )
-        .await?;
-        Ok(ipc::exit::OK)
+        .await
     }
 
     async fn answers<W: AsyncWrite + Unpin>(
@@ -2517,6 +2623,22 @@ impl Daemon {
         ))
     }
 
+    async fn pi_notifications_ready(&self, caller: &str, token: &str) -> bool {
+        if !pi_watch_matches(caller, token) {
+            return false;
+        }
+        let mut watches = self.pi_watches.subscribe();
+        // A cold dispatch can reach the daemon before the extension discovers it.
+        matches!(
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                watches.wait_for(|live| live.contains_key(token)),
+            )
+            .await,
+            Ok(Ok(_))
+        )
+    }
+
     /// A line for each piece of news, until stopped, or for a sub-agent until it has been idle
     /// for `WATCH_IDLE`; news within `WATCH_GAP` of the last line is merged into the next one.
     /// Takes nothing.
@@ -2868,6 +2990,13 @@ fn is_news(event: &Event, caller: &str) -> bool {
         event.kind.as_str(),
         "turn_ended" | "question" | "approval_request" | "stalled" | "failed" | "interrupted"
     )
+}
+
+fn take_pi_notify(env: &mut Vec<(String, String)>) -> Option<String> {
+    let i = env
+        .iter()
+        .position(|(key, _)| key == identity::PI_NOTIFY_VAR)?;
+    Some(env.swap_remove(i).1)
 }
 
 /// The environment a sub-agent starts with: its caller's, minus host session identity, plus ours.
