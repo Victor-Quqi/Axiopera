@@ -144,7 +144,7 @@ def host(f):
         "HOST-SEND": "axiopera send own HOST-PROBE-CHILD-resumed",
         "HOST-BARE": ('[[ -z $AXIOPERA_PI_NOTIFY && -z $AXIOPERA_PI_WATCH ]] && '
                       f"axiopera spawn pi --model {MODEL} --tier full --name removed HOST-PROBE-CHILD-removed"),
-        "HOST-TAKE": "echo ready > host-waiting && axiopera wait removed && axiopera inbox removed",
+        "HOST-TAKE": "echo ready > host-waiting && axiopera wait removed",
     }
 
     def respond(request):
@@ -167,7 +167,11 @@ def host(f):
         if last["role"] == "tool":
             tool = next(m for m in reversed(messages) if m.get("tool_calls"))["tool_calls"][0]
             command = json.loads(tool["function"]["arguments"])["command"]
-            if command in commands.values() and command != commands["HOST-TAKE"]:
+            if command == commands["HOST-TAKE"]:
+                if "axiopera inbox" in str(last["content"]):
+                    return "bash", {"command": "axiopera inbox removed"}
+                return "wait returned without a collection instruction"
+            if command in commands.values():
                 receipts[command] = str(last["content"])
                 prompt = next(prompt for prompt, action in commands.items() if action == command)
                 return "host finished " + prompt
@@ -208,6 +212,7 @@ def host(f):
                 command = commands[prompt]
                 wait_until(lambda: command in receipts, f"{prompt} did not return a receipt to the host")
                 output = receipts[command]
+                assert "axiopera inbox" not in output, output
                 if automatic:
                     assert "Pi will notify this session" in output and "axiopera wait" not in output, output
                 else:

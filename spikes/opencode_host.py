@@ -1,14 +1,16 @@
 """Test native OpenCode TUI background-shell wakeup and Axiopera inbox delivery.
 
 Run `cargo build --locked`, then `python spikes/opencode_host.py /path/to/opencode`.
-It covers an idle TUI and a TUI running another foreground tool. Each run uses an
-isolated profile, a private OpenCode server, and a local model. Windows needs pywinpty.
+It covers spawn, send and reply receipts, and inbox delivery to an idle or busy
+TUI. Each run uses an isolated profile, a private server, and a local model.
+Windows needs pywinpty.
 """
 
 import argparse
 import contextlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -42,6 +44,8 @@ def run(root, opencode, axiopera, busy):
                TERM="xterm-256color")
     child, release, got = (threading.Event() for _ in range(3))
     errors = []
+    send = "axiopera send sample RUN-OC-ASK"
+    reply = None
     if busy:
         (cwd / "busy.py").write_text(
             "from pathlib import Path\nimport time\nPath('busy-started').touch()\n"
@@ -49,23 +53,55 @@ def run(root, opencode, axiopera, busy):
             "print('busy-finished')\n", encoding="utf-8")
 
     def respond(req):
+        nonlocal reply
         messages = req["messages"]
         users = "\n".join(str(m["content"]) for m in messages if m["role"] == "user")
         tools = [t["function"]["name"] for t in req.get("tools", [])]
         if not tools:
             return "Fixture title"
         if "RUN-OC-HOST" not in users:
+            if "RUN-OC-ANSWER" in users:
+                return "child accepted the answer"
+            if "RUN-OC-ASK" in users:
+                if messages[-1]["role"] == "tool":
+                    return "child asked its question"
+                return {"command": "axiopera ask Which-marker"}
             if "RUN-OC-CHILD" in users:
                 child.set()
                 assert release.wait(90), "child timed out waiting for the parent"
                 return "child-return-9127"
             return "Fixture"
         assert "shell" in tools, tools
+        if "RUN-OC-FOLLOWUP" in users:
+            last = messages[-1]
+            if last["role"] == "tool":
+                call = next(m for m in reversed(messages) if m.get("tool_calls"))["tool_calls"][-1]
+                command = json.loads(call["function"]["arguments"])["command"]
+                output = str(last["content"])
+                if command in (send, reply):
+                    check_receipt(output)
+                    if command == reply:
+                        return "Parent verified reply"
+                    return {"command": "axiopera wait sample", "background": True}
+                if command == "axiopera inbox sample":
+                    question = re.search(r"axiopera reply (q[\w-]+)", output)
+                    assert question, output
+                    reply = f"axiopera reply {question[1]} RUN-OC-ANSWER"
+                    return {"command": reply}
+            followup = users.rsplit("RUN-OC-FOLLOWUP", 1)[-1]
+            if 'command="axiopera wait sample"' in followup:
+                assert "axiopera inbox" in followup, followup
+                return {"command": "axiopera inbox sample"}
+            if last["role"] == "tool":
+                return "Parent waiting for question"
+            return {"command": send}
         outputs = [str(m["content"]) for m in messages if m["role"] == "tool"]
         if not outputs:
             return {"command": f"axiopera --json spawn opencode --tier full --model {MODEL} --name sample RUN-OC-CHILD"}
         if len(outputs) == 1:
-            assert json.loads(outputs[0])["data"]["task"], outputs[0]
+            receipt = json.loads(outputs[0])
+            assert receipt["data"]["task"], outputs[0]
+            check_receipt(receipt["text"])
             return {"command": "axiopera wait sample", "background": True}
         assert "moved to the background" in outputs[1], outputs[1]
         if '<shell id="' not in users:
@@ -77,10 +113,17 @@ def run(root, opencode, axiopera, busy):
         if busy:
             assert "busy-finished" in outputs[2], outputs[2]
         if len(outputs) == (3 if busy else 2):
+            notice = next(m["content"] for m in reversed(messages)
+                          if m["role"] == "user" and '<shell id="' in str(m["content"]))
+            assert "axiopera inbox" in str(notice), notice
             return {"command": "axiopera inbox sample"}
         assert "child-return-9127" in outputs[-1], outputs[-1]
         got.set()
         return "Parent received result"
+
+    def check_receipt(text):
+        assert all(part in text for part in ("background: true", "keep one", "when you need")), text
+        assert "axiopera inbox" not in text, text
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_):
@@ -145,6 +188,9 @@ def run(root, opencode, axiopera, busy):
                 (cwd / "release-tool").touch()
             until(lambda: got.is_set() and "Parent received result" in tui.screen,
                   "wait completion must start the next turn and retrieve the child result")
+            if not busy:
+                tui.type("RUN-OC-FOLLOWUP")
+                until(lambda: "Parent verified reply" in tui.screen, "send, collect question and reply")
             print("OpenCode TUI", "busy delivery" if busy else "idle wake", "and inbox: passed", flush=True)
         finally:
             release.set()

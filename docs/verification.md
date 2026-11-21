@@ -24,7 +24,7 @@ Windows 上，Pi 1.6.0 自带 subagent 示例、`pi-subagents` 0.89.2 和 `@tint
 
 Pi full 和 OpenCode read/full 使用 `gpt-6.1-terra` 验证文件读取、full 写入、同会话恢复随机文件内容，以及输出原生接管命令。OpenCode 两档另在两轮之间完整停止并重启 Axiopera daemon。`python spikes/opencode_managed.py <opencode.exe>` 用可控的本地模型验证托管任务。额外实测包括 OpenCode read 的七个工具、full 审批与拒绝、轮中追加、取消、原生子任务唤醒和接管。
 
-`python spikes/opencode_host.py <opencode.exe>` 用真实交互 TUI 验证后台 `wait` 唤醒空闲宿主、忙时当前前台命令继续执行，以及随后 `inbox` 取回结果。`node spikes/pi_watch.mjs <axiopera.exe>` 验证监听重连、重放去重、宿主强退回收、daemon 空闲退出后重新发现，以及同一 Pi 会话切换 Axiopera 数据目录后收到首条提醒。
+`python spikes/opencode_host.py <opencode.exe>` 用真实交互 TUI 验证后台 `wait` 唤醒空闲宿主、忙时当前前台命令继续执行，以及随后 `inbox` 取回结果。Windows 上，OpenCode 2.3.2 发给模型的 shell 完成通知包含 `wait` 输出的收件命令。`node spikes/pi_watch.mjs <axiopera.exe>` 验证监听重连、重放去重、宿主强退回收、daemon 空闲退出后重新发现，以及同一 Pi 会话切换 Axiopera 数据目录后收到首条提醒。
 
 下表脚本名均指 `spikes/` 下的探针。
 
