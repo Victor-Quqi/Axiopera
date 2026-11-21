@@ -14,14 +14,15 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from probe import remove_tree
+
 MODEL = "fixture/probe"
 READ = {"read", "glob", "grep", "axiopera_ask", "axiopera_tell", "axiopera_answers", "axiopera_list_directory"}
 
 
-def run(root, opencode, binary):
+def isolated_profile(root, opencode, binary):
     cwd = root / "project"
     cwd.mkdir()
-    (cwd / "fixture.txt").write_text("native-read-marker", encoding="utf-8")
     home = root / "axiopera-home"
     home.mkdir()
     (home / "config.toml").write_text(f"[agents.opencode]\npath = {json.dumps(str(opencode))}\n", encoding="utf-8")
@@ -34,7 +35,35 @@ def run(root, opencode, binary):
         p.mkdir()
         env[key] = str(p)
     env.update(AXIOPERA_HOME=str(home), OPENCODE_DISABLE_MODELS_FETCH="1", OPENCODE_DISABLE_AUTOUPDATE="1")
+    return cwd, exe, env
 
+
+def send_completion(handler, model, delta, finish):
+    handler.send_response(200)
+    handler.send_header("Content-Type", "text/event-stream")
+    handler.end_headers()
+    for part, reason in [({"role": "assistant", **delta}, None), ({}, finish)]:
+        chunk = {"id": "chatcmpl_probe", "object": "chat.completion.chunk", "created": 1, "model": model,
+                 "choices": [{"index": 0, "delta": part, "finish_reason": reason}]}
+        handler.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+    handler.wfile.write(b"data: [DONE]\n\n")
+
+
+def cleanup_profile(path):
+    # Shutdown can acknowledge before Windows unloads Bun's DLL and the daemon finishes writing.
+    for attempt in range(60):
+        try:
+            remove_tree(path)
+            return
+        except OSError:
+            if attempt == 59:
+                raise
+            time.sleep(.25)
+
+
+def run(root, opencode, binary):
+    cwd, exe, env = isolated_profile(root, opencode, binary)
+    (cwd / "fixture.txt").write_text("native-read-marker", encoding="utf-8")
     entered, release = threading.Event(), threading.Event()
     sampled = []
 
@@ -63,14 +92,7 @@ def run(root, opencode, binary):
                                         "function": {"name": name, "arguments": json.dumps(args)}}]}
             else:
                 delta = {"content": "fixture-finished"}
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.end_headers()
-            for part, finish in [({"role": "assistant", **delta}, None), ({}, "tool_calls" if tool else "stop")]:
-                chunk = {"id": "chatcmpl_probe", "object": "chat.completion.chunk", "created": 1, "model": "probe",
-                         "choices": [{"index": 0, "delta": part, "finish_reason": finish}]}
-                self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
+            send_completion(self, body["model"], delta, "tool_calls" if tool else "stop")
 
     def cli(*args):
         result = subprocess.run([str(exe), "--json", "--caller", "manual:opencode-probe", *args],
@@ -144,12 +166,4 @@ if __name__ == "__main__":
     try:
         run(tmp, args.opencode.resolve(strict=True), args.axiopera.resolve(strict=True))
     finally:
-        # The daemon acknowledges shutdown before Windows unloads Bun's temporary DLL.
-        for attempt in range(60):
-            try:
-                shutil.rmtree(tmp)
-                break
-            except PermissionError:
-                if attempt == 59:
-                    raise
-                time.sleep(0.25)
+        cleanup_profile(tmp)
