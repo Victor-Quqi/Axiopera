@@ -67,7 +67,14 @@ try {
 	cp.spawn = (command, args, options) => {
 		assert.equal(command, "axiopera");
 		assert.deepEqual(args.slice(-3), ["watch", "--if-running", "--until-stdin-closes"]);
-		const child = savedSpawn(ax, args, { ...options, env });
+		const { AXIOPERA_PI_NOTIFY, AXIOPERA_PI_WATCH } = options.env;
+		assert.equal(AXIOPERA_PI_NOTIFY, process.env.AXIOPERA_PI_NOTIFY);
+		assert.equal(AXIOPERA_PI_WATCH, AXIOPERA_PI_NOTIFY);
+		assert.equal(process.env.AXIOPERA_PI_WATCH, undefined, "a tool shell can register as the watcher");
+		const [owner, token] = AXIOPERA_PI_WATCH.split("/");
+		assert.equal(owner, args[2]);
+		assert.match(token, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+		const child = savedSpawn(ax, args, { ...options, env: { ...env, AXIOPERA_PI_NOTIFY, AXIOPERA_PI_WATCH } });
 		const record = { child, frames: 0, done: false };
 		child.stdout.on("data", () => record.frames++);
 		child.once("close", () => { record.done = true; });
@@ -76,20 +83,29 @@ try {
 	};
 	syncBuiltinESMExports();
 	const extension = (await import("../plugins/pi/index.ts")).default;
-	extension({
+	const api = {
 		on: (name, cb) => { callbacks[name] = cb; },
 		sendMessage: (message, opts) => {
 			assert.deepEqual(opts, { deliverAs: "steer", triggerTurn: true });
 			messages.push({ type: "custom_message", ...message });
 		},
-	});
+	};
+	extension(api);
 
 	writeFileSync(info, JSON.stringify({ pid: process.pid }));
+	const inherited = "pi:" + other + "/" + randomUUID();
 	process.env.AXIOPERA_TASK_ID = "managed-child";
+	process.env.AXIOPERA_PI_NOTIFY = inherited;
 	start();
+	assert.equal(process.env.AXIOPERA_PI_NOTIFY, undefined);
 	delete process.env.AXIOPERA_TASK_ID;
-	start(caller, "rpc");
-	start(caller, "print");
+	for (const mode of ["rpc", "print", "json"]) {
+		process.env.AXIOPERA_PI_NOTIFY = inherited;
+		process.env.AXIOPERA_PI_WATCH = inherited;
+		start(caller, mode);
+		assert.equal(process.env.AXIOPERA_PI_NOTIFY, undefined);
+		assert.equal(process.env.AXIOPERA_PI_WATCH, undefined);
+	}
 	assert.equal(children.length, 0);
 	rmSync(info);
 	start();
@@ -102,33 +118,47 @@ try {
 	await until(() => children.filter(c => c.done).length >= 2, "no retry while the endpoint was unavailable");
 	assert.ok(!existsSync(join(home, "daemon", "daemon.log")), "watch started the daemon");
 	callbacks.session_shutdown();
+	assert.equal(process.env.AXIOPERA_PI_NOTIFY, undefined);
 
-	await failTask(other, "foreign");
+	rmSync(info);
 	start();
-	await sleep(600);
-	assert.equal(messages.length, 0);
+	const firstToken = process.env.AXIOPERA_PI_NOTIFY;
 	await failTask(caller, "own");
-	await until(() => messages.length === 1, "owner missed its task event");
+	await until(() => messages.length === 1, "owner missed its first cold-start task event");
+	await failTask(other, "foreign");
+	assert.equal(messages.length, 1);
 	const first = children.at(-1);
 	const seq = messages[0].details.seq;
 	first.child.stdin.end();
 	await until(() => first.done && children.at(-1) !== first && children.at(-1).frames > 0, "disconnected watch did not replay");
+	assert.equal(process.env.AXIOPERA_PI_NOTIFY, firstToken, "reconnect changed the token held by tool shells");
 	assert.equal(messages.length, 1);
 	// Replay an older entry at the tail of the branch to exercise max-sequence recovery.
-	messages.push({ ...messages[0], details: { caller: "pi:" + caller, seq: seq - 1 } });
+	messages.push({ ...messages[0], details: { ...messages[0].details, seq: seq - 1 } });
 	start();
+	assert.notEqual(process.env.AXIOPERA_PI_NOTIFY, firstToken, "reload did not rotate the subscription");
 	await until(() => children.at(-1).frames > 0, "reloaded watch received no replay");
 	assert.equal(messages.length, 2);
 	start(other);
+	assert.ok(process.env.AXIOPERA_PI_NOTIFY.startsWith("pi:" + other + "/"));
 	await until(() => messages.length === 3, "session switch missed the new owner's event");
 	assert.equal(messages[2].details.caller, "pi:" + other);
 	const last = children.at(-1);
 	last.child.kill();
 	await until(() => last.done, "watch did not exit");
 	callbacks.session_shutdown();
+	assert.equal(process.env.AXIOPERA_PI_NOTIFY, undefined, "shutdown left a marker for later shell commands");
 	const stopped = children.length;
 	await sleep(1200);
 	assert.equal(children.length, stopped, "shutdown left a retry scheduled");
+	start();
+	const oldShutdown = callbacks.session_shutdown;
+	extension(api);
+	start();
+	const replacement = process.env.AXIOPERA_PI_NOTIFY;
+	oldShutdown();
+	assert.equal(process.env.AXIOPERA_PI_NOTIFY, replacement, "old extension revoked the replacement subscription");
+	callbacks.session_shutdown();
 
 	const abrupt = cp.spawnSync(process.execPath, ["-e", `
 		const w = require("node:child_process").spawn(process.argv[1],
@@ -161,7 +191,32 @@ try {
 	await until(() => messages.length > beforeIdle, "watch missed the first event after an idle restart");
 	assert.equal(messages.at(-1).details.caller, "pi:" + caller);
 	assert.ok(messages.at(-1).details.seq > seq);
-	console.log("Pi watcher passed startup retry, replay, reload, isolation, parent death, idle exit and restart delivery");
+	const previous = messages.at(-1);
+	assert.equal(previous.details.home, home);
+	messages.push({ ...previous, details: { caller: previous.details.caller, seq: Number.MAX_SAFE_INTEGER } });
+	const beforeSwitch = messages.length;
+	callbacks.session_shutdown();
+	const secondHome = join(root, "second");
+	mkdirSync(secondHome);
+	copyFileSync(join(home, "config.toml"), join(secondHome, "config.toml"));
+	process.env.AXIOPERA_HOME = env.AXIOPERA_HOME = secondHome;
+	try {
+		start(caller);
+		await failTask(caller, "new-home");
+		await until(() => messages.length > beforeSwitch, "previous or legacy cursor hid the new home's first event");
+		const fresh = messages.at(-1).details;
+		assert.equal(fresh.home, secondHome);
+		assert.equal(fresh.caller, previous.details.caller);
+		assert.ok(fresh.seq < previous.details.seq, "new daemon did not exercise a lower sequence");
+	} finally {
+		callbacks.session_shutdown();
+		try {
+			run("daemon", "stop", "--force");
+		} finally {
+			process.env.AXIOPERA_HOME = env.AXIOPERA_HOME = home;
+		}
+	}
+	console.log("Pi watcher passed startup retry, replay, reload, session and home isolation, parent death, idle exit and restart delivery");
 } finally {
 	callbacks.session_shutdown?.();
 	for (const { child, done } of children) if (!done) child.kill();

@@ -3,10 +3,10 @@
     python spikes/pi_extensions.py /path/to/pi host
     python spikes/pi_extensions.py /path/to/pi subagents
 
-host exercises local Git package install/update/remove, idle and busy delivery,
-session isolation, and reload deduplication. Windows needs pywinpty. subagents
-downloads two pinned npm packages into temporary homes and checks child identity,
-RPC completion, and both turns recorded by the daemon. Neither command needs a model key.
+host checks Git install, update and removal, the receipts Pi sees, automatic
+inbox delivery, and foreground wait after removal. subagents installs two pinned
+npm packages in temporary homes and checks native child inboxes, RPC completion,
+and turns recorded by the daemon. Windows needs pywinpty.
 """
 
 import argparse
@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import queue
+import re
 import shlex
 import shutil
 import subprocess
@@ -134,64 +135,239 @@ def host(f):
     f.env["PI_OFFLINE"] = "1"
     caller = "pi:" + str(uuid.uuid4())
     calls = []
-    entered, release, steered = (threading.Event() for _ in range(3))
+    receipts, inbox = {}, []
+    initial_context = []
+    release_child, entered, release_busy, defer = (threading.Event() for _ in range(4))
+    commands = {
+        "HOST-SPAWN": ('[[ $AXIOPERA_PI_NOTIFY == "pi:$PI_SESSION_ID/"?* && -z $AXIOPERA_PI_WATCH ]] && '
+                       f"axiopera spawn pi --model {MODEL} --tier full --name own HOST-PROBE-CHILD-own"),
+        "HOST-SEND": "axiopera send own HOST-PROBE-CHILD-resumed",
+        "HOST-BARE": ('[[ -z $AXIOPERA_PI_NOTIFY && -z $AXIOPERA_PI_WATCH ]] && '
+                      f"axiopera spawn pi --model {MODEL} --tier full --name removed HOST-PROBE-CHILD-removed"),
+        "HOST-TAKE": "echo ready > host-waiting && axiopera wait removed && axiopera inbox removed",
+    }
 
     def respond(request):
-        text = user_text(request)
-        if "HOST-PROBE-CHILD" in text:
-            calls.append("child")
-            return "child result"
+        messages = request["messages"]
+        last = messages[-1]
+        last_user = next(str(m["content"]) for m in reversed(messages) if m["role"] == "user")
+        if "HOST-UNRELATED" in last_user:
+            initial_context.append(str(messages))
+            return "ordinary turn finished"
+        child = re.search(r"HOST-PROBE-CHILD-([a-z]+)", last_user)
+        if child:
+            name = child[1]
+            calls.append(name)
+            if name in ("own", "resumed", "answered", "removed", "blocked"):
+                release_child.wait(45)
+            if name == "resumed" and last["role"] == "user":
+                return "bash", {"command": "axiopera ask Which-marker"}
+            return f"child-result-{name}"
         calls.append("host")
-        if "HOST-PROBE-BUSY" in text and not entered.is_set():
+        if last["role"] == "tool":
+            tool = next(m for m in reversed(messages) if m.get("tool_calls"))["tool_calls"][0]
+            command = json.loads(tool["function"]["arguments"])["command"]
+            if command in commands.values() and command != commands["HOST-TAKE"]:
+                receipts[command] = str(last["content"])
+                prompt = next(prompt for prompt, action in commands.items() if action == command)
+                return "host finished " + prompt
+            if "axiopera inbox" in command:
+                inbox.append(str(last["content"]))
+                return "host collected"
+        if last["role"] == "user" and NOTICE in last_user:
+            if defer.is_set():
+                return "host deferred collection"
+            return "bash", {"command": "axiopera inbox"}
+        if last["role"] == "user":
+            for prompt, command in commands.items():
+                if prompt in last_user:
+                    return "bash", {"command": command}
+        if "HOST-PROBE-BUSY" in last_user and not entered.is_set():
             entered.set()
-            release.wait(45)
+            release_busy.wait(45)
             return "bash", {"command": "echo host-tool-complete"}
-        if "HOST-PROBE-BUSY" in text and text.count(NOTICE) >= 2:
-            steered.set()
         return "host done"
 
     def dispatch(name, owner=caller):
-        f.run([AXIOPERA, "--caller", owner, "spawn", "pi", "--model", MODEL, "--tier", "full",
-               "--name", name, "HOST-PROBE-CHILD " + name])
+        receipt = f.run([AXIOPERA, "--caller", owner, "spawn", "pi", "--model", MODEL, "--tier", "full",
+                         "--name", name, "HOST-PROBE-CHILD-" + name])
+        assert "in the foreground" in receipt and "Pi will notify" not in receipt, receipt
 
     with f.model(respond):
         tui = Pty([str(f.pi), "--session-id", caller[3:], "--model", MODEL, "--approve"], f.cwd, f.env)
         try:
             wait_until(lambda: bool(tui.screen.strip()), "Pi did not start")
+            tui.type("HOST-UNRELATED")
+            wait_until(lambda: "ordinary turn finished" in tui.screen, "ordinary turn did not finish")
+            assert len(initial_context) == 1
+            assert not any(cmd in initial_context[0] for cmd in ("axiopera inbox", "axiopera wait"))
             assert not (f.root / "ax/daemon/info.json").exists()
+
+            def receipt(prompt, automatic):
+                tui.type(prompt)
+                command = commands[prompt]
+                wait_until(lambda: command in receipts, f"{prompt} did not return a receipt to the host")
+                output = receipts[command]
+                if automatic:
+                    assert "Pi will notify this session" in output and "axiopera wait" not in output, output
+                else:
+                    assert "in the foreground" in output and "Pi will notify" not in output, output
+                wait_until(lambda: "host finished " + prompt in tui.screen, "host did not finish its turn")
+                print(f"{prompt}: {output.strip()}", flush=True)
+
+            def collected(name):
+                wait_until(lambda: any("child-result-" + name in output for output in inbox),
+                           f"host did not take the {name} result")
+
+            for prompt, name in (("HOST-SPAWN", "own"), ("HOST-SEND", "resumed")):
+                release_child.clear()
+                receipt(prompt, automatic=True)
+                wait_until(lambda: name in calls, f"{name} child did not run")
+                release_child.set()
+                collected(name)
+
+            question = re.search(r"axiopera reply (q[\w-]+)", "\n".join(inbox))
+            assert question, inbox
+            commands["HOST-REPLY"] = f"axiopera reply {question[1]} HOST-PROBE-CHILD-answered"
+            release_child.clear()
+            receipt("HOST-REPLY", automatic=True)
+            release_child.set()
+            collected("answered")
+
+            before = calls.count("host")
             dispatch("foreign", "pi:" + str(uuid.uuid4()))
-            wait_until(lambda: "child" in calls, "foreign child did not run")
+            wait_until(lambda: "foreign" in calls, "foreign child did not run")
             time.sleep(3)
-            assert "host" not in calls
-            dispatch("own")
-            wait_until(lambda: "host" in calls, "idle owner did not wake")
+            assert calls.count("host") == before
+            defer.set()
+            dispatch("unread")
+            wait_until(lambda: "host deferred collection" in tui.screen, "host did not see unread news")
+            defer.clear()
+            before = calls.count("host")
             tui.type("/reload")
             time.sleep(3)
-            assert calls.count("host") == 1
+            assert calls.count("host") == before
             tui.type("HOST-PROBE-BUSY")
             assert entered.wait(15)
             dispatch("busy")
-            wait_until(lambda: calls.count("child") == 3, "third child did not run")
+            wait_until(lambda: "busy" in calls, "busy child did not run")
             time.sleep(2)
-            release.set()
-            assert steered.wait(20), "busy host did not receive the notice after the tool"
+            release_busy.set()
+            collected("busy")
+            collected("unread")
             f.run([f.pi, "remove", source])
             assert not installed.exists() and "fixture/axiopera" not in f.run([f.pi, "list"])
             tui.type("/reload")
             time.sleep(2)
+            release_child.clear()
+            receipt("HOST-BARE", automatic=False)
+            wait_until(lambda: "removed" in calls, "uninstalled case child did not run")
             before = calls.count("host")
-            dispatch("removed")
-            wait_until(lambda: calls.count("child") == 4, "fourth child did not run")
+            release_child.set()
             time.sleep(3)
             assert calls.count("host") == before
+            tui.type("HOST-TAKE")
+            collected("removed")
+            (f.cwd / "host-waiting").unlink()
+
+            commands["HOST-BLOCK"] = "axiopera send removed HOST-PROBE-CHILD-blocked"
+            release_child.clear()
+            receipt("HOST-BLOCK", automatic=False)
+            wait_until(lambda: "blocked" in calls, "bare resumed child did not run")
+            before = len(inbox)
+            tui.type("HOST-TAKE")
+            wait_until(lambda: (f.cwd / "host-waiting").exists(), "foreground command did not start")
+            time.sleep(.5)
+            assert len(inbox) == before
+            release_child.set()
+            collected("blocked")
+        finally:
+            release_busy.set()
+            release_child.set()
+            tui.close()
+            f.run([AXIOPERA, "daemon", "stop", "--force"])
+    print("Pi TUI: ordinary turn, cold spawn, resumed send/reply, idle/busy inbox, reload and bare wait passed")
+
+
+PACKAGES = {"nico": "pi-subagents@0.89.2", "tintin": "@tintinweb/pi-subagents@0.26.2"}
+
+
+def subagent_receipts(f):
+    f.run([f.pi, "install", str(ROOT)])
+    session = str(uuid.uuid4())
+    child_output, child_inbox, parent_output, inbox = [], [], [], []
+    release = threading.Event()
+    child_task, parent_task = "from-delegate", "from-tui"
+
+    def spawn(name, prompt):
+        return f"axiopera spawn pi --model {MODEL} --tier full --name {name} {prompt}"
+
+    def respond(request):
+        messages = request["messages"]
+        last = messages[-1]
+        user = next(str(m["content"]) for m in reversed(messages) if m["role"] == "user")
+        if "DELEGATE-LEAF" in user:
+            return "private child result"
+        if "TUI-LEAF" in user:
+            release.wait(40)
+            return "public parent result"
+        if "DELEGATE-SHELL" in user:
+            if last["role"] == "tool":
+                if not child_output:
+                    child_output.append(str(last["content"]))
+                    return "bash", {"command": f"axiopera wait {child_task} && axiopera inbox {child_task}"}
+                child_inbox.append(str(last["content"]))
+                return "delegate collected its result"
+            return "bash", {"command": spawn(child_task, "DELEGATE-LEAF")}
+        if NOTICE in user:
+            if last["role"] == "tool":
+                inbox.append(str(last["content"]))
+                return "parent received own result"
+            return "bash", {"command": "axiopera inbox"}
+        if "PARENT-DISPATCH" in user:
+            if last["role"] == "tool":
+                parent_output.append(str(last["content"]))
+                return "parent dispatched"
+            return "bash", {"command": spawn(parent_task, "TUI-LEAF")}
+        previous = [call["function"]["name"] for m in messages for call in m.get("tool_calls", [])]
+        if "subagent" in previous:
+            return "parent finished delegation"
+        tools = {tool["function"]["name"] for tool in request["tools"]}
+        if "subagent" not in tools:
+            return "subagents_enable", {}
+        return "subagent", {"agent": "delegate", "task": "DELEGATE-SHELL", "async": False}
+
+    with f.model(respond):
+        tui = Pty([str(f.pi), "--session-id", session, "--model", MODEL, "--approve"], f.cwd, f.env)
+        try:
+            wait_until(lambda: "pi-subagents" in tui.screen, "community plugin did not load")
+            # Pi can display the editor while extension startup is still in progress.
+            # An Enter rejected during startup has no pending prompt.
+            for attempt in range(4):
+                offset = len(tui.screen)
+                tui.type("PARENT-DELEGATE")
+                time.sleep(.5)
+                if "Startup is still in progress" not in tui.screen[offset:]:
+                    break
+                time.sleep(1)
+            wait_until(lambda: "parent finished delegation" in tui.screen, "native delegate did not return")
+            assert child_output and "in the foreground" in child_output[-1] and "Pi will notify" not in child_output[-1]
+            assert child_inbox and "private child result" in child_inbox[-1]
+            tui.type("PARENT-DISPATCH")
+            wait_until(lambda: "parent dispatched" in tui.screen, "parent did not dispatch after its delegate")
+            assert parent_output and "Pi will notify this session" in parent_output[-1] and "axiopera wait" not in parent_output[-1]
+            release.set()
+            wait_until(lambda: any("public parent result" in row for row in inbox), "original TUI did not take its result")
+            assert all("private child result" not in row for row in inbox)
+            rows = json.loads(f.run([AXIOPERA, "--json", "status", "--all"]).splitlines()[0])["data"]
+            owners = {row["name"]: row["parent"] for row in rows}
+            assert owners[parent_task] == "pi:" + session
+            assert owners[child_task].startswith("pi:") and owners[child_task] != owners[parent_task]
         finally:
             release.set()
             tui.close()
             f.run([AXIOPERA, "daemon", "stop", "--force"])
-    print("Pi TUI: Git install/update/remove, owner filtering, idle wake, busy steer and reload dedup passed")
-
-
-PACKAGES = {"nico": "pi-subagents@0.89.2", "tintin": "@tintinweb/pi-subagents@0.26.2"}
+    print("pi-subagents TUI: native delegate collected its result with foreground wait; parent received its own notification")
 
 
 def subagents(f, name):
@@ -295,6 +471,8 @@ def subagents(f, name):
             release.set()
             f.run([AXIOPERA, "daemon", "stop", "--force"])
     print(f"{package}: distinct child, terminal RPC notification, both managed turns and release passed")
+    if name == "nico":
+        subagent_receipts(f)
 
 
 if __name__ == "__main__":
