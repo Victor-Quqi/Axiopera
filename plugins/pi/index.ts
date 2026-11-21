@@ -26,8 +26,8 @@ export default function (pi: ExtensionAPI) {
 		let lastSeq = 0;
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom_message" && entry.customType === notice) {
-				const details = entry.details as { caller?: string; seq?: number } | undefined;
-				if (details?.caller === caller && typeof details.seq === "number" && Number.isSafeInteger(details.seq)) {
+				const details = entry.details as { caller?: string; home?: string; seq?: number } | undefined;
+				if (details?.caller === caller && details.home === home && typeof details.seq === "number" && Number.isSafeInteger(details.seq)) {
 					lastSeq = Math.max(lastSeq, details.seq);
 				}
 			}
@@ -80,7 +80,7 @@ export default function (pi: ExtensionAPI) {
 				if (seq === lastSeq) return;
 				lastSeq = seq;
 				pi.sendMessage(
-					{ customType: notice, content: "Run axiopera inbox to read your task updates.", display: true, details: { caller, seq } },
+					{ customType: notice, content: "Run axiopera inbox to read your task updates.", display: true, details: { caller, home, seq } },
 					{ deliverAs: "steer", triggerTurn: true },
 				);
 			});

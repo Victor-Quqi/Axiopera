@@ -1297,7 +1297,7 @@ impl Daemon {
             && self.pi_notifications_ready(caller, token).await
         {
             data["reach"] = json!("notify");
-            "Pi will notify this session. You can end your turn and run `axiopera inbox` when notified.".into()
+            "Pi will notify this session even after your turn ends. Run `axiopera inbox` when notified.".into()
         } else {
             data["reach"] = json!("wait");
             "When you need a task update to continue, run `axiopera wait` in the foreground, then `axiopera inbox`.".into()

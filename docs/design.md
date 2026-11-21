@@ -158,7 +158,7 @@ spawned、turn_started、steered、input_read、tool、tool_updated、said、fil
 
 Pi 扩展在独立 TUI 中观察 daemon 的启动记录，再以当前会话运行 `watch --if-running`。每次加载扩展或切换会话时生成一个标记，随 Pi 工具调用和监听连接传给 daemon。`spawn`、`send`、`reply` 的回执按当前调用方和在线监听的标记确定收件方式。首次派发先启动子任务，再等监听登记。监听断开后登记随即失效。
 
-扩展收到新的事件序号时通过 Pi 的 `sendMessage` 投递提醒。序号和会话 ID 随提醒保存在 Pi 会话分支中，重新加载扩展时据此去重。托管 Pi 任务的消息直接通过 RPC 送达。
+扩展收到新的事件序号时通过 Pi 的 `sendMessage` 投递提醒。序号随提醒保存在 Pi 会话分支中，按会话 ID 和 Axiopera 数据目录去重。托管 Pi 任务的消息直接通过 RPC 送达。
 
 ## Codex 推送与门铃
 
