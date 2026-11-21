@@ -102,6 +102,12 @@ enum Command {
     /// By default, print sub-task news until stopped; for a sub-agent, until a minute after its
     /// sub-tasks are done and their news taken. Takes nothing.
     Watch {
+        /// Connect only if the daemon is already running.
+        #[arg(long)]
+        if_running: bool,
+        /// Exit when the host closes its stdin pipe.
+        #[arg(long)]
+        until_stdin_closes: bool,
         /// Show progress until no sub-tasks are running or queued.
         #[arg(long)]
         status: bool,
@@ -412,7 +418,34 @@ async fn run(cli: Cli) -> Result<i32> {
             timeout_ms: timeout.map(|d| d.as_millis() as u64),
         },
         Command::Inbox { tasks } => Request::Inbox { tasks },
-        Command::Watch { status } => Request::Watch { status },
+        Command::Watch {
+            status,
+            if_running,
+            until_stdin_closes,
+        } => {
+            let client = client::Client {
+                home,
+                json: cli.json,
+            };
+            let watch = client.run(
+                caller,
+                Request::Watch {
+                    status,
+                    passive: if_running,
+                },
+                !if_running,
+            );
+            if until_stdin_closes {
+                let (closed, stdin) = tokio::sync::oneshot::channel();
+                // A detached reader lets the process exit even if the daemon disconnects first.
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+                    let _ = closed.send(());
+                });
+                return tokio::select! { result = watch => result, _ = stdin => Ok(ipc::exit::OK) };
+            }
+            return watch.await;
+        }
         Command::Status { task, all } => Request::Status { task, all },
         Command::Log { task, tail } => Request::Log { task, tail },
         Command::Result { task, turn, force } => Request::Result { task, turn, force },
@@ -438,7 +471,7 @@ async fn run(cli: Cli) -> Result<i32> {
         home,
         json: cli.json,
     }
-    .run(caller, request)
+    .run(caller, request, true)
     .await
 }
 
@@ -703,7 +736,14 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["axiopera", "watch", "--status"]).unwrap();
         assert!(cli.caller.is_none());
-        assert!(matches!(cli.command, Command::Watch { status: true }));
+        assert!(matches!(
+            cli.command,
+            Command::Watch {
+                status: true,
+                if_running: false,
+                until_stdin_closes: false
+            }
+        ));
         let cli = Cli::try_parse_from(["axiopera", "spawn", "codex", "a", "b"]).unwrap();
         assert!(matches!(cli.command, Command::Spawn { task, .. } if task == ["a", "b"]));
     }

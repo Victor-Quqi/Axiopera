@@ -27,9 +27,14 @@ pub enum Line {
 impl Client {
     /// Send one request as `caller` (default: the one detected) and print the replies. Returns
     /// the exit code.
-    pub async fn run(&self, caller: Option<String>, request: Request) -> Result<i32> {
+    pub async fn run(
+        &self,
+        caller: Option<String>,
+        request: Request,
+        may_launch: bool,
+    ) -> Result<i32> {
         let caller = caller.unwrap_or_else(detect_caller);
-        let launch = !matches!(request, Request::Stop { .. });
+        let launch = may_launch && !matches!(request, Request::Stop { .. });
         self.request_as(caller, launch, request, |line| match line {
             Line::Out { text, data } if self.json => {
                 // The text carries result bodies that `data` does not repeat.

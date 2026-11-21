@@ -229,11 +229,14 @@ pub async fn run(opts: Options) -> Result<()> {
                     let d = d.clone();
                     d.conns.fetch_add(1, Ordering::SeqCst);
                     tokio::spawn(async move {
-                        if let Err(e) = d.serve(stream, peer).await {
+                        let mut keeps_alive = true;
+                        if let Err(e) = d.serve(stream, peer, &mut keeps_alive).await {
                             d.log(&format!("connection error: {e:#}"));
                         }
-                        d.conns.fetch_sub(1, Ordering::SeqCst);
-                        d.lock().last_active = Instant::now();
+                        if keeps_alive {
+                            d.conns.fetch_sub(1, Ordering::SeqCst);
+                            d.lock().last_active = Instant::now();
+                        }
                     });
                 }
                 Err(e) => {
@@ -600,6 +603,7 @@ impl Daemon {
         self: &Arc<Self>,
         stream: S,
         peer: platform::Peer,
+        keeps_alive: &mut bool,
     ) -> Result<()> {
         let (r, mut w) = tokio::io::split(stream);
         let mut reader = ipc::Reader::new(r);
@@ -609,7 +613,8 @@ impl Daemon {
         let mut out = Out::new(&mut w);
         let compatible = env.protocol == ipc::PROTOCOL && env.version == env!("CARGO_PKG_VERSION");
         // Hooks run in every host session; one from another version must not restart us.
-        if !compatible && matches!(env.request, Request::Pending) {
+        let passive = matches!(env.request, Request::Watch { passive: true, .. });
+        if !compatible && (passive || matches!(env.request, Request::Pending)) {
             out.done(ipc::exit::OK).await?;
             return Ok(());
         }
@@ -648,6 +653,10 @@ impl Daemon {
         // Agents started with it would run outside the sandbox, on a PATH the sandbox chose.
         if peer.restricted() {
             env.env = None;
+        }
+        if passive {
+            self.conns.fetch_sub(1, Ordering::SeqCst);
+            *keeps_alive = false;
         }
         // Clients send nothing after the request, so a read only returns once they are gone.
         // Commands that block indefinitely stop then; the others run to completion.
@@ -829,8 +838,8 @@ impl Daemon {
                 }
                 Ok(ipc::exit::OK)
             }
-            Request::Watch { status: true } => self.watch_status(&caller, out).await,
-            Request::Watch { status: false } => self.watch(&caller, out).await,
+            Request::Watch { status: true, .. } => self.watch_status(&caller, out).await,
+            Request::Watch { status: false, .. } => self.watch(&caller, out).await,
             Request::Status { task, all } => self.status(&caller, task.as_deref(), all, out).await,
             Request::Log { task, tail } => self.log_cmd(&caller, &task, tail, out).await,
             Request::Result { task, turn, force } => {
@@ -1105,6 +1114,8 @@ impl Daemon {
             "Take results and questions with `axiopera inbox` when your watch monitor reports news."
         } else if host.starts_with("agy:") || task_agent == Some(Agent::Agy) {
             "Run `axiopera wait` as a background command. When it finishes, run `axiopera inbox`."
+        } else if host.starts_with("pi:") && identity::task_of(caller).is_none() {
+            "With the Pi TUI extension, run `axiopera inbox` when notified. Otherwise run `axiopera wait` in the foreground, then `axiopera inbox`."
         } else {
             "Take results and questions with `axiopera inbox`; `axiopera wait` blocks until there are some."
         };
@@ -2516,6 +2527,7 @@ impl Daemon {
             (self.events.subscribe(), self.news(&st, caller, &[]))
         };
         let mut due = tokio::time::Instant::now();
+        let mut last_reported = 0;
         let sub_agent = identity::task_of(caller).is_some();
         let mut tick = tokio::time::interval(WATCH_GAP);
         let mut idle_since = None;
@@ -2555,6 +2567,7 @@ impl Daemon {
                 };
                 if let Some(line) = line {
                     out.text(line, serde_json::to_value(&news)?).await?;
+                    last_reported = news.iter().map(|e| e.seq).max().unwrap_or(last_reported);
                     due = tokio::time::Instant::now() + WATCH_GAP;
                 }
                 news.clear();
@@ -2562,8 +2575,14 @@ impl Daemon {
             let wake = tokio::time::sleep_until(due);
             tokio::select! {
                 e = rx.recv() => match e {
-                    Ok(e) if is_news(&e, caller) && self.concerns(&e, caller) => news.push(e),
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(e) if e.seq > last_reported && is_news(&e, caller) && self.concerns(&e, caller) => news.push(e),
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let st = self.lock();
+                        rx = self.events.subscribe();
+                        news = self.news(&st, caller, &[]);
+                        news.retain(|e| e.seq > last_reported);
+                    }
                     Err(broadcast::error::RecvError::Closed) => return Ok(ipc::exit::OK),
                 },
                 _ = wake, if !news.is_empty() => {}

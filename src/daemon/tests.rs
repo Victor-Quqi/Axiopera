@@ -1281,6 +1281,33 @@ async fn watch_merges_news_that_comes_together() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn watch_recovers_unread_news_after_its_receiver_lags() {
+    let f = fixture();
+    let (client, mut server) = tokio::io::duplex(1 << 16);
+    let d = f.d.clone();
+    let watcher =
+        tokio::spawn(async move { d.watch("codex:host", &mut Out::new(&mut server)).await });
+    let mut reader = ipc::Reader::new(client);
+    f.d.emit("test", "question", json!({"id":"q1","text":"First?"}));
+    assert!(matches!(
+        reader.read::<Reply>().await.unwrap(),
+        Some(Reply::Out { .. })
+    ));
+    f.d.emit("test", "question", json!({"id":"q2","text":"Second?"}));
+    // Fill the receiver with unrelated events before the watcher can run again.
+    let mut other = f.d.store.events("test").pop().unwrap();
+    other.kind = "tool".into();
+    for _ in 0..2048 {
+        f.d.events.send(other.clone()).unwrap();
+    }
+    let Some(Reply::Out { text, .. }) = reader.read::<Reply>().await.unwrap() else {
+        panic!("missing reminder after receiver lag");
+    };
+    assert_eq!(text, "test (codex) asks q2: Second?");
+    watcher.abort();
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_sub_agents_watch_ends_a_minute_after_its_work_is_done_and_taken() {
     let f = fixture();
     f.d.update("test", |t| t.parent = "task:boss".into());
