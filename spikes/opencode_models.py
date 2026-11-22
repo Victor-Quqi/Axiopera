@@ -21,7 +21,6 @@ from urllib.request import ProxyHandler, Request, build_opener
 from opencode_managed import cleanup_profile, isolated_profile, send_completion
 from probe import AXIOPERA, Pty
 
-
 def until(check, message):
     deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
@@ -69,6 +68,8 @@ def exercise(root, opencode, axiopera):
     database = Path(env["XDG_DATA_HOME"]) / "opencode/opencode.db"
     requests = queue.Queue()
     failures = []
+    focus_marker = "OPENCODE-FOCUS-SYSTEM-PROBE"
+    primary_id = "build"
 
     def compare(label, actual, expected):
         if actual != expected:
@@ -82,7 +83,8 @@ def exercise(root, opencode, axiopera):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             # Title generation can quote the prompt. Only the agent request carries tools.
             if body.get("tools"):
-                requests.put((body["model"], self.headers.get("x-probe-effort"), body.get("reasoning_effort")))
+                has_focus = any(focus_marker in str(m["content"]) for m in body["messages"] if m["role"] == "system")
+                requests.put((body["model"], self.headers.get("x-probe-effort"), body.get("reasoning_effort"), has_focus))
             send_completion(self, body["model"], {"content": "probe-finished"}, "stop")
 
     def cli(*args, raw=False):
@@ -94,8 +96,9 @@ def exercise(root, opencode, axiopera):
         return result.stdout.strip() if raw else json.loads(result.stdout)["data"]
 
     def wire(label):
-        model, header, body = requests.get(timeout=30)
+        model, header, body, has_focus = requests.get(timeout=30)
         compare(label + " variant header/body", header, body)
+        compare(label + " primary instructions", has_focus, primary_id == "focus")
         return model, body
 
     def saved():
@@ -127,26 +130,26 @@ def exercise(root, opencode, axiopera):
         finally:
             pty.close()
 
-    def check_task(label, *options, tier="full", model=None, effort=None):
+    def check_task(label, *options, model, effort, tier="full"):
         task = cli("spawn", "opencode", "--tier", tier, *options, label)["task"]
         actual = wire(label)
-        if model is not None:
-            compare(label + " requested model", actual[0], model)
-        if effort is not None:
-            compare(label + " requested effort", actual[1], effort)
+        compare(label + " model request", actual, (model, effort))
         cli("wait", task, "--timeout", "40s", raw=True)
         status = cli("status", task)[0]
         model = "fixture/" + actual[0]
         compare(label + " status", (status["status"], status.get("actual_model")), ("idle", model))
         effort = status.get("actual_effort")
-        compare(label + " status effort", None if effort == "default" else effort, actual[1])
+        compare(label + " status effort", effort, actual[1])
         end = next(e for e in cli("log", task) if e["kind"] == "turn_ended")
         compare(label + " turn log", (end["model"], end.get("effort")), (model, effort))
         stamp = "model " + model + (", effort " + effort if effort else "")
-        compare(label + " inbox", stamp in cli("inbox", task, raw=True), True)
+        inbox = cli("inbox", task, raw=True)
+        compare(label + " inbox", stamp in inbox, True)
+        compare(label + " inbox effort", ", effort " in inbox, effort is not None)
         compare(label + " result", "probe-finished" in cli("result", task, "--force", raw=True), True)
         with contextlib.closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
             agent = db.execute("select agent from session_v2 where id = ?", (status["session"],)).fetchone()[0]
+        compare(label + " stored primary agent", agent, primary_id)
         print(label, "wire", actual, "agent", agent, flush=True)
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Provider) as server:
@@ -164,14 +167,16 @@ def exercise(root, opencode, axiopera):
                 if case == "project":
                     project["model"] = "fixture/alpha#high"
                 if case == "primary":
+                    primary_id = "focus"
                     project.update(default_agent="focus", agent={"focus": {"mode": "primary",
-                                   "description": "Fixture agent", "model": "fixture/beta#low"}})
+                                   "description": "Fixture agent", "model": "fixture/beta#low", "prompt": focus_marker}})
                 (cwd / "opencode.json").write_text(json.dumps(project), encoding="utf-8")
                 if case in ("saved", "saved-variant"):
                     tui(pick=expected, cycle=case == "saved-variant")
                 native = tui()
                 compare(case + " fresh TUI", native, expected)
                 rows, api_default, primary = native_catalog(opencode, cwd, env)
+                compare(case + " native primary", primary["id"], primary_id)
                 print(case, "TUI", native, "server default", api_default["id"], "primary", primary["id"], flush=True)
                 catalog = cli("models", "opencode")
                 expected_rows = {row["providerID"] + "/" + row["id"]: [v["id"] for v in row["variants"]] for row in rows}
@@ -182,18 +187,20 @@ def exercise(root, opencode, axiopera):
                     compare("native CLI model IDs", set(native_cli.splitlines()), set(expected_rows))
                 lines = cli("models", "opencode", raw=True).splitlines()
                 model, effort = catalog["native_model"], catalog.get("native_effort")
+                compare(case + " listed default", (model, effort), ("fixture/" + native[0], native[1]))
                 print(case, "Axiopera catalog", (model, effort), flush=True)
                 suffix = ", effort " + effort if effort else ""
                 compare(case + " text default", lines[0], f"Without --model, spawns use {model}{suffix}.")
                 for name, efforts in expected_rows.items():
                     compare(case + " text " + name, any(line.startswith(name + " ") and
                             "effort: " + ", ".join(efforts) in line for line in lines), True)
-                check_task(case)
-                check_task(case + "-read", tier="read")
+                check_task(case, model=native[0], effort=native[1])
+                check_task(case + "-read", tier="read", model=native[0], effort=native[1])
 
-            check_task("effort-only", "--effort", "low", effort="low")
-            check_task("model-only", "--model", "fixture/gamma", model="gamma")
+            check_task("effort-only", "--effort", "low", model="beta", effort="low")
+            check_task("model-only", "--model", "fixture/gamma", model="gamma", effort="high")
             check_task("both", "--model", "fixture/gamma", "--effort", "low", model="gamma", effort="low")
+            check_task("default-variant", "--effort", "default", model="beta", effort=None)
             # Give the configured-model run a separate daemon and immutable settings.
             cli("daemon", "stop", "--force", raw=True)
             configured = root / "configured-axiopera"
@@ -203,8 +210,10 @@ def exercise(root, opencode, axiopera):
             env["AXIOPERA_HOME"] = str(configured)
             catalog = cli("models", "opencode")
             compare("configured JSON model", catalog.get("configured_model"), "fixture/alpha")
-            compare("configured text model", "fixture/alpha" in cli("models", "opencode", raw=True).splitlines()[0], True)
-            check_task("configured", model="alpha")
+            compare("configured JSON effort", catalog.get("configured_effort"), "high")
+            compare("configured text model", cli("models", "opencode", raw=True).splitlines()[0],
+                    "Without --model, spawns use fixture/alpha, effort high (Axiopera config).")
+            check_task("configured", model="alpha", effort="high")
             check_task("override-config", "--model", "fixture/beta", "--effort", "low", model="beta", effort="low")
         finally:
             cli("daemon", "stop", "--force", raw=True)

@@ -352,12 +352,13 @@ async fn drive_agent(
         d.opts.agents.get(task.agent).path.as_deref(),
         &env,
     )?;
-    // AGY can restore the conversation with ACP defaults in a fresh process.
-    let (model, effort) = if task.agent == Agent::Agy && task.session.is_some() {
-        task.running_on()
-    } else {
-        (task.model.as_deref(), task.effort.as_deref())
-    };
+    // AGY restores ACP defaults, and older OpenCode sessions may lack a stored model.
+    let (model, effort) =
+        if matches!(task.agent, Agent::Agy | Agent::Opencode) && task.session.is_some() {
+            task.running_on()
+        } else {
+            (task.model.as_deref(), task.effort.as_deref())
+        };
     let spec = StartSpec {
         task_id: id.to_string(),
         agent: task.agent,

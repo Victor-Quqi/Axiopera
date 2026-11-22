@@ -212,7 +212,9 @@ pub async fn query(
 ) -> Result<Catalog> {
     let args: Vec<String> = match agent {
         Agent::Pi => return super::pi::query(exe, cwd, env, timeout).await,
-        Agent::Opencode => return super::opencode::query(exe, cwd, env, timeout).await,
+        Agent::Opencode => {
+            return super::opencode::query(exe, cwd, env, configured_model, timeout).await;
+        }
         Agent::Codex => vec!["app-server"],
         Agent::Agy => vec!["acp"],
         Agent::Grok => vec!["agent", "--no-leader", "stdio"],

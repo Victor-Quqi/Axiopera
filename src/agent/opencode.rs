@@ -175,22 +175,23 @@ impl Api {
     }
 
     async fn agent(&self, selected: Option<&str>) -> Result<Value> {
-        for attempt in 1..=30 {
-            let agents = self.get("/api/agent").await?;
-            let available = agents.as_array().context("invalid OpenCode agent list")?;
-            // OpenCode puts its configured default primary agent first.
-            if let Some(agent) = available.iter().find(|a| {
+        let agents = self.get("/api/agent").await?;
+        agents
+            .as_array()
+            .context("invalid OpenCode agent list")?
+            .iter()
+            .find(|a| {
                 a["mode"] != "subagent"
                     && a["hidden"] != true
                     && selected.is_none_or(|id| a["id"] == id)
-            }) {
-                return Ok(agent.clone());
-            }
-            if attempt < 30 {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-        anyhow::bail!("no selectable OpenCode primary agent was registered")
+            })
+            .cloned()
+            .context("no selectable OpenCode primary agent was registered")
+    }
+
+    async fn models(&self) -> Result<Vec<Value>> {
+        // The model endpoint waits for location plugins. Only then is the primary agent list complete.
+        serde_json::from_value(self.get("/api/model").await?).context("invalid OpenCode model list")
     }
 
     async fn jobs(&self, session: &str) -> Result<Vec<Value>> {
@@ -258,51 +259,169 @@ fn read_permissions(rules: &Value) -> Result<Value> {
 }
 
 fn model_id(model: &Value) -> Option<String> {
+    qualified_id(model, "id")
+}
+
+fn qualified_id(model: &Value, field: &str) -> Option<String> {
     Some(format!(
         "{}/{}",
         model["providerID"].as_str()?,
-        model["id"].as_str()?
+        model[field].as_str()?
     ))
 }
 
-async fn select_model(api: &Api, current: &Value, spec: &StartSpec) -> Result<Option<Value>> {
-    if spec.model.is_none() && spec.effort.is_none() {
-        return Ok(None);
-    }
-    let native = if current.is_null() {
-        api.get("/api/model/default").await?
-    } else {
-        current.clone()
-    };
-    let id = spec
-        .model
-        .clone()
-        .or_else(|| model_id(&native))
-        .context("no default OpenCode model")?;
-    let catalog = api.get("/api/model").await?;
-    Ok(Some(model_ref(&catalog, &id, spec.effort.as_deref())?))
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct ModelPreferences {
+    recent: Value,
+    variant: Value,
 }
 
-fn model_ref(catalog: &Value, id: &str, effort: Option<&str>) -> Result<Value> {
+fn model_preferences(env: &[(String, String)], cwd: &Path) -> ModelPreferences {
+    let path = |name| {
+        env.iter()
+            .find(|(k, v)| k.eq_ignore_ascii_case(name) && !v.is_empty())
+            .map(|(_, v)| PathBuf::from(v))
+    };
+    let state = path("XDG_STATE_HOME").unwrap_or_else(|| {
+        path(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .unwrap_or_else(super::home_dir)
+            .join(".local/state")
+    });
+    std::fs::File::open(cwd.join(state).join("opencode/model.json"))
+        .ok()
+        .and_then(|f| serde_json::from_reader(std::io::BufReader::new(f)).ok())
+        .unwrap_or_default()
+}
+
+struct ModelPicker {
+    models: Vec<Value>,
+    agent: Value,
+    project: Value,
+    preferences: ModelPreferences,
+}
+
+impl ModelPicker {
+    async fn load(api: &Api, models: Vec<Value>, env: &[(String, String)]) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Entry {
+            #[serde(rename = "type")]
+            kind: String,
+            info: Option<Info>,
+        }
+        #[derive(Deserialize)]
+        struct Info {
+            model: Option<Value>,
+        }
+        let agent = api.agent(None).await?;
+        let config: Vec<Entry> = api
+            .request(Method::GET, "/api/config", None)
+            .await?
+            .json()
+            .await?;
+        let project = config
+            .into_iter()
+            .rev()
+            .filter(|entry| entry.kind == "document")
+            .find_map(|entry| entry.info?.model)
+            .unwrap_or(Value::Null);
+        let preferences = model_preferences(env, Path::new(&api.cwd));
+        Ok(Self {
+            models,
+            agent,
+            project,
+            preferences,
+        })
+    }
+
+    fn select(&self, requested: Option<&str>, effort: Option<&str>) -> Result<Option<Value>> {
+        let agent = &self.agent["model"];
+        let agent_id = model_id(agent);
+        let project_id = self
+            .project
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| qualified_id(&self.project, "model"));
+        let recent = self
+            .preferences
+            .recent
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|item| qualified_id(item, "modelID"));
+        let id = match requested {
+            Some(id) => id.to_string(),
+            None => {
+                let preferred = agent_id
+                    .iter()
+                    .chain(&project_id)
+                    .cloned()
+                    .chain(recent)
+                    .find(|id| model_info(&self.models, id).is_ok());
+                let Some(id) = preferred.or_else(|| {
+                    self.models
+                        .iter()
+                        .find(|m| m["enabled"] != false)
+                        .and_then(model_id)
+                }) else {
+                    return Ok(None);
+                };
+                id
+            }
+        };
+        let info = model_info(&self.models, &id)?;
+        let configured = [
+            (agent_id.as_ref(), agent),
+            (project_id.as_ref(), &self.project),
+        ];
+        let preferred = self
+            .preferences
+            .variant
+            .get(&id)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .or_else(|| {
+                configured
+                    .iter()
+                    .filter(|(model, _)| *model == Some(&id))
+                    .find_map(|(_, selection)| selection["variant"].as_str())
+            });
+        let supported = variant(preferred).filter(|v| has_variant(info, v));
+        Ok(Some(model_ref(info, effort.or(supported))?))
+    }
+}
+
+fn model_info<'a>(catalog: &'a [Value], id: &str) -> Result<&'a Value> {
     let (provider, model) = id
         .split_once('/')
         .filter(|(provider, model)| !provider.is_empty() && !model.is_empty())
         .context("invalid model ID: expected OpenCode provider/model")?;
     let info = catalog
-        .as_array()
-        .and_then(|a| {
-            a.iter()
-                .find(|m| m["providerID"] == provider && m["id"] == model)
-        })
+        .iter()
+        .find(|m| m["providerID"] == provider && m["id"] == model)
         .with_context(|| format!("unknown model {id} in OpenCode"))?;
     ensure!(info["enabled"] != false, "OpenCode model is disabled");
-    let mut selected = json!({"id":model,"providerID":provider});
-    if let Some(variant) = effort {
+    Ok(info)
+}
+
+fn has_variant(info: &Value, variant: &str) -> bool {
+    info["variants"]
+        .as_array()
+        .is_some_and(|v| v.iter().any(|x| x["id"] == variant))
+}
+
+// OpenCode uses "default" in session snapshots to mean no variant overlay.
+fn variant(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| *v != "default")
+}
+
+fn model_ref(info: &Value, effort: Option<&str>) -> Result<Value> {
+    let mut selected = json!({"id":info["id"],"providerID":info["providerID"]});
+    if let Some(variant) = variant(effort) {
         ensure!(
-            info["variants"]
-                .as_array()
-                .is_some_and(|v| v.iter().any(|x| x["id"] == variant)),
-            "unknown variant {variant} for model {id}"
+            has_variant(info, variant),
+            "unknown variant {variant} for model {}",
+            model_id(info).unwrap_or_default()
         );
         selected["variant"] = json!(variant);
     }
@@ -359,6 +478,7 @@ impl OpenCode {
             .join("tasks")
             .join(&spec.task_id)
             .join("opencode-seq");
+        let models = api.models().await?;
         let data = if let Some(id) = &spec.resume {
             let endpoint = format!("/api/session/{}", valid_id(id)?);
             let raw = tokio::fs::read(&checkpoint)
@@ -395,6 +515,13 @@ impl OpenCode {
             } else {
                 json!([])
             };
+            // Older sessions left the model unset. Preserve the model used by their last turn.
+            let legacy_model = spec
+                .model
+                .as_deref()
+                .filter(|_| info["model"].is_null())
+                .map(|id| model_ref(model_info(&models, id)?, spec.effort.as_deref()))
+                .transpose()?;
             if spec.tier == Tier::Read && info["permissions"] != permissions {
                 ensure!(
                     api.jobs(id).await?.is_empty(),
@@ -408,9 +535,21 @@ impl OpenCode {
                 Some(json!({"permissions":permissions})),
             )
             .await?;
+            if let Some(model) = legacy_model {
+                api.request(
+                    Method::POST,
+                    &format!("{endpoint}/model"),
+                    Some(json!({"model":model})),
+                )
+                .await?;
+            }
             info
         } else {
-            let agent = api.agent(None).await?;
+            let picker = ModelPicker::load(&api, models, &spec.env).await?;
+            let model = picker
+                .select(spec.model.as_deref(), spec.effort.as_deref())?
+                .context("no default OpenCode model")?;
+            let agent = &picker.agent;
             let permissions = if spec.tier == Tier::Read {
                 read_permissions(&agent["permissions"])?
             } else {
@@ -419,6 +558,7 @@ impl OpenCode {
             let body = json!({
                 "location": {"directory": spec.cwd},
                 "agent": agent["id"],
+                "model": model,
                 "permissions": permissions,
             });
             let response: Value = api
@@ -430,14 +570,6 @@ impl OpenCode {
         };
         let session =
             valid_id(data["id"].as_str().context("missing OpenCode session ID")?)?.to_owned();
-        if let Some(model) = select_model(&api, &data["model"], spec).await? {
-            api.request(
-                Method::POST,
-                &format!("/api/session/{session}/model"),
-                Some(json!({"model":model})),
-            )
-            .await?;
-        }
         let mut cmd = vec![
             std::env::current_exe()?.to_string_lossy().into_owned(),
             "mcp".into(),
@@ -849,7 +981,7 @@ fn project(s: &mut State, events: &Events, event: &Value) {
             let model = &data["model"];
             emit(AgentEvent::Model {
                 model: model_id(model),
-                effort: Some(model["variant"].as_str().map(str::to_owned)),
+                effort: Some(variant(model["variant"].as_str()).map(str::to_owned)),
             });
             events.progress();
         }
@@ -964,17 +1096,27 @@ pub(super) async fn query(
     exe: &Path,
     cwd: &Path,
     env: &[(String, String)],
+    configured_model: Option<&str>,
     timeout: Duration,
 ) -> Result<Catalog> {
     tokio::time::timeout(timeout, async {
         let (mut proc, api) = Api::start(exe, cwd, env).await?;
         let result = async {
-            let (models, default) =
-                tokio::try_join!(api.get("/api/model"), api.get("/api/model/default"))?;
-            let native_model = model_id(&default);
-            let models = models
-                .as_array()
-                .context("invalid OpenCode model list")?
+            let models = api.models().await?;
+            if models.is_empty() {
+                return Ok(Catalog::default());
+            }
+            let (picker, default) = tokio::try_join!(
+                ModelPicker::load(&api, models, env),
+                api.request(Method::GET, "/api/model/default", None)
+            )?;
+            let default: Value = default.json().await?;
+            let native = picker.select(None, None)?.unwrap_or(Value::Null);
+            let configured_effort = configured_model
+                .and_then(|id| picker.select(Some(id), None).ok().flatten())
+                .and_then(|selected| selected["variant"].as_str().map(str::to_owned));
+            let models = picker
+                .models
                 .iter()
                 .map(|m| {
                     Ok(Model {
@@ -993,9 +1135,10 @@ pub(super) async fn query(
                 .collect::<Result<_>>()?;
             Ok(Catalog {
                 models,
-                default_model: native_model.clone(),
-                native_model,
-                native_effort: default["variant"].as_str().map(str::to_owned),
+                default_model: model_id(&default["data"]),
+                native_model: model_id(&native),
+                native_effort: native["variant"].as_str().map(str::to_owned),
+                configured_effort,
                 ..Default::default()
             })
         }
@@ -1015,27 +1158,53 @@ mod tests {
 
     #[test]
     fn model_errors_identify_the_rejected_selection() {
-        let catalog = json!([{"providerID":"team","id":"nested/name","variants":[{"id":"high"}]}]);
+        let catalog = [json!({"providerID":"team","id":"nested/name","variants":[{"id":"high"}]})];
         assert_eq!(
-            model_ref(&catalog, "bad", None).unwrap_err().to_string(),
+            model_info(&catalog, "bad").unwrap_err().to_string(),
             "invalid model ID: expected OpenCode provider/model"
         );
         assert_eq!(
-            model_ref(&catalog, "team/other", None)
-                .unwrap_err()
-                .to_string(),
+            model_info(&catalog, "team/other").unwrap_err().to_string(),
             "unknown model team/other in OpenCode"
         );
         assert_eq!(
-            model_ref(&catalog, "team/nested/name", Some("low"))
-                .unwrap_err()
-                .to_string(),
+            model_ref(&catalog[0], Some("low")).unwrap_err().to_string(),
             "unknown variant low for model team/nested/name"
         );
         assert_eq!(
-            model_ref(&catalog, "team/nested/name", Some("high")).unwrap(),
+            model_ref(
+                model_info(&catalog, "team/nested/name").unwrap(),
+                Some("high")
+            )
+            .unwrap(),
             json!({"providerID":"team","id":"nested/name","variant":"high"})
         );
+    }
+
+    #[test]
+    fn stale_preferences_and_remembered_default_follow_the_native_picker() {
+        let model = json!({"providerID":"team","id":"base","variants":[{"id":"high"}]});
+        let mut picker = ModelPicker {
+            models: vec![model.clone()],
+            agent: json!({"model":{"providerID":"team","id":"retired"}}),
+            project: Value::Null,
+            preferences: serde_json::from_value(json!({
+                "recent":[{"providerID":"team","modelID":"retired"},{"providerID":"team","modelID":"base"}],
+                "variant":{"team/base":"high"}
+            })).unwrap(),
+        };
+        let choose = |picker: &ModelPicker| picker.select(None, None).unwrap().unwrap();
+        assert_eq!(
+            choose(&picker),
+            json!({"providerID":"team","id":"base","variant":"high"})
+        );
+        picker.agent = json!({"model":{"providerID":"team","id":"base","variant":"high"}});
+        for stale in ["default", "retired"] {
+            picker.preferences.variant["team/base"] = json!(stale);
+            assert_eq!(choose(&picker), json!({"providerID":"team","id":"base"}));
+        }
+        picker.models.clear();
+        assert!(picker.select(None, None).unwrap().is_none());
     }
 
     #[test]
