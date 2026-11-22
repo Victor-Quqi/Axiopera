@@ -51,7 +51,7 @@ def cli_models(f):
     return {"/".join(line.split()[:2]) for line in rows[1:] if line.strip()}
 
 
-def dynamic_models(f, url, catalog, task):
+def dynamic_models(f, url, catalog, task, cli, seen):
     ready = f.root / "catalog-ready"
     f.env.pop("PI_OFFLINE")
     f.env.update(PI_SKIP_VERSION_CHECK="1", HTTPS_PROXY="http://127.0.0.1:1", HTTP_PROXY="http://127.0.0.1:1",
@@ -62,14 +62,16 @@ def dynamic_models(f, url, catalog, task):
 import { existsSync } from "node:fs";
 const model = (id, reasoning) => ({
   id, name: id, reasoning, input: ["text"], contextWindow: 10000, maxTokens: 200,
+  compat: { supportsReasoningEffort: true },
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 });
 export default (pi) => {
-  for (const [provider, models] of [["dynamic", [model("seed", false)]], ["unseeded", []]]) {
+  for (const [provider, models] of [["dynamic", [model("seed", false)]], ["unseeded", []], ["broken", []]]) {
     pi.registerProvider(provider, {
       api: "openai-completions", apiKey: "fixture", baseUrl: process.env.FIXTURE_BASE_URL, models,
       async refreshModels({ allowNetwork, signal }) {
         if (!allowNetwork) return models;
+        if (provider === "broken") throw new Error("probe provider offline");
         while (!signal.aborted && !existsSync(process.env.FIXTURE_CATALOG_READY)) {
           await new Promise(resolve => setTimeout(resolve, 50));
         }
@@ -82,7 +84,6 @@ export default (pi) => {
     target = "dynamic/discovered"
     initial = cli_models(f)
     assert "dynamic/seed" in initial and not {target, "unseeded/discovered"}.intersection(initial)
-    assert {r["id"] for r in catalog()["models"]} == initial
     with native(f) as rpc:
         def ids():
             return {r["provider"] + "/" + r["id"] for r in rpc("get_available_models")["models"]}
@@ -92,10 +93,42 @@ export default (pi) => {
         wait_until(lambda: {target, "unseeded/discovered"} <= ids(), "Pi did not publish the refreshed catalog")
         rpc("set_model", provider="dynamic", modelId="discovered")
         assert "high" in rpc("get_available_thinking_levels")["levels"]
+    def after_discovery(operation):
+        ready.unlink()
+        timer = threading.Timer(2, ready.touch)
+        timer.start()
+        try:
+            return operation()
+        finally:
+            timer.join()
+
+    listed = after_discovery(catalog)
+    for full in (target, "unseeded/discovered"):
+        assert "high" in next(r for r in listed["models"] if r["id"] == full)["efforts"]
+        after_discovery(lambda: task(full.split("/")[0], ["--model", full], full, "medium", "medium"))
+    task("dynamic-suffix", ["--model", "unseeded/discovered:high"], "unseeded/discovered", "high", "high")
+    failed_task(f, ["--model", "dynamic/missing"], "Pi model not found")
+    # The saved default itself can be discovered after the native RPC session is created.
+    settings = f.agent / "settings.json"
+    data = {"defaultProvider": "unseeded", "defaultModel": "discovered", "defaultThinkingLevel": "high"}
+    settings.write_text(json.dumps(data), encoding="utf-8")
+    assert catalog()["native_model"] == "unseeded/discovered"
+    task_id = task("saved-dynamic", [], "unseeded/discovered", "high", "high")
+    session = json.loads(cli("--json", "status", task_id))["data"][0]["session"]
+    cli("daemon", "stop", "--force")
+    data.update(defaultProvider="fixture", defaultModel="plain", defaultThinkingLevel="low")
+    settings.write_text(json.dumps(data), encoding="utf-8")
+    cli("send", task_id, "resume-dynamic")
+    cli("wait", task_id, "--timeout", "30s")
+    status = json.loads(cli("--json", "status", task_id))["data"][0]
+    assert (status["session"], status["actual_model"], status["actual_effort"]) == (session, "unseeded/discovered", "high"), status
+    assert seen[-1] == ("discovered", "high")
+    with native(f, "--model", "fixture/custom") as rpc:
+        effort = rpc("get_state")["thinkingLevel"]
+    task("unlisted-static", ["--model", "fixture/custom"], "fixture/custom", effort,
+         None if effort == "off" else effort)
     ready.unlink()
-    # A new Pi process can forward an unlisted model ID from a known provider.
-    task("dynamic", ["--model", target], target, "off", None)
-    failed_task(f, ["--model", "unseeded/discovered"], "Pi exited before its RPC response")
+    failed_task(f, ["--model", "unseeded/discovered"], "discovery timed out")
 
 
 def failed_task(f, options, error):
@@ -121,14 +154,10 @@ def empty_catalog(f):
         listing = json.loads(f.run([AXIOPERA, "--json", "models", "pi"]))
         data = listing["data"]
         assert data["models"] == []
-        if data.get("native_model") == "unknown/unknown":
-            # 0.5.0 displays Pi's placeholder as the default model in an empty profile.
-            assert data["native_effort"] == "off"
-            assert listing["text"].splitlines()[0] == "Without --model, spawns use unknown/unknown, effort off."
-        else:
-            assert not data.get("native_model") and not data.get("native_effort")
+        assert not data.get("native_model") and not data.get("native_effort")
+        assert listing["text"] == "No models returned."
         print("empty catalog:", listing["text"].replace("\n", " | "), flush=True)
-        failed_task(f, [], "No API key")
+        failed_task(f, [], "No models available")
     finally:
         f.run([AXIOPERA, "daemon", "stop", "--force"])
 
@@ -179,6 +208,7 @@ def exercise(f):
         assert f"model {full_model}, effort {effort}" in cli("inbox", task_id), name
         assert "probe-finished" in cli("result", task_id, "--force"), name
         print(name, full_model, effort, wire_effort, flush=True)
+        return task_id
 
     with f.model(respond, models) as url:
         try:
@@ -230,13 +260,16 @@ def exercise(f):
             cli("daemon", "stop")
             configure("fixture/draft")
             assert catalog()["configured_model"] == "fixture/draft"
-            assert cli("models", "pi").startswith("Without --model, spawns use fixture/draft (Axiopera config).")
+            assert cli("models", "pi").startswith("Without --model, spawns use fixture/draft, effort medium (Axiopera config).")
             task("configured", [], "fixture/draft", "medium", "medium")
             task("override-config", ["--model", "fixture/research", "--effort", "low"], "fixture/research", "low", "low")
             cli("daemon", "stop")
+            configure("absent/deleted")
+            assert catalog()["models"] and not catalog().get("configured_effort")
+            cli("daemon", "stop")
             configure()
-            dynamic_models(f, url, catalog, task)
-            assert seen[-1] == ("discovered", None) and seen.count(("discovered", None)) == 1
+            dynamic_models(f, url, catalog, task, cli, seen)
+            assert seen.count(("discovered", "medium")) == 2
         finally:
             cli("daemon", "stop", "--force")
 

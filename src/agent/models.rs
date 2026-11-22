@@ -211,7 +211,7 @@ pub async fn query(
     timeout: Duration,
 ) -> Result<Catalog> {
     let args: Vec<String> = match agent {
-        Agent::Pi => return super::pi::query(exe, cwd, env, timeout).await,
+        Agent::Pi => return super::pi::query(exe, cwd, env, configured_model, timeout).await,
         Agent::Opencode => {
             return super::opencode::query(exe, cwd, env, configured_model, timeout).await;
         }

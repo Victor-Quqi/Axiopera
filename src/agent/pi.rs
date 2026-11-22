@@ -1,7 +1,8 @@
 //! Pi's JSONL RPC. Each native process owns a single writable session.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -46,6 +47,9 @@ impl Client {
 
 #[derive(Default)]
 struct State {
+    catalog_status: Option<String>,
+    configured_effort: Option<String>,
+    ready: bool,
     active: bool,
     inputs: Inputs,
     result: String,
@@ -60,6 +64,29 @@ pub struct Pi {
     client: Client,
     state: Arc<Mutex<State>>,
     events: Events,
+    _extension: CatalogExtension,
+}
+
+struct CatalogExtension(PathBuf);
+
+impl CatalogExtension {
+    fn create() -> Result<Self> {
+        let path = std::env::temp_dir().join(format!("axiopera-pi-{}.ts", uuid::Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&path)?;
+        let ext = Self(path);
+        file.write_all(include_bytes!("pi-catalog.ts"))?;
+        Ok(ext)
+    }
+}
+
+impl Drop for CatalogExtension {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 impl Pi {
@@ -77,15 +104,19 @@ impl Pi {
             // Pi may not have flushed a JSONL file if the first request was cancelled.
             args.extend(["--session-id".into(), id.clone()]);
         }
-        if let Some(model) = &spec.model {
-            args.extend(["--model".into(), model.clone()]);
-        }
         if let Some(effort) = &spec.effort {
             args.extend(["--thinking".into(), effort.clone()]);
         }
-        let (proc, stdout) = spawn(exe, &args, &spec.cwd, &spec.env, spec.trace.as_deref())?;
-        let pi = Self::read(proc, stdout, events);
-        let state = pi.client.call(json!({"type":"get_state"})).await?;
+        let (pi, state) = Self::launch(
+            exe,
+            &args,
+            &spec.cwd,
+            &spec.env,
+            spec.trace.as_deref(),
+            events,
+            json!({"model":spec.model, "effort":spec.effort, "resume":spec.resume.is_some()}),
+        )
+        .await?;
         let id = state["sessionId"]
             .as_str()
             .context("Pi returned no session ID")?;
@@ -107,6 +138,10 @@ impl Pi {
             file: Some(file.into()),
         });
         let model = model_id(&state["model"]);
+        ensure!(
+            model.is_some(),
+            "No models available in Pi; configure a provider with a model and credentials"
+        );
         super::report_settings(
             &pi.events,
             model.as_deref(),
@@ -115,7 +150,59 @@ impl Pi {
         Ok(pi)
     }
 
-    fn read(proc: Proc, stdout: ChildStdout, events: Events) -> Self {
+    async fn launch(
+        exe: &Path,
+        args: &[String],
+        cwd: &Path,
+        env: &[(String, String)],
+        trace: Option<&Path>,
+        events: Events,
+        mut options: Value,
+    ) -> Result<(Self, Value)> {
+        loop {
+            let extension = CatalogExtension::create()?;
+            let mut args = args.to_vec();
+            args.extend([
+                "--extension".into(),
+                extension.0.to_string_lossy().into_owned(),
+                "--axiopera-catalog".into(),
+                options.to_string(),
+            ]);
+            if options["retry"] != true
+                && let Some(model) = options["model"].as_str()
+            {
+                args.extend(["--model".into(), model.into()]);
+            }
+            let (proc, stdout) = spawn(exe, &args, cwd, env, trace)?;
+            let pi = Self::read(proc, stdout, events.clone(), extension);
+            let state = match pi.client.call(json!({"type":"get_state"})).await {
+                Ok(state) => state,
+                Err(error) => {
+                    // An unseeded provider has no CLI model until RPC starts discovery.
+                    if options["retry"] != true
+                        && options["model"].as_str().is_some_and(|m| m.contains('/'))
+                        && error.downcast_ref::<oneshot::error::RecvError>().is_some()
+                    {
+                        options["retry"] = json!(true);
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let status = pi
+                .state
+                .lock()
+                .unwrap()
+                .catalog_status
+                .take()
+                .context("Pi did not load the Axiopera model extension")?;
+            ensure!(status == "ready", "{status}");
+            pi.state.lock().unwrap().ready = true;
+            return Ok((pi, state));
+        }
+    }
+
+    fn read(proc: Proc, stdout: ChildStdout, events: Events, extension: CatalogExtension) -> Self {
         let state = Arc::<Mutex<State>>::default();
         let client = Client {
             writer: proc.stdin.clone(),
@@ -133,6 +220,7 @@ impl Pi {
             client,
             state,
             events,
+            _extension: extension,
         }
     }
 
@@ -251,6 +339,14 @@ async fn reader(
         writer.trace.line("recv", &line);
         if m["type"] == "extension_ui_request" {
             match m["method"].as_str() {
+                Some("setStatus") if m["statusKey"] == "axiopera-catalog" => {
+                    state.lock().unwrap().catalog_status =
+                        super::nonempty(m["statusText"].as_str());
+                }
+                Some("setStatus") if m["statusKey"] == "axiopera-configured-effort" => {
+                    state.lock().unwrap().configured_effort =
+                        super::nonempty(m["statusText"].as_str());
+                }
                 Some("select" | "confirm" | "input" | "editor") => {
                     let _ = events.send(AgentEvent::Blocked(format!(
                         "Pi extension requested interactive input: {}",
@@ -274,8 +370,11 @@ async fn reader(
         }
     }
     pending.lock().unwrap().clear();
-    state.lock().unwrap().active = false;
-    let _ = events.send(AgentEvent::Exited("Pi exited".into()));
+    let mut state = state.lock().unwrap();
+    state.active = false;
+    if state.ready {
+        let _ = events.send(AgentEvent::Exited("Pi exited".into()));
+    }
 }
 
 impl State {
@@ -454,6 +553,12 @@ impl State {
 }
 
 fn model_id(model: &Value) -> Option<String> {
+    if ["api", "provider", "id"]
+        .iter()
+        .all(|key| model[key] == "unknown")
+    {
+        return None;
+    }
     Some(format!(
         "{}/{}",
         model["provider"].as_str()?,
@@ -480,14 +585,22 @@ pub(super) async fn query(
     exe: &Path,
     cwd: &Path,
     env: &[(String, String)],
+    configured_model: Option<&str>,
     timeout: Duration,
 ) -> Result<Catalog> {
     let args = ["--mode", "rpc", "--no-session"].map(str::to_owned);
-    let (proc, stdout) = spawn(exe, &args, cwd, env, None)?;
     let (events, _rx) = Events::channel();
-    let mut pi = Pi::read(proc, stdout, events);
-    let result = tokio::time::timeout(timeout, async {
-        let state = pi.client.call(json!({"type":"get_state"})).await?;
+    tokio::time::timeout(timeout, async {
+        let (pi, state) = Pi::launch(
+            exe,
+            &args,
+            cwd,
+            env,
+            None,
+            events,
+            json!({"catalog":true,"configured":configured_model}),
+        )
+        .await?;
         let available = pi
             .client
             .call(json!({"type":"get_available_models"}))
@@ -507,17 +620,21 @@ pub(super) async fn query(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let native_model = model_id(&state["model"]);
+        let native_effort = native_model
+            .as_ref()
+            .and_then(|_| super::nonempty(state["thinkingLevel"].as_str()));
+        let configured_effort = pi.state.lock().unwrap().configured_effort.take();
         Ok(Catalog {
             models,
-            native_model: model_id(&state["model"]),
-            native_effort: super::nonempty(state["thinkingLevel"].as_str()),
+            native_model,
+            native_effort,
+            configured_effort,
             ..Default::default()
         })
     })
-    .await;
-    pi.proc.job.kill();
-    let _ = pi.proc.child.wait().await;
-    result.context("Pi model query timed out")?
+    .await
+    .context("Pi model query timed out")?
 }
 
 #[cfg(test)]
