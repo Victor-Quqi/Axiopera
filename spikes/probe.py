@@ -79,12 +79,14 @@ def workdir(name):
 
 def remove_tree(path):
     """Delete a tree, including read-only files such as git objects on Windows."""
-    def writable(func, p, _exc):
+    def writable(func, p, exc):
+        if not isinstance(exc, PermissionError):
+            raise exc
         os.chmod(p, stat.S_IWRITE)
         func(p)
 
     if Path(path).exists():
-        shutil.rmtree(path, onexc=writable)
+        shutil.rmtree(path, onexc=writable if os.name == "nt" else None)
 
 
 def forget_sessions(cwd):
