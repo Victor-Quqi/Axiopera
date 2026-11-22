@@ -17,7 +17,7 @@
 
 OpenCode 从 full 降为 read 前须等原生后台任务结束。适配器给已有原生子会话关闭工具权限，并对主会话应用 read 规则。
 
-OpenCode 2.3.2 加载自定义主 agent 期间，Axiopera 0.5.0 的 read 和 full 都可能先选中内置 `build`。此时项目给默认主 agent 写的专属提示词也会缺失。[原生会话与模型请求对照](verification.md#opencode)
+OpenCode read 和 full 均在项目插件就绪后选取默认主 agent，保留其专属提示词。read 的工具限制应用到选中的 agent。[原生会话与模型请求对照](verification.md#opencode)
 
 AGY 1.5.11 的 ACP 默认权限模式会为用户在 `permissions.deny` 中明确禁止的命令请求审批。Axiopera 转发这类请求时，应选择拒绝。AGY 续接时保留建会话时的工具列表，进出 read 档都要新建任务。
 
@@ -84,7 +84,9 @@ AGY 在任务进程内创建或恢复 ACP 会话，注册任务专用 stdio MCP�
 
 ## 模型查询
 
-Pi 通过 `get_available_models` 读取启动时的模型目录，从模型元数据推导思考档位，通过 `get_state` 读取新会话的默认值。OpenCode v2 查询私有服务的模型目录和默认模型，推理强度使用模型列出的 variant 名称。OpenCode TUI 会在建会话时应用主 agent 的模型、项目或终端中保存的 variant，私有服务的默认模型接口只返回目录条目。两者的模型 ID 都使用 `provider/model`。[默认值的实测对照](verification.md#pi-与-opencode-的模型和任务显示)
+Pi 和 OpenCode 的模型 ID 都使用 `provider/model`。Pi 从 RPC 读取模型和思考档位，在托管进程中等待支持动态发现的 provider 刷新目录，最终选择取自 `get_state`。
+
+OpenCode 在项目插件就绪后读取目录。新会话依次考虑主 agent 指定的模型、项目模型、TUI 最近使用的模型和目录中的可用模型。所选模型的 variant 优先取 TUI 为它保存的值，再取主 agent 或项目为该模型指定的值。显式 `--effort` 优先，`--effort default` 可清除本次派发的 variant。OpenCode 在建会话时保存模型与 variant，续接使用该会话的选择。[默认值的实测对照](verification.md#pi-与-opencode-的模型和任务显示)
 
 AGY 1.5.11 的 `agy acp` 新会话和交互终端可能使用不同的默认模型与强度。新任务只取终端设置 `~/.gemini/antigravity-cli/settings.json` 的 `model` 字段，在当前 ACP 返回的 `availableModels` 中匹配标签或 ID，通过 `session/set_model` 选中包含强度的组合。终端偏好缺失、匹配不到唯一选项或被 ACP 拒绝时，派发和查询均沿用 ACP 默认值，显式指定的模型和强度仍按请求设置。`axiopera models agy` 先记录默认值，再在同一个临时会话中逐个选择模型，读取各自的 `thought_level` 菜单。查询结束后关闭会话，全程不发送提示词。AGY 跨进程续接时可能恢复成 ACP 的默认值，适配器会重新应用任务记录中上次实际使用的模型和强度。
 

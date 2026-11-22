@@ -86,7 +86,7 @@ model = "haiku"
 
 AGY 新任务默认沿用终端 `/model` 保存的模型和强度。`--model` 或 `[agents.agy].model` 选中同一模型时保留终端强度，选中其他模型时使用该模型自己的默认强度。`--effort` 始终优先。续接已有任务沿用任务自身的选择。
 
-`axiopera models <agent>` 列出模型 ID 和支持的推理强度。`--cwd` 指定工作目录，默认当前目录。首行优先显示 Axiopera 配置的模型，否则显示新启动的后端报告的默认值。OpenCode 用户要让派发沿用 TUI 中的模型和强度，可在 `spawn` 时同时指定 `--model` 和 `--effort`。Pi 新任务使用保存的偏好，打开的 TUI 中临时切换模型或强度只影响该会话。两家实际选用的模型和强度见 `status` 和 `inbox`。[默认值的实测对照](verification.md#pi-与-opencode-的模型和任务显示)
+`axiopera models <agent>` 列出模型 ID 和支持的推理强度。`--cwd` 指定工作目录，默认当前目录。首行显示派发默认值，优先取 Axiopera 配置的模型。OpenCode 新任务按当前项目和 TUI 保存的偏好选择模型和强度。Pi 新任务沿用保存的设置，打开的 TUI 中临时切换只影响该会话。两家实际选用的模型和强度见 `status` 和 `inbox`。[模型选择顺序](backends.md#模型查询)
 
 别名有解析结果时显示为 `别名 → 具体模型 ID`，重复名称省略，说明保留在 `--json`。列表中的 `account default` 是 Claude 的账户默认入口，`backend default` 是后端目录的默认模型。Grok 的默认模型可能在查询后变化，任务实际所用以 `status` 和每轮结果为准。
 

@@ -101,40 +101,36 @@ Windows 11 上的原生 CLI 与 Axiopera 任务验证结果如下。
 
 ## Pi 与 OpenCode 的模型和任务显示
 
-Windows 11 上，用 Axiopera 0.5.0、Pi 1.6.0 和 OpenCode 2.3.2 在同一临时项目分别启动原生 TUI 和 Axiopera 任务。模型服务在本机记录每次请求的模型 ID 和推理强度，再与 `axiopera models`、`status` 和 `inbox` 对照。以下无参数派发指省略模型和强度。权限档位另测：Pi 和 OpenCode 在省略 `--tier` 或指定 `work` 时都返回退出码 1，提示各自支持的档位，四次均未创建任务。
+模型探针在隔离的用户目录和项目中启动原生 TUI 和 Axiopera 任务，用本机 HTTP 服务记录模型 ID、推理强度，再与 `models`、`status`、`log` 和 `inbox` 对照。Pi 和 OpenCode 均需显式指定支持的权限档位。省略 `--tier` 和指定 `work` 的四次派发均在创建任务前返回错误。
 
 ### Pi
 
-`python spikes/pi_models.py <pi>` 把 `models pi` 的文本、JSON 和原生 RPC 逐模型对照。三种模型覆盖常规强度菜单、自定义菜单和无推理模型。无推理模型只列 `off`，实际请求省略推理参数。自定义菜单中的 `max` 按 provider 映射发送为 `maximum`。查询模型列表没有发出推理请求。
+`python spikes/pi_models.py <pi>` 逐项对照 Pi 1.6.0 原生目录和强度菜单，覆盖普通、自定义和无推理模型。自定义模型的 `max` 档在请求中映射为 `maximum`；无推理模型只列 `off`，请求中省略推理参数。目录查询不发送推理请求。
 
-保存的默认模型为 `research`、全局强度为 `medium`、该模型单设 `high` 时，新 TUI 和无参数派发都使用 `research/high`。在仍然打开的 TUI 中用 `/model` 和 `/thinking` 切到 `draft/low` 后，该会话实际使用 `draft/low`，新派发仍用 `research/high`。只传 `--model fixture/draft` 或在 Axiopera 配置中指定该模型时，新任务使用 `draft/medium`。后一种情况下 `models pi` 首行只报配置的模型，省略实际生效的 `medium`。只传 `--effort` 和同时传两项时，任务也按指定值运行。[Pi 新会话选择](https://github.com/earendil-works/pi/blob/faac585884ae2c013a6b1400f3e9e77f10b34bac/packages/coding-agent/src/core/sdk.ts#L219-L277)、[TUI 切换模型和强度](https://github.com/earendil-works/pi/blob/faac585884ae2c013a6b1400f3e9e77f10b34bac/packages/coding-agent/src/modes/interactive/interactive-mode.ts#L5386-L5450)
+默认模型为 `research`、全局强度为 `medium`，该模型单设 `high` 时，新 TUI 和无覆盖派发均使用 `research/high`。在已打开的 TUI 切到 `draft/low` 后，新任务仍用 `research/high`。只传 `--model fixture/draft` 或在 Axiopera 配置中指定该模型，实际请求使用 `draft/medium`。[Pi 新会话选择](https://github.com/earendil-works/pi/blob/faac585884ae2c013a6b1400f3e9e77f10b34bac/packages/coding-agent/src/core/sdk.ts#L219-L277)
 
-新建无凭据的 Pi 环境中，原生 `--list-models` 报告目录为空。`models pi` 同样返回空目录，但首行把 `get_state` 的占位值 `unknown/unknown, effort off` 写成了派发默认值。实际派发因缺少凭据失败。[Pi 初始状态](https://github.com/earendil-works/pi/blob/faac585884ae2c013a6b1400f3e9e77f10b34bac/packages/agent/src/agent.ts#L58-L68)
-
-使用异步发现模型的 provider 扩展时，原生 `pi --list-models`、刚启动的 RPC 和 `models pi` 都只列出扩展的初始模型。刷新完成后同一 RPC 能选中新发现的模型，可用强度含 `high`。在刷新完成前显式派发该模型，实际请求用了正确的模型 ID，但 Pi 沿用了初始模型的能力，只能用 `off`。另一个 provider 完全依靠异步发现，没有初始模型；对它做同样的派发，任务启动失败，模型服务收到零次请求。[Pi 后台刷新](https://github.com/earendil-works/pi/blob/faac585884ae2c013a6b1400f3e9e77f10b34bac/packages/coding-agent/src/main.ts#L1020-L1032)、[Pi 对未列出模型的处理](https://github.com/earendil-works/pi/blob/faac585884ae2c013a6b1400f3e9e77f10b34bac/packages/coding-agent/src/core/model-resolver.ts#L301-L312)
+Windows 和 WSL2 Ubuntu 上均用两个延迟发现模型的 provider 复测，Linux 覆盖官方二进制和 npm 安装。一个 provider 预置无推理能力的模型，另一个初始目录为空。刷新后两者都能列出 `discovered`，实际请求均使用 `discovered/medium`。修改全局偏好后，冷续接保留原会话的 `high`。一个 provider 离线时仍能列出其他可用模型。无凭据且没有可用模型时，`models pi` 只报告空目录。[Pi 原生后台刷新](https://github.com/earendil-works/pi/blob/faac585884ae2c013a6b1400f3e9e77f10b34bac/packages/coding-agent/src/main.ts#L1020-L1032)
 
 ### OpenCode
 
-`python spikes/opencode_models.py <opencode>` 比对原生 TUI、服务目录和实际派发。原生 `opencode models --standalone` 列出 `fixture/alpha`、`fixture/beta`、`fixture/gamma` 三个 ID。`axiopera models opencode` 列出相同的 ID，各自的 `low`、`high` 也与原生服务目录一致。下表记录省略 `--model` 和 `--effort` 时的结果，模型名省略 `fixture/`。
+`python spikes/opencode_models.py <opencode>` 用 OpenCode 2.3.2 保存模型和 variant，再关闭并重开原生 TUI。在 Windows 和 WSL2 Ubuntu 上，以下四组中，TUI、`models opencode` 的派发默认值和 read/full 的实际请求三者一致。表中省略 provider 名 `fixture/`。
 
-| 原生设置 | 新 TUI 实际请求 | `models` 首行 | Axiopera 派发实际请求 |
-|---|---|---|---|
-| 项目指定 `alpha#high` | `alpha/high` | `alpha` | `alpha`，未传强度 |
-| 项目指定 `alpha#high`，默认主 agent 指定 `beta#low` | `beta/low` | `alpha` | `alpha`，未传强度 |
-| 同上，TUI 还保存了 `beta` 的 `high` | `beta/high` | `alpha` | `alpha`，未传强度 |
-| 只保留 TUI 最近选择的 `gamma/high` | `gamma/high` | `alpha` | `alpha`，未传强度 |
+| 项目和终端设置 | 模型 / 强度 |
+|---|---|
+| 项目指定 `alpha#high` | `alpha/high` |
+| 同一项目，默认主 agent `focus` 指定 `beta#low` | `beta/low` |
+| 同上，TUI 为 `beta` 保存 `high` | `beta/high` |
+| 仅在 TUI 最近使用过 `gamma/high` | `gamma/high` |
 
-OpenCode TUI 创建会话时把选好的模型和 variant 一起写入会话。Axiopera 0.5.0 创建会话时只指定主 agent，`models` 首行取服务的 `/api/model/default`。该接口返回目录中的模型条目。原生服务直接用 `build` 建会话时也会省略项目的 variant。单独指定模型或在 Axiopera 配置中指定模型时，模型生效，实际请求省略 variant；同时指定 `--model` 和 `--effort` 时两项均生效。[TUI 默认值](https://github.com/anomalyco/opencode/blob/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/tui/src/context/local.tsx#L173-L253)、[TUI 创建会话](https://github.com/anomalyco/opencode/blob/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/tui/src/component/prompt/index.tsx#L1234-L1242)、[服务端选择模型](https://github.com/anomalyco/opencode/blob/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/core/src/session/runner/model.ts#L89-L99)
+模型 ID 与原生 `opencode models --standalone` 一致，每个模型的候选强度与服务目录一致。只覆盖模型、只覆盖强度、同时覆盖，以及通过 Axiopera 配置选择模型，均核对了实际请求。项目指定 `focus` 时，read 和 full 的原生会话记录均为 `focus`，请求中带有它的专属系统指令。上游的模型端点会等待项目插件完成注册，此时 agent 列表才包含完整的项目配置。[上游就绪条件](https://github.com/anomalyco/opencode/blob/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/server/src/location.ts#L36-L50)、[TUI 模型与强度选择](https://github.com/anomalyco/opencode/blob/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/tui/src/context/local.tsx#L173-L253)
 
-另有一处冷启动时序差异。Axiopera 选用 `/api/agent` 首次返回的可见主 agent。两个独立服务的首个非空列表都以 `build` 开头，等待 `/api/model` 返回后，列表首项都变成项目指定的 `focus`。用 Axiopera 任务的原生会话 ID 核对，read 和 full 均已保存为 `build`。给 `focus` 增加专属提示词后，原生 TUI 和就绪后创建的 `focus` 会话都把它发给模型；Axiopera 的 read 和 full 请求均缺少这条提示词。上游的模型目录接口会等待插件注册，agent 列表接口直接返回当前列表。[agent 列表](https://github.com/anomalyco/opencode/blob/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/server/src/handlers/agent.ts#L8-L15)、[模型目录](https://github.com/anomalyco/opencode/blob/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/server/src/handlers/model.ts#L10-L24)、[模型请求中的主 agent 指令](https://github.com/anomalyco/opencode/blob/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/core/src/session/model-request.ts#L116-L124)
-
-WSL2 Ubuntu 另用 Linux 发布版复测。两个工作目录分别指定 `alpha`、`beta`，查询和派发各自使用项目模型。第三个项目指定 `alpha`，主 agent 指定 `beta/high`，派发使用 `alpha`；只传 `--effort low` 后，实际请求和 `status` 都是 `alpha/low`。同环境下 Pi 保存的 `beta/low` 也与派发请求一致。
+WSL2 Ubuntu 上将项目默认值改成 `beta/low`，再重启 daemon 续接原任务。新任务保留首轮的 `alpha/high`。用 0.5.1 发布版创建的旧任务保留首轮的 `alpha`，请求和 `status` 均省略强度。两种任务的第二轮都沿用原生会话 ID。
 
 ### top
 
-Windows 终端中，150 列可看见两家任务的完整模型、强度和状态。80 列时标题优先保留状态。40 列时，有名称的任务详情仍保留名称、ID 和权限档位，Pi 的 `running` 只剩 `run…`，OpenCode 的 `approval` 整个被裁掉。总览和详情正文中仍能看到审批请求。宽屏下也有一处信息缺失：读取同一个 `sample.txt`，Pi 工具行显示 `Read sample.txt`，OpenCode 只显示 `Read`；写文件和运行命令也缺少操作对象。OpenCode 在后续 `session.tool.called` 事件中提供完整参数。[标题布局](../src/top.rs)、[OpenCode 适配器](../src/agent/opencode.rs)、[OpenCode 工具事件](https://github.com/anomalyco/opencode/blob/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/schema/src/session-event.ts#L458-L496)
+Windows 终端实测覆盖 40、80 和 150 列。150 列显示完整模型和强度。40 列仍完整显示 `approval` 和返回键，长中文任务名也给状态留出空间。OpenCode 的读写行显示目标文件，shell 行显示实际命令。批准和拒绝写入两次实测中，审批前都能看见目标路径。[OpenCode 工具事件](https://github.com/anomalyco/opencode/blob/c0ad18b402eb2827fc1ee71c171b1177b3fc02d1/packages/schema/src/session-event.ts#L458-L496)
 
-OpenCode 后台 shell 和 Pi 的 `@tintinweb/pi-subagents` 0.26.2 都在首轮结束后显示 `running` 及后台仍在工作的提示，完成后自动进入第二轮，最终显示 `idle` 和两轮结果。
+OpenCode 后台 shell 和 Pi 的 `@tintinweb/pi-subagents` 0.26.2 均在首轮结束后显示 `running` 和后台工作提示，子任务完成后进入第二轮，最终显示 `idle` 和两轮结果。
 
 ## 探针
 
