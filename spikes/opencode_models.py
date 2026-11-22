@@ -15,6 +15,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import ProxyHandler, Request, build_opener
 
@@ -49,7 +50,15 @@ def native_catalog(opencode, cwd, env):
                     return json.load(response)["data"]
 
             # The agent endpoint can expose built-ins before the project agents have registered.
-            models = get("/api/model")
+            for attempt in range(3):
+                try:
+                    models = get("/api/model")
+                    break
+                except HTTPError as error:
+                    error.close()
+                    if error.code != 503 or attempt == 2:
+                        raise
+                    time.sleep(.1)
             primary = next(a for a in get("/api/agent") if a["mode"] != "subagent" and not a.get("hidden"))
             return models, get("/api/model/default"), primary
         finally:

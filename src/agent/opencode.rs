@@ -99,23 +99,36 @@ impl Api {
         let mut url = self.url.join(path)?;
         url.query_pairs_mut()
             .append_pair("location[directory]", &self.cwd);
-        let mut req = self
-            .client
-            .request(method.clone(), url)
-            .basic_auth("opencode", Some(&self.password));
-        if path != "/api/event" {
-            req = req.timeout(Duration::from_secs(30));
+        // The model list returns 503 if location plugins are still activating after five seconds.
+        let mut retries = if method == Method::GET && path == "/api/model" {
+            2
+        } else {
+            0
+        };
+        loop {
+            let mut req = self
+                .client
+                .request(method.clone(), url.clone())
+                .basic_auth("opencode", Some(&self.password));
+            if path != "/api/event" {
+                req = req.timeout(Duration::from_secs(30));
+            }
+            if let Some(value) = &body {
+                req = req.json(value);
+            }
+            let res = req.send().await?;
+            if res.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE && retries > 0 {
+                retries -= 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+            ensure!(
+                res.status().is_success(),
+                "OpenCode {method} {path} returned {}",
+                res.status()
+            );
+            return Ok(res);
         }
-        if let Some(value) = body {
-            req = req.json(&value);
-        }
-        let res = req.send().await?;
-        ensure!(
-            res.status().is_success(),
-            "OpenCode {method} {path} returned {}",
-            res.status()
-        );
-        Ok(res)
     }
 
     async fn get(&self, path: &str) -> Result<Value> {
@@ -1155,6 +1168,62 @@ pub(super) async fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn only_model_readiness_retries_service_unavailable() {
+        use tokio::{io::AsyncWriteExt, net::TcpListener};
+
+        for (path, statuses) in [
+            ("/api/model", vec![503, 200]),
+            ("/api/model", vec![503, 503, 503]),
+            ("/api/model", vec![403]),
+            ("/api/agent", vec![503]),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = Url::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+            let api = Api {
+                client: Client::builder().no_proxy().build().unwrap(),
+                url,
+                password: "fixture".into(),
+                cwd: ".".into(),
+            };
+            let expected = *statuses.last().unwrap();
+            let server = tokio::spawn(async move {
+                for status in statuses {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut headers = BufReader::new(&mut stream).lines();
+                    while headers
+                        .next_line()
+                        .await
+                        .unwrap()
+                        .is_some_and(|s| !s.is_empty())
+                    {}
+                    let body = r#"{"data":[]}"#;
+                    let reply = format!(
+                        "HTTP/1.1 {status} Test\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(reply.as_bytes()).await.unwrap();
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let reply = api.get(path).await;
+                if expected == 200 {
+                    assert_eq!(reply.unwrap(), json!([]));
+                } else {
+                    assert!(
+                        reply
+                            .unwrap_err()
+                            .to_string()
+                            .contains(&format!("returned {expected}"))
+                    );
+                }
+                server.await.unwrap();
+            })
+            .await
+            .unwrap();
+        }
+    }
 
     #[test]
     fn model_errors_identify_the_rejected_selection() {
