@@ -1,6 +1,6 @@
 {
   "name": "axiopera",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Delegate tasks to coding agents and receive sub-task notifications in Codex.",
   "mcpServers": "./codex/mcp.json",
   "hooks": "./codex/hooks.json",
