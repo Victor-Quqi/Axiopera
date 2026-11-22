@@ -83,6 +83,8 @@ def run(root, opencode, binary):
                     tool = ("read", {"path": str(cwd / "fixture.txt")})
                 elif "write-request" in document and not any(m["role"] == "tool" for m in messages):
                     tool = ("write", {"path": str(cwd / "written.txt"), "content": "native-write-marker"})
+                elif "shell-request" in document and not any(m["role"] == "tool" for m in messages):
+                    tool = ("shell", {"command": "echo shell-marker"})
                 elif "pause-request" in document and "steering-marker" not in document:
                     entered.set()
                     release.wait(20)
@@ -115,6 +117,12 @@ def run(root, opencode, binary):
     def finished(task, turn=1):
         until(lambda: any(e["kind"] == "turn_ended" and e["turn"] == turn and e["ok"] for e in cli("log", task)))
 
+    def check_tool(task, name, target):
+        events = cli("log", task)
+        calls = [e["id"] for e in events if e["kind"] == "tool" and e["name"] == name]
+        assert len(calls) == 1 and any(e["kind"] == "tool_updated" and e["id"] == calls[0]
+                                      and e["detail"] == target for e in events), (name, target)
+
     with ThreadingHTTPServer(("127.0.0.1", 0), Model) as server:
         provider = {"npm": "@ai-sdk/openai-compatible", "name": "Fixture", "models": {"probe": {"name": "Probe"}},
                     "options": {"apiKey": "fixture", "baseURL": f"http://127.0.0.1:{server.server_port}/v1"}}
@@ -127,15 +135,20 @@ def run(root, opencode, binary):
             finished(read)
             assert sampled and all(names == READ for names, _ in sampled)
             assert any("native-read-marker" in body for _, body in sampled)
+            check_tool(read, "read", str(cwd / "fixture.txt"))
             for command in ("deny", "approve"):
                 sampled.clear()
                 task = spawn("full", "write-request")
                 rid = until(lambda: next((e["id"] for e in cli("log", task) if e["kind"] == "approval_request"), None))
+                check_tool(task, "write", str(cwd / "written.txt"))
                 cli("inbox", task)
                 cli(command, rid)
                 finished(task)
                 assert (cwd / "written.txt").exists() == (command == "approve")
             assert (cwd / "written.txt").read_text(encoding="utf-8") == "native-write-marker"
+            shell = spawn("full", "shell-request")
+            finished(shell)
+            check_tool(shell, "shell", "echo shell-marker")
             task = spawn("read", "pause-request")
             assert entered.wait(30)
             cli("send", task, "steering-marker")

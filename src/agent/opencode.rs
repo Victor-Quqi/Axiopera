@@ -328,6 +328,8 @@ struct State {
     usage: Option<Value>,
     pending: HashMap<String, u64>,
     delivered: Vec<u64>,
+    // Tool names and their parsed arguments arrive in separate events.
+    tool_names: HashMap<String, String>,
 }
 
 pub struct OpenCode {
@@ -870,11 +872,34 @@ fn project(s: &mut State, events: &Events, event: &Value) {
                 emit(AgentEvent::Said(text.to_owned()));
             }
         }
-        "session.tool.input.started" => emit(AgentEvent::Tool {
-            id: data["id"].as_str().map(str::to_owned),
-            name: data["name"].as_str().unwrap_or("tool").to_owned(),
-            detail: String::new(),
-        }),
+        "session.tool.input.started" => {
+            if let (Some(id), Some(name)) = (data["id"].as_str(), data["name"].as_str()) {
+                s.tool_names.insert(id.into(), name.into());
+                emit(AgentEvent::Tool {
+                    id: Some(id.into()),
+                    name: name.into(),
+                    detail: String::new(),
+                });
+            }
+        }
+        "session.tool.called" => {
+            if let Some(id) = data["id"].as_str()
+                && let Some(name) = s.tool_names.remove(id)
+            {
+                let input = &data["input"];
+                let detail = ["command", "pattern", "path", "url", "query", "description"]
+                    .iter()
+                    .find_map(|key| input[*key].as_str())
+                    .map_or_else(|| super::arguments(input), str::to_owned);
+                if !detail.is_empty() {
+                    emit(AgentEvent::ToolUpdated {
+                        id: id.into(),
+                        name,
+                        detail: super::clip(&detail, 500),
+                    });
+                }
+            }
+        }
         "session.text.delta"
         | "session.reasoning.delta"
         | "session.tool.progress"
@@ -884,6 +909,7 @@ fn project(s: &mut State, events: &Events, event: &Value) {
         | "session.execution.failed"
         | "session.execution.interrupted" => {
             s.active = false;
+            s.tool_names.clear();
             let ok = kind == "session.execution.succeeded";
             let error = if ok {
                 None
@@ -1041,6 +1067,53 @@ mod tests {
             xs.iter()
                 .any(|r| r["action"] == "axiopera_tell" && r["effect"] == "ask")
         );
+    }
+
+    #[test]
+    fn parsed_inputs_update_the_matching_tool_call() {
+        let (events, mut received) = Events::channel();
+        let mut state = State::default();
+        for (id, name) in [("a", "read"), ("b", "write"), ("c", "shell")] {
+            project(
+                &mut state,
+                &events,
+                &json!({"type":"session.tool.input.started", "data":{"id":id,"name":name}}),
+            );
+            assert!(
+                matches!(received.try_recv().unwrap(), AgentEvent::Tool { id: Some(call), .. } if call == id)
+            );
+        }
+        for (id, name, args, expected) in [
+            (
+                "c",
+                "shell",
+                json!({"command":"echo hello", "workdir":"."}),
+                "echo hello",
+            ),
+            (
+                "a",
+                "read",
+                json!({"path":"one.txt","offset":10}),
+                "one.txt",
+            ),
+            (
+                "b",
+                "write",
+                json!({"path":"two.txt","content":"file contents"}),
+                "two.txt",
+            ),
+        ] {
+            project(
+                &mut state,
+                &events,
+                &json!({"type":"session.tool.called", "data":{"id":id,"input":args}}),
+            );
+            assert!(
+                matches!(received.try_recv().unwrap(), AgentEvent::ToolUpdated { id: call, name: tool, detail }
+                if call == id && tool == name && detail == expected)
+            );
+        }
+        assert!(state.tool_names.is_empty());
     }
 
     #[test]

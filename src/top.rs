@@ -1020,7 +1020,6 @@ impl View {
         scroll: Option<&mut Scroll>,
     ) -> Vec<String> {
         self.load_detail(id);
-        // The way back is told however narrow the window: the title gives way to it.
         let width = size.map(|(w, _)| w);
         let hint = "  Esc back";
         let back = |title: Vec<Seg>| match keys {
@@ -1048,22 +1047,38 @@ impl View {
             Some(_) => format!("  {id} {agent}{runs_on}  "),
             None => format!("  {agent}{runs_on}  "),
         };
-        let name = clean(t.name.as_deref().unwrap_or(id));
-        // The model gives way before the state does.
-        let room = width.map_or(usize::MAX, |w| {
-            w.saturating_sub(1 + if keys { columns(hint) } else { 0 })
+        let mut name = clean(t.name.as_deref().unwrap_or(id));
+        let room = width.map_or(usize::MAX, |w| w.saturating_sub(1));
+        let separate_hint = keys && columns(state) + columns(hint) > room;
+        let room = room.saturating_sub(if keys && !separate_hint {
+            columns(hint)
+        } else {
+            0
         });
-        let mut shown = about(&runs_on);
-        if columns(&name) + columns(&shown) + columns(state) > room {
-            shown = about("");
-        }
-        let title = back(vec![
+        let label_room = room.saturating_sub(columns(state));
+        let extra = label_room.saturating_sub(columns(&name));
+        let id_only = t.name.as_ref().map(|_| format!("  {id}  "));
+        let shown = [Some(about(&runs_on)), Some(about("")), id_only]
+            .into_iter()
+            .flatten()
+            .find(|label| columns(label) <= extra)
+            .unwrap_or_else(|| {
+                // A long task name can take the last of the space before the state.
+                name = fit(&name, label_room.saturating_sub(2)).0;
+                if name.is_empty() { "" } else { "  " }.into()
+            });
+        let title = vec![
             (name, BOLD),
             (shown, DIM),
             (state.into(), color),
             (format!("  {}", meta(t, tail, now)), ""),
-        ]);
-        let mut head = vec![title];
+        ];
+        let mut head = if separate_hint {
+            vec![title, vec![(hint.trim().into(), DIM)]]
+        } else {
+            vec![back(title)]
+        };
+        let title_lines = head.len();
         let mut waiting: Vec<Vec<Seg>> = details(t, tail).iter().map(Detail::row).collect();
         // Approvals and questions may be more than the window holds: as many as fit, and how
         // many more there are.
@@ -1159,8 +1174,8 @@ impl View {
             // What waits for someone stays under the title while the conversation scrolls:
             // following the latest output must not push it out of sight. Past half the window,
             // the rest of it opens the conversation, where paging reaches it.
-            let mut waiting = lines.split_off(1);
-            let room = height.saturating_sub(1) / 2;
+            let mut waiting = lines.split_off(title_lines);
+            let room = height.saturating_sub(title_lines) / 2;
             let pinned = match waiting.len() <= room {
                 true => waiting.len(),
                 false => room.saturating_sub(1),
@@ -2745,6 +2760,38 @@ mod tests {
         // empty last column, 49 hold it.
         assert!(title(49).starts_with("review  t1 codex/work gpt-6 high  idle  Esc back"));
         assert!(title(48).starts_with("review  t1 codex/work  idle"));
+        assert!(title(30).starts_with("review  t1  idle"));
+        assert_eq!(title(15), "idle  Esc back");
+        let tiny = view.task_frame("t1", NOW, Some((13, 5)), true);
+        assert!(strip_sgr(&tiny[0]).contains("idle"));
+        assert_eq!(strip_sgr(&tiny[1]), "Esc back");
+    }
+
+    #[test]
+    fn a_long_wide_name_leaves_room_for_approval() {
+        let h = home();
+        let store = Store::new(&h.0);
+        let id = "t123456";
+        let more =
+            json!({"name":"检查任务名称很长的工作目录和配置", "agent":"opencode", "tier":"full"});
+        store.save(&task(id, "user", "running", NOW, more)).unwrap();
+        store
+            .append(&event(
+                1,
+                0,
+                id,
+                "approval_request",
+                json!({"id":"r1","summary":"write sample.txt"}),
+            ))
+            .unwrap();
+        let mut view = View::new(&h.0, false);
+        view.refresh();
+        let title = strip_sgr(&view.task_frame(id, NOW, Some((40, 6)), true)[0]);
+        assert!(
+            title.contains("…  approval") && title.ends_with("  Esc back"),
+            "{title}"
+        );
+        assert!(columns(&title) < 40);
     }
 
     #[test]
