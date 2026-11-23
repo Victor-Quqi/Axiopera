@@ -4,6 +4,7 @@ use std::ffi::{OsStr, c_void};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::AsRawHandle;
+use std::os::windows::process::CommandExt;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
@@ -392,13 +393,23 @@ pub fn spawn_detached(exe: &Path, args: &[&str]) -> io::Result<&'static str> {
     }
 }
 
+fn wmi_script(cmdline: &str) -> String {
+    // CREATE_NO_WINDOW and SW_HIDE keep WMI from opening a visible console or Windows Terminal.
+    format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $s = New-CimInstance -ClassName Win32_ProcessStartup -Property @{{CreateFlags=[uint32]{}; ShowWindow=[uint16]0}} -ClientOnly; \
+         $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{}'; ProcessStartupInformation=$s}}; \
+         if ($null -eq $r -or $null -eq $r.ReturnValue) {{ exit 1 }}; \
+         exit $r.ReturnValue",
+        CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+        cmdline.replace('\'', "''")
+    )
+}
+
 /// Win32_Process.Create: the new process is a child of the WMI provider host, outside our job.
 /// Note it gets the user's registry environment, not ours.
 fn wmi_create(cmdline: &str) -> io::Result<()> {
-    let script = format!(
-        "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{}'}}; exit $r.ReturnValue",
-        cmdline.replace('\'', "''")
-    );
+    let script = wmi_script(cmdline);
     let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let status = std::process::Command::new("powershell.exe")
         .args([
@@ -407,6 +418,7 @@ fn wmi_create(cmdline: &str) -> io::Result<()> {
             "-EncodedCommand",
             &base64(&utf16),
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -600,5 +612,43 @@ mod tests {
         assert_eq!(base64(b"hello"), "aGVsbG8=");
         assert_eq!(base64(b"hi!"), "aGkh");
         assert_eq!(base64(b"a"), "YQ==");
+    }
+
+    #[test]
+    fn wmi_script_hides_console_and_escapes_quotes() {
+        let script = wmi_script(r#""C:\it's\axiopera.exe" daemon run"#);
+        assert!(script.starts_with("$ErrorActionPreference = 'Stop';"));
+        assert!(script.contains("Win32_ProcessStartup"));
+        assert!(script.contains(&format!(
+            "CreateFlags=[uint32]{}",
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+        )));
+        assert!(script.contains("ShowWindow=[uint16]0"));
+        assert!(script.contains("ProcessStartupInformation=$s"));
+        assert!(script.contains("if ($null -eq $r -or $null -eq $r.ReturnValue) { exit 1 }"));
+        assert!(script.contains(r#"CommandLine='"C:\it''s\axiopera.exe" daemon run'"#));
+    }
+
+    #[test]
+    fn wmi_script_exits_nonzero_on_cim_error() {
+        let script = format!(
+            "function New-CimInstance {{ Write-Error 'boom' }}; {}",
+            wmi_script("probe")
+        );
+        let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let status = std::process::Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-EncodedCommand",
+                &base64(&utf16),
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success());
     }
 }
