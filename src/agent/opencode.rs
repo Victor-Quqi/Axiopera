@@ -413,7 +413,7 @@ fn model_info<'a>(catalog: &'a [Value], id: &str) -> Result<&'a Value> {
         .iter()
         .find(|m| m["providerID"] == provider && m["id"] == model)
         .with_context(|| format!("unknown model {id} in OpenCode"))?;
-    ensure!(info["enabled"] != false, "OpenCode model is disabled");
+    ensure!(info["enabled"] != false, "OpenCode model {id} is disabled");
     Ok(info)
 }
 
@@ -1227,6 +1227,12 @@ mod tests {
 
     #[test]
     fn model_errors_identify_the_rejected_selection() {
+        let disabled = [json!({"providerID":"team","id":"retired","enabled":false})];
+        let error = model_info(&disabled, "team/retired")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "OpenCode model team/retired is disabled");
+        assert!(super::super::models::selection_error(&error));
         let catalog = [json!({"providerID":"team","id":"nested/name","variants":[{"id":"high"}]})];
         assert_eq!(
             model_info(&catalog, "bad").unwrap_err().to_string(),

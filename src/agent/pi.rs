@@ -174,7 +174,7 @@ impl Pi {
                 args.extend(["--model".into(), model.into()]);
             }
             let (proc, stdout) = spawn(exe, &args, cwd, env, trace)?;
-            let pi = Self::read(proc, stdout, events.clone(), extension);
+            let mut pi = Self::read(proc, stdout, events.clone(), extension);
             let state = match pi.client.call(json!({"type":"get_state"})).await {
                 Ok(state) => state,
                 Err(error) => {
@@ -185,6 +185,15 @@ impl Pi {
                     {
                         options["retry"] = json!(true);
                         continue;
+                    }
+                    // stdout can close before the stderr reader consumes the last diagnostic.
+                    pi.proc.job.kill();
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(1), &mut pi.proc.stderr_reader)
+                            .await;
+                    let tail = pi.proc.stderr_tail();
+                    if !tail.trim().is_empty() {
+                        bail!("{error:#}: {tail}");
                     }
                     return Err(error);
                 }
@@ -640,6 +649,40 @@ pub(super) async fn query(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn startup_reports_stderr_when_the_requested_model_is_rejected() {
+        let args = [
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            "--",
+            "agent::pi::tests::reject_model_fixture",
+        ]
+        .map(str::to_owned);
+        let error = Pi::launch(
+            &std::env::current_exe().unwrap(),
+            &args,
+            &std::env::current_dir().unwrap(),
+            &[],
+            None,
+            Events::channel().0,
+            json!({"model":"typo"}),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            error.to_string().contains("Unknown model 'typo'"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture for Pi startup"]
+    fn reject_model_fixture() {
+        eprintln!("Unknown model 'typo'");
+    }
 
     #[test]
     fn only_settled_finishes_a_run_and_failed_tools_do_not_mark_files() {

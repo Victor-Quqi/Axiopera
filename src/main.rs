@@ -45,6 +45,14 @@ enum Command {
     /// List model IDs, resolved aliases and supported reasoning efforts.
     Models {
         agent: Agent,
+        /// Match part of a model ID, name or resolved alias.
+        query: Option<String>,
+        /// Only list models from this provider.
+        #[arg(long, value_name = "NAME")]
+        provider: Option<String>,
+        /// Show every matching model in text output.
+        #[arg(long)]
+        all: bool,
         /// Working directory (default: the current one).
         #[arg(long)]
         cwd: Option<PathBuf>,
@@ -318,8 +326,17 @@ async fn run(cli: Cli) -> Result<i32> {
         None => None,
     };
     let request = match cli.command {
-        Command::Models { agent, cwd } => Request::Models {
+        Command::Models {
             agent,
+            query,
+            provider,
+            all,
+            cwd,
+        } => Request::Models {
+            agent,
+            query,
+            provider,
+            all,
             cwd: match cwd {
                 Some(c) => std::path::absolute(c)?,
                 None => std::env::current_dir()?,
@@ -538,6 +555,50 @@ fn guide(host: Option<Agent>, caller: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn models_accepts_optional_filters_and_output_options() {
+        let cli = Cli::try_parse_from(["axiopera", "models", "pi"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Models {
+                query: None,
+                provider: None,
+                all: false,
+                cwd: None,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "axiopera",
+            "models",
+            "opencode",
+            "opus",
+            "--provider",
+            "team/",
+            "--cwd",
+            ".",
+            "--all",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        let Command::Models {
+            agent,
+            query,
+            provider,
+            cwd,
+            all,
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(agent, Agent::Opencode);
+        assert_eq!(query.as_deref(), Some("opus"));
+        assert_eq!(provider.as_deref(), Some("team/"));
+        assert_eq!(cwd, Some(PathBuf::from(".")));
+        assert!(all);
+    }
 
     struct TextFile(PathBuf);
 

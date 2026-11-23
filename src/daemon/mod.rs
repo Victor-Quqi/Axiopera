@@ -7,8 +7,9 @@ mod task;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,6 +69,71 @@ pub struct Daemon {
     /// Held while appending to or trimming `daemon/requests.jsonl`.
     requests: Mutex<()>,
     previews: Mutex<delivery::Previews>,
+    catalogs: CatalogCache,
+}
+
+#[derive(PartialEq, Eq)]
+struct CatalogKey {
+    agent: Agent,
+    cwd: PathBuf,
+    exe: PathBuf,
+    env_fingerprint: u64,
+}
+
+impl CatalogKey {
+    fn new(agent: Agent, cwd: &Path, exe: &Path, env: &[(String, String)]) -> Self {
+        let mut pairs: Vec<_> = env.iter().collect();
+        // Keep the precedence of duplicate environment keys, including on Windows.
+        pairs.sort_by_cached_key(|(name, _)| name.to_ascii_lowercase());
+        let mut hash = DefaultHasher::new();
+        pairs.hash(&mut hash);
+        Self {
+            agent,
+            cwd: cwd.to_owned(),
+            exe: exe.to_owned(),
+            env_fingerprint: hash.finish(),
+        }
+    }
+}
+
+struct CachedCatalog {
+    key: CatalogKey,
+    stored: tokio::time::Instant,
+    catalog: Arc<agent::models::Catalog>,
+}
+
+#[derive(Default)]
+struct CatalogCache(Mutex<VecDeque<CachedCatalog>>);
+
+impl CatalogCache {
+    async fn get_or_query(
+        &self,
+        key: CatalogKey,
+        query: impl Future<Output = Result<agent::models::Catalog>>,
+    ) -> Result<Arc<agent::models::Catalog>> {
+        const TTL: Duration = Duration::from_secs(15);
+        {
+            let mut entries = self.0.lock().unwrap();
+            entries.retain(|entry| entry.stored.elapsed() < TTL);
+            if let Some(entry) = entries.iter().find(|entry| entry.key == key) {
+                return Ok(entry.catalog.clone());
+            }
+        }
+        let catalog = Arc::new(query.await?);
+        if !catalog.models.is_empty() {
+            let mut entries = self.0.lock().unwrap();
+            entries.retain(|entry| entry.key != key && entry.stored.elapsed() < TTL);
+            if entries.len() == 16 {
+                entries.pop_front();
+            }
+            entries.push_back(CachedCatalog {
+                key,
+                stored: tokio::time::Instant::now(),
+                catalog: catalog.clone(),
+            });
+        }
+        Ok(catalog)
+    }
 }
 
 fn pi_watch_matches(caller: &str, token: &str) -> bool {
@@ -387,6 +453,7 @@ impl Daemon {
             log: Mutex::new(log),
             requests: Mutex::new(()),
             previews: Mutex::new(delivery::Previews::default()),
+            catalogs: CatalogCache::default(),
         };
         for error in errors {
             d.log(&error);
@@ -808,7 +875,13 @@ impl Daemon {
     ) -> Result<i32> {
         let caller = self.resolve_caller(&env.caller);
         match env.request {
-            Request::Models { agent, cwd } => {
+            Request::Models {
+                agent,
+                cwd,
+                provider,
+                query,
+                all,
+            } => {
                 let catalog = self
                     .model_catalog(
                         agent,
@@ -817,8 +890,9 @@ impl Daemon {
                         Duration::from_secs(20),
                     )
                     .await?;
-                out.text(catalog.render(agent), serde_json::to_value(&catalog)?)
-                    .await?;
+                let (text, filtered) =
+                    catalog.listing(agent, provider.as_deref(), query.as_deref(), all);
+                out.text(text, serde_json::to_value(filtered)?).await?;
                 Ok(ipc::exit::OK)
             }
             Request::Ping => {
@@ -999,22 +1073,27 @@ impl Daemon {
         cwd: &Path,
         env: &[(String, String)],
         timeout: Duration,
-    ) -> Result<agent::models::Catalog> {
+    ) -> Result<Arc<agent::models::Catalog>> {
         let config = self.opts.agents.get(agent);
         let exe = agent::resolve_exe(agent, config.path.as_deref(), env)?;
         let mut query_env = agent_env(env, "", agent, &self.opts.home);
         query_env.retain(|(k, _)| !k.eq_ignore_ascii_case(identity::TASK_VAR));
-        let mut catalog = agent::models::query(
-            agent,
-            &exe,
-            cwd,
-            &query_env,
-            config.model.as_deref(),
-            timeout,
-        )
-        .await?;
-        catalog.configured_model = config.model.clone();
-        Ok(catalog)
+        let key = CatalogKey::new(agent, cwd, &exe, &query_env);
+        self.catalogs
+            .get_or_query(key, async {
+                let mut catalog = agent::models::query(
+                    agent,
+                    &exe,
+                    cwd,
+                    &query_env,
+                    config.model.as_deref(),
+                    timeout,
+                )
+                .await?;
+                catalog.configured_model = config.model.clone();
+                Ok(catalog)
+            })
+            .await
     }
 
     async fn spawn<W: AsyncWrite + Unpin>(

@@ -125,6 +125,87 @@ fn pi_and_opencode_reject_unsupported_dispatch_tiers() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn catalog_cache_is_scoped_bounded_and_expires_after_fifteen_seconds() {
+    use agent::models::{Catalog, Model};
+    let cache = CatalogCache::default();
+    let key = |agent, cwd: &str, exe: &str, env: &[_]| {
+        CatalogKey::new(agent, Path::new(cwd), Path::new(exe), env)
+    };
+    let env = [("A".into(), "1".into()), ("B".into(), "2".into())];
+    let base = || key(Agent::Pi, "project", "pi", &env);
+    let load = || async {
+        Ok(Catalog {
+            models: vec![Model {
+                id: "provider/model".into(),
+                name: None,
+                description: None,
+                efforts: None,
+                resolved_model: None,
+                disabled: None,
+            }],
+            ..Catalog::default()
+        })
+    };
+    let first = cache.get_or_query(base(), load()).await.unwrap();
+    tokio::time::advance(Duration::from_secs(14)).await;
+    let mut reordered = env.clone();
+    reordered.reverse();
+    let hit = cache
+        .get_or_query(key(Agent::Pi, "project", "pi", &reordered), async {
+            panic!("queried on hit")
+        })
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&first, &hit));
+    let changed = [("A".into(), "3".into()), env[1].clone()];
+    for other in [
+        key(Agent::Pi, "elsewhere", "pi", &env),
+        key(Agent::Pi, "project", "other", &env),
+        key(Agent::Opencode, "project", "pi", &env),
+        key(Agent::Pi, "project", "pi", &changed),
+    ] {
+        assert!(!Arc::ptr_eq(
+            &first,
+            &cache.get_or_query(other, load()).await.unwrap()
+        ));
+    }
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let fresh = cache.get_or_query(base(), load()).await.unwrap();
+    assert!(!Arc::ptr_eq(&first, &fresh));
+    for n in 0..16 {
+        cache
+            .get_or_query(key(Agent::Pi, &n.to_string(), "pi", &env), load())
+            .await
+            .unwrap();
+    }
+    assert_eq!(cache.0.lock().unwrap().len(), 16);
+    assert!(!Arc::ptr_eq(
+        &fresh,
+        &cache.get_or_query(base(), load()).await.unwrap()
+    ));
+}
+
+#[tokio::test]
+async fn empty_and_failed_catalog_queries_are_retried() {
+    let cache = CatalogCache::default();
+    let key = || CatalogKey::new(Agent::Pi, Path::new("."), Path::new("pi"), &[]);
+    for _ in 0..2 {
+        assert!(
+            cache
+                .get_or_query(key(), async { Err(anyhow!("unavailable")) })
+                .await
+                .is_err()
+        );
+        let empty = cache
+            .get_or_query(key(), async { Ok(agent::models::Catalog::default()) })
+            .await
+            .unwrap();
+        assert!(empty.models.is_empty());
+    }
+    assert!(cache.0.lock().unwrap().is_empty());
+}
+
 #[test]
 fn blocked_is_logged_without_waking_and_counted_once_per_turn() {
     let f = fixture();

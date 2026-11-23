@@ -1,6 +1,7 @@
 //! Native model pickers, queried without starting an inference turn.
 
-use std::collections::{HashMap, HashSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
@@ -13,7 +14,7 @@ use tokio::process::ChildStdout;
 use super::Proc;
 use crate::ipc::Agent;
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct Catalog {
     pub models: Vec<Model>,
     /// The catalog's own default: Claude's account default, Codex's backend default.
@@ -31,7 +32,7 @@ pub struct Catalog {
     pub configured_effort: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Model {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -46,13 +47,29 @@ pub struct Model {
     pub disabled: Option<bool>,
 }
 
+impl Model {
+    fn provider(&self) -> Option<&str> {
+        self.id
+            .split_once('/')
+            .map(|(name, _)| name)
+            .filter(|name| !name.is_empty())
+    }
+
+    fn matches_name_or_id(&self, query: &str) -> bool {
+        self.id.to_lowercase().contains(query)
+            || self
+                .name
+                .as_ref()
+                .is_some_and(|name| name.to_lowercase().contains(query))
+    }
+}
+
+fn query_hint(agent: Agent) -> String {
+    format!("Narrow with `{} <query>` or pass --all.", command(agent))
+}
+
 impl Catalog {
-    pub fn render(&self, agent: Agent) -> String {
-        let mut lines = Vec::new();
-        let default_label = match agent {
-            Agent::Claude => "account default",
-            _ => "backend default",
-        };
+    fn with_header(&self, body: String) -> String {
         // A configured model may take a different default effort: name the model alone.
         let spawns = match (
             &self.configured_model,
@@ -75,13 +92,25 @@ impl Catalog {
             (None, Some(model), None) => Some(single_line(model)),
             (None, None, _) => None,
         };
-        if let Some(spawns) = spawns {
-            lines.push(format!("Without --model, spawns use {spawns}."));
+        match spawns {
+            Some(spawns) => format!("Without --model, spawns use {spawns}.\n{body}"),
+            None => body,
         }
-        if self.models.is_empty() {
-            lines.push("No models returned.".into());
-        }
-        for model in &self.models {
+    }
+
+    fn rows<'a>(
+        &self,
+        agent: Agent,
+        models: impl ExactSizeIterator<Item = &'a Model>,
+        limit: usize,
+    ) -> String {
+        let remaining = models.len().saturating_sub(limit);
+        let mut lines = Vec::new();
+        let default_label = match agent {
+            Agent::Claude => "account default",
+            _ => "backend default",
+        };
+        for model in models.take(limit) {
             let mut row = single_line(&model.id);
             if let Some(resolved) = &model.resolved_model
                 && !resolved.is_empty()
@@ -118,7 +147,151 @@ impl Catalog {
             }
             lines.push(row);
         }
+        if remaining > 0 {
+            lines.push(format!("{remaining} more. {}", query_hint(agent)));
+        }
         lines.join("\n")
+    }
+
+    fn providers(&self) -> Vec<(&str, usize)> {
+        let mut counts = BTreeMap::new();
+        for name in self.models.iter().filter_map(Model::provider) {
+            let (_, count) = counts.entry(name.to_lowercase()).or_insert((name, 0));
+            *count += 1;
+        }
+        counts.into_values().collect()
+    }
+
+    fn overview(&self, agent: Agent, limit: usize) -> String {
+        let counts = self.providers();
+        if counts.is_empty() {
+            return self.rows(agent, self.models.iter(), limit);
+        }
+        let unprefixed = self.models.len() - counts.iter().map(|(_, count)| count).sum::<usize>();
+        let mut groups: Vec<_> = counts
+            .into_iter()
+            .map(|(p, n)| format!("{} ({n})", single_line(p)))
+            .collect();
+        if unprefixed > 0 {
+            groups.push(format!("unprefixed ({unprefixed})"));
+        }
+        format!(
+            "Providers: {}.\nSelect with --provider <name>. {}",
+            groups.join(", "),
+            query_hint(agent)
+        )
+    }
+
+    /// Only filtering changes the returned catalog. Row limits apply to text alone.
+    pub fn listing(
+        &self,
+        agent: Agent,
+        provider: Option<&str>,
+        query: Option<&str>,
+        all: bool,
+    ) -> (String, Cow<'_, Self>) {
+        const LIMIT: usize = 50;
+        let filtered = provider.is_some() || query.is_some();
+        let mut catalog = Cow::Borrowed(self);
+        let mut empty = if filtered {
+            "No matching models."
+        } else {
+            "No models returned."
+        }
+        .to_string();
+        if let Some(provider) = provider {
+            let provider = provider.trim_end_matches('/').to_lowercase();
+            catalog
+                .to_mut()
+                .models
+                .retain(|m| m.provider().is_some_and(|p| p.to_lowercase() == provider));
+            if catalog.models.is_empty() {
+                let names: Vec<_> = self
+                    .providers()
+                    .into_iter()
+                    .map(|(p, _)| single_line(p))
+                    .collect();
+                if !names.is_empty() {
+                    empty.push_str(&format!(" Available providers: {}.", names.join(", ")));
+                }
+            }
+        }
+        if let Some(query) = query {
+            let query = query.to_lowercase();
+            catalog.to_mut().models.retain(|m| {
+                m.matches_name_or_id(&query)
+                    || m.resolved_model
+                        .as_ref()
+                        .is_some_and(|id| id.to_lowercase().contains(&query))
+            });
+        }
+        let body = if catalog.models.is_empty() {
+            empty
+        } else if !filtered && !all && catalog.models.len() > LIMIT {
+            self.overview(agent, LIMIT)
+        } else {
+            self.rows(
+                agent,
+                catalog.models.iter(),
+                if all { usize::MAX } else { LIMIT },
+            )
+        };
+        (self.with_header(body), catalog)
+    }
+
+    pub fn render_error(&self, agent: Agent, requested: Option<&str>) -> String {
+        const LIMIT: usize = 20;
+        if self.models.len() <= 30 {
+            return self.with_header(self.rows(agent, self.models.iter(), 30));
+        }
+        if let Some(raw) = requested.filter(|s| !s.is_empty()) {
+            // A native ID can itself end in a qualifier such as ":free".
+            let id = raw
+                .rsplit_once(':')
+                .filter(|(_, suffix)| !suffix.contains('/'))
+                .map_or(raw, |(id, _)| id);
+            if let Some(model) = self
+                .models
+                .iter()
+                .find(|m| m.id == raw)
+                .or_else(|| self.models.iter().find(|m| m.id == id))
+            {
+                return self.rows(agent, std::iter::once(model), LIMIT);
+            }
+            let query = id.to_lowercase();
+            let matches: Vec<_> = match query.split_once('/') {
+                Some((p, tail)) => {
+                    let same_provider: Vec<_> = self
+                        .models
+                        .iter()
+                        .filter(|m| m.provider().is_some_and(|name| name.to_lowercase() == p))
+                        .collect();
+                    let narrower: Vec<_> = if tail.is_empty() {
+                        Vec::new()
+                    } else {
+                        same_provider
+                            .iter()
+                            .copied()
+                            .filter(|m| m.matches_name_or_id(tail))
+                            .collect()
+                    };
+                    if !narrower.is_empty() {
+                        narrower
+                    } else {
+                        same_provider
+                    }
+                }
+                None => self
+                    .models
+                    .iter()
+                    .filter(|m| !query.is_empty() && m.matches_name_or_id(&query))
+                    .collect(),
+            };
+            if !matches.is_empty() {
+                return self.rows(agent, matches.into_iter(), LIMIT);
+            }
+        }
+        self.overview(agent, LIMIT)
     }
 }
 
@@ -142,6 +315,9 @@ pub fn command(agent: Agent) -> String {
 /// Match backend parameter errors, excluding auth, capacity and transport failures.
 pub fn selection_error(error: &str) -> bool {
     let text = error.to_ascii_lowercase();
+    if text.starts_with("opencode model ") && text.ends_with(" is disabled") {
+        return true;
+    }
     if [
         "401",
         "403",
@@ -763,7 +939,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            agy.render(Agent::Agy),
+            agy.listing(Agent::Agy, None, None, false).0,
             "Without --model, spawns use first, effort low.\nfirst  effort: low\nsecond  effort: deep, extra\nfixed-medium  Fixed (Medium)\nunavailable"
         );
         let rows = serde_json::to_value(&agy).unwrap()["models"].clone();
@@ -786,7 +962,7 @@ mod tests {
         );
         assert_eq!(codex.default_model.as_deref(), Some("second"));
         assert_eq!(
-            codex.render(Agent::Codex),
+            codex.listing(Agent::Codex, None, None, false).0,
             "Without --model, spawns use second, effort medium.\nfirst\nsecond  (backend default)"
         );
         // The user's configuration wins over the catalog's default.
@@ -806,7 +982,7 @@ mod tests {
         let claude = fixture(Agent::Claude, "ok", timeout).await.unwrap();
         assert_eq!(claude.default_model.as_deref(), Some("default"));
         assert_eq!(
-            claude.render(Agent::Claude),
+            claude.listing(Agent::Claude, None, None, false).0,
             "Without --model, spawns use claude-opus, effort xhigh.\ndefault  (account default)\nrestricted  (disabled)"
         );
         assert_eq!(claude.models[1].disabled, Some(true));
@@ -905,7 +1081,7 @@ mod tests {
         };
         // A configured model may take another default effort: none is named.
         assert_eq!(
-            catalog.render(Agent::Claude),
+            catalog.listing(Agent::Claude, None, None, false).0,
             "Without --model, spawns use custom (Axiopera config).\ndefault → claude-opus  (account default)  effort: low, high\nopus → claude-opus\nclaude-sonnet\ncustom  Team model"
         );
         let json = serde_json::to_value(&catalog).unwrap();
@@ -921,8 +1097,131 @@ mod tests {
             ..Catalog::default()
         };
         assert_eq!(
-            catalog.render(Agent::Codex),
+            catalog.listing(Agent::Codex, None, None, false).0,
             "Without --model, spawns use custom.\nNo models returned."
         );
+    }
+
+    fn numbered_catalog(prefix: &str, count: usize) -> Catalog {
+        let models = (0..count)
+            .map(|i| Model {
+                id: format!("{prefix}{i:02}"),
+                name: None,
+                description: None,
+                resolved_model: None,
+                disabled: None,
+                efforts: Some(vec!["high".into()]),
+            })
+            .collect();
+        Catalog {
+            models,
+            default_model: Some("default".into()),
+            native_model: Some("native".into()),
+            native_effort: Some("low".into()),
+            configured_model: Some("configured".into()),
+            configured_effort: Some("medium".into()),
+        }
+    }
+
+    #[test]
+    fn provider_and_query_filters_preserve_catalog_defaults() {
+        let mut catalog = numbered_catalog("Anthropic/", 2);
+        catalog.models[0].name = Some("Claude Opus".into());
+        catalog.models[1].resolved_model = Some("claude-sonnet".into());
+        catalog
+            .models
+            .extend(numbered_catalog("openrouter/anthropic/opus", 1).models);
+        let list = |p, q| catalog.listing(Agent::Pi, p, q, false);
+        for (query, index) in [("OPUS", 0), ("sONNet", 1), ("01", 1)] {
+            let (text, filtered) = list(Some("AnThRoPiC/"), Some(query));
+            assert!(text.starts_with("Without --model, spawns use configured, effort medium"));
+            assert_eq!(filtered.models.len(), 1);
+            assert_eq!(filtered.models[0].id, catalog.models[index].id);
+            let mut expected = json!(catalog);
+            expected["models"] = json!([expected["models"][index]]);
+            assert_eq!(json!(filtered), expected);
+        }
+        assert_eq!(list(None, Some("Opus")).1.models.len(), 2);
+        assert_eq!(list(Some("anthropic"), None).1.models.len(), 2);
+        let (text, filtered) = list(Some("missing"), None);
+        assert!(filtered.models.is_empty());
+        assert!(text.ends_with("No matching models. Available providers: Anthropic, openrouter."));
+        let text = catalog
+            .listing(Agent::Pi, Some("openrouter"), Some("absent"), true)
+            .0;
+        assert!(text.ends_with("No matching models."));
+    }
+
+    #[test]
+    fn only_text_is_summarized_or_limited() {
+        let small = numbered_catalog("team/", 50);
+        let small_text = small.listing(Agent::Pi, None, None, false).0;
+        assert_eq!(small_text.lines().count(), 51);
+        assert_eq!(small_text, small.listing(Agent::Pi, None, None, true).0);
+        let mut large = numbered_catalog("team/", 52);
+        large.models.extend(numbered_catalog("other/", 1).models);
+        let (summary, full) = large.listing(Agent::Pi, None, None, false);
+        assert!(summary.starts_with("Without --model"));
+        assert!(summary.contains("Providers: other (1), team (52)."));
+        assert!(
+            summary.contains("--provider <name>")
+                && summary.contains("<query>")
+                && summary.contains("--all")
+        );
+        assert!(!summary.contains("team/00"));
+        assert_eq!(json!(full), json!(large));
+
+        let (text, filtered) = large.listing(Agent::Pi, Some("team"), None, false);
+        assert!(text.contains("team/49") && !text.contains("team/50"));
+        assert!(text.contains("2 more.") && text.contains("--all"));
+        assert_eq!(json!(filtered)["models"].as_array().unwrap().len(), 52);
+        let text = large.listing(Agent::Pi, Some("team"), None, true).0;
+        assert!(text.ends_with("team/51  effort: high"));
+        assert!(!text.contains("other/"));
+        assert_eq!(
+            large.listing(Agent::Pi, None, None, true).0.lines().count(),
+            54
+        );
+
+        let flat = numbered_catalog("model-", 51);
+        let text = flat.listing(Agent::Codex, None, None, false).0;
+        assert!(text.contains("model-49") && !text.contains("model-50"));
+        assert!(text.contains("1 more.") && text.contains("<query>"));
+    }
+
+    #[test]
+    fn selection_errors_show_relevant_rows_with_a_bounded_fallback() {
+        let small = numbered_catalog("team/", 30);
+        assert_eq!(
+            small.render_error(Agent::Pi, Some("team/01")),
+            small.listing(Agent::Pi, None, None, true).0
+        );
+        let mut catalog = numbered_catalog("team/", 30);
+        catalog.models[2].name = Some("Featured".into());
+        catalog
+            .models
+            .extend(numbered_catalog("other/team/", 1).models);
+        let render = |requested| catalog.render_error(Agent::Pi, Some(requested));
+        for requested in ["team/11", "team/11:bad"] {
+            assert_eq!(render(requested), "team/11  effort: high");
+        }
+        assert_eq!(render("FEATURED"), "team/02  Featured  effort: high");
+        assert_eq!(render("team/featured"), "team/02  Featured  effort: high");
+        assert_eq!(render("other/00"), "other/team/00  effort: high");
+        assert_eq!(render("29:bad"), "team/29  effort: high");
+        let text = render("TEAM/missing");
+        assert!(text.contains("team/19") && !text.contains("team/20") && !text.contains("other/"));
+        assert!(text.contains("10 more.") && text.contains("axiopera models pi"));
+        let text = render("absent");
+        assert!(
+            text.contains("Providers: other (1), team (30).")
+                && text.contains("axiopera models pi")
+        );
+        let flat = numbered_catalog("model-", 31);
+        let text = flat.render_error(Agent::Codex, None);
+        assert!(
+            text.contains("model-19") && !text.contains("model-20") && text.contains("11 more.")
+        );
+        assert!(text.contains("axiopera models codex"));
     }
 }

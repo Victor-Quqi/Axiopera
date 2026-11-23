@@ -67,6 +67,12 @@ pub enum Request {
     Models {
         agent: Agent,
         cwd: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        all: bool,
     },
     Stop {
         force: bool,
@@ -296,9 +302,15 @@ mod tests {
 
     #[test]
     fn model_queries_carry_environment_and_cannot_escape_a_sandbox() {
+        let old = serde_json::json!({"op":"models","agent":"grok","cwd":"."});
+        let defaults: Request = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(defaults).unwrap(), old);
         let request = Request::Models {
             agent: Agent::Grok,
             cwd: PathBuf::from("."),
+            query: Some("opus".into()),
+            provider: Some("team".into()),
+            all: true,
         };
         assert!(request.needs_env());
         assert!(!request.allowed_in_sandbox());
@@ -308,8 +320,9 @@ mod tests {
             serde_json::from_value::<Request>(wire).unwrap(),
             Request::Models {
                 agent: Agent::Grok,
+                query: Some(q), provider: Some(p), all: true,
                 ..
-            }
+            } if q == "opus" && p == "team"
         ));
     }
 }

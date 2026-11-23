@@ -643,12 +643,15 @@ async fn model_error(d: &Daemon, id: &str, error: String) -> String {
     if !agent::models::selection_error(&error) {
         return error;
     }
-    let context = d
-        .lock()
-        .tasks
-        .get(id)
-        .map(|entry| (entry.task.agent, entry.task.cwd.clone(), entry.env.clone()));
-    let Some((agent, cwd, env)) = context else {
+    let context = d.lock().tasks.get(id).map(|entry| {
+        (
+            entry.task.agent,
+            entry.task.cwd.clone(),
+            entry.env.clone(),
+            entry.task.model.clone(),
+        )
+    });
+    let Some((agent, cwd, env, requested)) = context else {
         return error;
     };
     let catalog = match env {
@@ -662,7 +665,7 @@ async fn model_error(d: &Daemon, id: &str, error: String) -> String {
         Some(catalog) if !catalog.models.is_empty() => format!(
             "{error}\n\n{}:\n{}",
             agent::models::command(agent),
-            catalog.render(agent)
+            catalog.render_error(agent, requested.as_deref())
         ),
         _ => format!(
             "{error}\nRun `{}` to query models and supported reasoning efforts.",

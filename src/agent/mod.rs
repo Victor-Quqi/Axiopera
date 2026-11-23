@@ -438,14 +438,7 @@ impl Backend {
     }
 
     pub fn stderr_tail(&mut self) -> String {
-        self.proc()
-            .stderr
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.proc().stderr_tail()
     }
 }
 
@@ -531,10 +524,21 @@ pub struct Proc {
     pub stdin: Writer,
     /// Last lines of stderr, each cut to a few hundred characters, for error reports. Never
     /// logged.
-    pub stderr: Arc<Mutex<VecDeque<String>>>,
+    stderr: Arc<Mutex<VecDeque<String>>>,
+    stderr_reader: tokio::task::JoinHandle<()>,
 }
 
 impl Proc {
+    fn stderr_tail(&self) -> String {
+        self.stderr
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     pub fn spawn(exe: &Path, args: &[String], spec: &StartSpec) -> Result<(Proc, ChildStdout)> {
         Self::spawn_with(exe, args, &spec.cwd, &spec.env, spec.trace.as_deref())
     }
@@ -567,7 +571,7 @@ impl Proc {
         let stderr: Arc<Mutex<VecDeque<String>>> = Arc::default();
         let tail = stderr.clone();
         let err = child.stderr.take().unwrap();
-        tokio::spawn(async move {
+        let stderr_reader = tokio::spawn(async move {
             let mut lines = lines(err);
             while let Ok(Some(l)) = lines.next_line().await {
                 let mut t = tail.lock().unwrap();
@@ -584,6 +588,7 @@ impl Proc {
                 child,
                 stdin,
                 stderr,
+                stderr_reader,
             },
             stdout,
         ))

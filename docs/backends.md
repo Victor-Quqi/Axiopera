@@ -84,7 +84,7 @@ AGY 在任务进程内创建或恢复 ACP 会话，注册任务专用 stdio MCP�
 
 ## 模型查询
 
-Pi 和 OpenCode 的模型 ID 都使用 `provider/model`。Pi 从 RPC 读取模型和思考档位，在托管进程中等待支持动态发现的 provider 刷新目录，最终选择取自 `get_state`。
+Pi 和 OpenCode 的模型 ID 都使用 `provider/model`。Pi 从 RPC 读取模型和思考档位，在托管进程中等待支持动态发现的 provider 刷新目录，最终选择取自 `get_state`。启动时这条请求最终失败，错误会附上 Pi 写到标准错误的最后几行。OpenCode 拒绝已禁用的模型时会给出完整 ID。
 
 OpenCode 在项目插件就绪后读取目录。新会话依次考虑主 agent 指定的模型、项目模型、TUI 最近使用的模型和目录中的可用模型。所选模型的 variant 优先取 TUI 为它保存的值，再取主 agent 或项目为该模型指定的值。显式 `--effort` 优先，`--effort default` 可清除本次派发的 variant。OpenCode 在建会话时保存模型与 variant，续接使用该会话的选择。[默认值的实测对照](verification.md#pi-与-opencode-的模型和任务显示)
 
