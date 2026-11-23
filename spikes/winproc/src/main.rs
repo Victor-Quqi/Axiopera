@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
+use std::os::windows::process::CommandExt;
 use std::ptr::{null, null_mut};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, mem, process, slice, thread};
@@ -197,12 +198,18 @@ fn launch(heartbeat: &str, secs: &str) -> io::Result<()> {
 /// Win32_Process.Create: the new process is a child of the WMI provider host, outside our job.
 fn wmi_create(cmdline: &str) -> io::Result<()> {
     let script = format!(
-        "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{}'}}; exit $r.ReturnValue",
+        "$ErrorActionPreference = 'Stop'; \
+         $s = New-CimInstance -ClassName Win32_ProcessStartup -Property @{{CreateFlags=[uint32]{}; ShowWindow=[uint16]0}} -ClientOnly; \
+         $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{}'; ProcessStartupInformation=$s}}; \
+         if ($null -eq $r -or $null -eq $r.ReturnValue) {{ exit 1 }}; \
+         exit $r.ReturnValue",
+        CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
         cmdline.replace('\'', "''")
     );
     let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let status = process::Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &base64(&utf16)])
+        .creation_flags(CREATE_NO_WINDOW)
         .status()?;
     if !status.success() {
         return Err(io::Error::other(format!("Win32_Process.Create returned {status}")));

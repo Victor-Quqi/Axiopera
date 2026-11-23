@@ -112,6 +112,7 @@ export default (pi) => {
     settings = f.agent / "settings.json"
     data = {"defaultProvider": "unseeded", "defaultModel": "discovered", "defaultThinkingLevel": "high"}
     settings.write_text(json.dumps(data), encoding="utf-8")
+    cli("daemon", "stop")
     assert catalog()["native_model"] == "unseeded/discovered"
     task_id = task("saved-dynamic", [], "unseeded/discovered", "high", "high")
     session = json.loads(cli("--json", "status", task_id))["data"][0]["session"]

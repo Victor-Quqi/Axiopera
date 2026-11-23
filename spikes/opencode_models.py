@@ -187,6 +187,8 @@ def exercise(root, opencode, axiopera):
                 rows, api_default, primary = native_catalog(opencode, cwd, env)
                 compare(case + " native primary", primary["id"], primary_id)
                 print(case, "TUI", native, "server default", api_default["id"], "primary", primary["id"], flush=True)
+                if case != "saved":
+                    cli("daemon", "stop", raw=True)
                 catalog = cli("models", "opencode")
                 expected_rows = {row["providerID"] + "/" + row["id"]: [v["id"] for v in row["variants"]] for row in rows}
                 compare(case + " model catalog", {m["id"]: m["efforts"] for m in catalog["models"]}, expected_rows)
