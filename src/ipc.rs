@@ -7,7 +7,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 /// Bump on incompatible wire types or caller identity semantics.
-pub const PROTOCOL: u32 = 8;
+pub const PROTOCOL: u32 = 9;
 
 /// Longest accepted line; task descriptions and environments travel inline.
 const MAX_LINE: usize = 16 << 20;

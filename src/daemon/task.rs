@@ -648,7 +648,7 @@ async fn model_error(d: &Daemon, id: &str, error: String) -> String {
             entry.task.agent,
             entry.task.cwd.clone(),
             entry.env.clone(),
-            entry.task.model.clone(),
+            entry.task.running_on().0.map(str::to_owned),
         )
     });
     let Some((agent, cwd, env, requested)) = context else {

@@ -191,9 +191,15 @@ impl Pi {
                     let _ =
                         tokio::time::timeout(Duration::from_secs(1), &mut pi.proc.stderr_reader)
                             .await;
-                    let tail = pi.proc.stderr_tail();
-                    if !tail.trim().is_empty() {
-                        bail!("{error:#}: {tail}");
+                    if let Some(diagnostic) = pi
+                        .proc
+                        .stderr_tail()
+                        .lines()
+                        .rev()
+                        .map(str::trim)
+                        .find(|line| !line.is_empty() && super::models::selection_error(line))
+                    {
+                        bail!("{error:#}: {diagnostic}");
                     }
                     return Err(error);
                 }
@@ -672,15 +678,15 @@ mod tests {
         .await
         .err()
         .unwrap();
-        assert!(
-            error.to_string().contains("Unknown model 'typo'"),
-            "{error:#}"
-        );
+        let message = error.to_string();
+        assert!(message.contains("Unknown model 'typo'"), "{error:#}");
+        assert!(!message.contains("fixture-secret"), "{error:#}");
     }
 
     #[test]
     #[ignore = "subprocess fixture for Pi startup"]
     fn reject_model_fixture() {
+        eprintln!("Authorization: Bearer fixture-secret");
         eprintln!("Unknown model 'typo'");
     }
 

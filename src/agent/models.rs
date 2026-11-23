@@ -244,7 +244,12 @@ impl Catalog {
         if self.models.len() <= 30 {
             return self.with_header(self.rows(agent, self.models.iter(), 30));
         }
-        if let Some(raw) = requested.filter(|s| !s.is_empty()) {
+        let target = requested
+            .filter(|s| !s.is_empty())
+            .or(self.configured_model.as_deref())
+            .or(self.native_model.as_deref())
+            .or(self.default_model.as_deref());
+        if let Some(raw) = target.filter(|s| !s.is_empty()) {
             // A native ID can itself end in a qualifier such as ":free".
             let id = raw
                 .rsplit_once(':')
@@ -1216,6 +1221,18 @@ mod tests {
         assert!(
             text.contains("Providers: other (1), team (30).")
                 && text.contains("axiopera models pi")
+        );
+        // Effort-only errors without an explicit --model fall back to the active default model.
+        catalog.configured_model = None;
+        catalog.native_model = Some("team/05".into());
+        assert_eq!(
+            catalog.render_error(Agent::Opencode, None),
+            "team/05  effort: high"
+        );
+        catalog.configured_model = Some("team/06".into());
+        assert_eq!(
+            catalog.render_error(Agent::Opencode, None),
+            "team/06  effort: high"
         );
         let flat = numbered_catalog("model-", 31);
         let text = flat.render_error(Agent::Codex, None);
